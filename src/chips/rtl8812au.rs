@@ -151,6 +151,8 @@ fn tx_rate_to_hw(rate: &TxRate, channel: u8) -> u8 {
         TxRate::Ofdm36m => 0x09,
         TxRate::Ofdm48m => 0x0A,
         TxRate::Ofdm54m => 0x0B,
+        // HT/VHT/HE: fallback to OFDM 6M on legacy RTL driver
+        _ => 0x04,
     };
     // CCK rates invalid on 5 GHz — fallback to OFDM 6M
     if channel > 14 && idx <= 0x03 {
@@ -1379,6 +1381,7 @@ impl Rtl8812au {
             data: buf[data_start..data_start + frame_len].to_vec(),
             rssi,
             channel,
+            band: if channel <= 14 { 0 } else { 1 },
             timestamp: Duration::ZERO,
         };
 
@@ -1499,6 +1502,12 @@ impl ChipDriver for Rtl8812au {
 
     fn calibrate(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn channel_settle_time(&self) -> Duration {
+        // RTL8812AU: register-based PLL, same as BU variant.
+        // Hardware re-lock is ~1-2ms, 5ms is conservative.
+        Duration::from_millis(5)
     }
 
     fn take_rx_handle(&mut self) -> Option<crate::core::chip::RxHandle> {

@@ -285,11 +285,31 @@ const FW_DL_MAX_LEN: usize = 4096;
 // ══════════════════════════════════════════════════════════════════════════════
 //  Constants — USB endpoint assignments
 // ══════════════════════════════════════════════════════════════════════════════
+//
+// MT7921AU has 6 bulk OUT endpoints mapped to different TX queues.
+// Descriptor order on both Fenvi and CF-952AX:
+//   1st OUT = EP 0x08 (MCU commands)
+//   2nd OUT = EP 0x04 (AC_BK / firmware scatter)
+//   3rd OUT = EP 0x05 (AC_BE — default data TX)
+//   4th OUT = EP 0x06 (AC_VI)
+//   5th OUT = EP 0x07 (AC_VO)
+//   6th OUT = EP 0x09 (FWDL)
+//
+// Confirmed by usbmon captures: Linux sends runtime MCU commands on EP8,
+// firmware scatter pages on EP4, and data TX on EP5 (AC_BE).
 
-/// EP for inband MCU commands (bulk OUT)
-const EP_OUT_INBAND_CMD: u8 = 0x04;
-/// EP for data TX / firmware scatter (bulk OUT, AC_BE)
-const EP_OUT_AC_BE: u8      = 0x05;
+/// Default EP for MCU commands (discovered as 1st bulk OUT in descriptor order)
+const EP_OUT_MCU_DEFAULT: u8     = 0x08;
+/// EP for firmware scatter download / AC_BK data (2nd bulk OUT)
+const EP_OUT_AC_BK_DEFAULT: u8   = 0x04;
+/// EP for AC_BE data TX (3rd bulk OUT — primary data TX endpoint)
+const EP_OUT_AC_BE_DEFAULT: u8   = 0x05;
+/// EP for AC_VI data TX (4th bulk OUT)
+const EP_OUT_AC_VI_DEFAULT: u8   = 0x06;
+/// EP for AC_VO data TX (5th bulk OUT — highest priority data)
+const EP_OUT_AC_VO_DEFAULT: u8   = 0x07;
+/// EP for firmware download (6th bulk OUT)
+const EP_OUT_FWDL_DEFAULT: u8    = 0x09;
 /// Primary RX data endpoint (bulk IN)
 const EP_IN_DATA: u8        = 0x84;
 /// Secondary RX / event endpoint (bulk IN)
@@ -444,7 +464,19 @@ fn channel_to_freq(ch: u8, band: Band) -> u16 {
     }
 }
 
-/// Map channel number to band index for MCU commands
+/// Map band to NL80211 band index for MCU commands.
+/// Using Band enum is authoritative — channel_number alone is ambiguous
+/// (e.g., channel 1 exists in both 2.4GHz and 6GHz).
+fn band_to_idx(band: Band) -> u8 {
+    match band {
+        Band::Band2g => 0, // NL80211_BAND_2GHZ
+        Band::Band5g => 1, // NL80211_BAND_5GHZ
+        Band::Band6g => 2, // NL80211_BAND_6GHZ
+    }
+}
+
+/// Map channel number to band index — LEGACY fallback only.
+/// Prefer band_to_idx(band) when Band is available.
 fn channel_to_band_idx(ch: u8) -> u8 {
     match ch {
         1..=14 => 0,    // NL80211_BAND_2GHZ = 0
@@ -459,17 +491,25 @@ fn channel_to_band_idx(ch: u8) -> u8 {
 
 /// MT7921AU capability flags — WiFi 6, dual-band, HE
 const MT7921AU_CAPS: ChipCaps = ChipCaps::MONITOR.union(ChipCaps::INJECT)
-    .union(ChipCaps::BAND_2G).union(ChipCaps::BAND_5G)
+    .union(ChipCaps::BAND_2G).union(ChipCaps::BAND_5G).union(ChipCaps::BAND_6G)
     .union(ChipCaps::HT).union(ChipCaps::VHT)
     .union(ChipCaps::HE)
     .union(ChipCaps::BW40).union(ChipCaps::BW80).union(ChipCaps::BW160);
 
 pub struct Mt7921au {
     handle: Arc<DeviceHandle<GlobalContext>>,
-    /// Primary bulk OUT endpoint (inband commands)
-    ep_cmd_out: u8,
-    /// Data TX bulk OUT endpoint (AC_BE, also used for FW scatter)
-    ep_data_out: u8,
+    /// MCU command bulk OUT endpoint (EP 0x08 — 1st in descriptor order)
+    ep_mcu_out: u8,
+    /// AC_BK bulk OUT / firmware scatter (EP 0x04 — 2nd in descriptor order)
+    ep_ac_bk_out: u8,
+    /// AC_BE bulk OUT — primary data TX (EP 0x05 — 3rd in descriptor order)
+    ep_ac_be_out: u8,
+    /// AC_VI bulk OUT (EP 0x06 — 4th)
+    ep_ac_vi_out: u8,
+    /// AC_VO bulk OUT (EP 0x07 — 5th)
+    ep_ac_vo_out: u8,
+    /// Firmware download bulk OUT (EP 0x09 — 6th)
+    ep_fwdl_out: u8,
     /// Primary bulk IN endpoint (RX data)
     ep_data_in: u8,
     /// Event bulk IN endpoint
@@ -538,8 +578,14 @@ impl Mt7921au {
         // Comfast CF-952AX: iface 0 is WiFi
         let config = device.active_config_descriptor()?;
         let mut wifi_iface: Option<u8> = None;
-        let mut ep_cmd_out: u8 = EP_OUT_INBAND_CMD;
-        let mut ep_data_out: u8 = EP_OUT_AC_BE;
+        // TX endpoints: discovered in USB descriptor order (matches Linux mt76u)
+        // Descriptor order on Fenvi/CF-952AX: 0x08, 0x04, 0x05, 0x06, 0x07, 0x09
+        let mut ep_mcu_out: u8 = EP_OUT_MCU_DEFAULT;
+        let mut ep_ac_bk_out: u8 = EP_OUT_AC_BK_DEFAULT;
+        let mut ep_ac_be_out: u8 = EP_OUT_AC_BE_DEFAULT;
+        let mut ep_ac_vi_out: u8 = EP_OUT_AC_VI_DEFAULT;
+        let mut ep_ac_vo_out: u8 = EP_OUT_AC_VO_DEFAULT;
+        let mut ep_fwdl_out: u8 = EP_OUT_FWDL_DEFAULT;
         let mut ep_data_in: u8 = EP_IN_DATA;
         let mut ep_event_in: u8 = EP_IN_EVENT;
         let mut n_bulk_out: u8 = 0;
@@ -551,17 +597,23 @@ impl Mt7921au {
                 if alt.class_code() == 0xFF && alt.sub_class_code() == 0xFF {
                     wifi_iface = Some(alt.interface_number());
                     // Discover endpoints from this interface
+                    // MT76 USB uses enumeration ORDER for endpoint assignment:
+                    //   [0]=MCU cmd, [1]=AC_BK/scatter, [2]=AC_BE(data),
+                    //   [3]=AC_VI, [4]=AC_VO, [5]=FWDL
                     n_bulk_out = 0;
                     n_bulk_in = 0;
                     for ep in alt.endpoint_descriptors() {
                         match (ep.direction(), ep.transfer_type()) {
                             (rusb::Direction::Out, rusb::TransferType::Bulk) => {
-                                // MT76 USB uses enumeration ORDER for endpoint assignment.
-                                // Linux mt76u discovers endpoints in descriptor order and
-                                // maps by index: [0]=inband CMD, [1]=AC_BE data.
-                                // On CF-952AX: EP 0x08 appears FIRST → it's the CMD EP!
-                                if n_bulk_out == 0 { ep_cmd_out = ep.address(); }
-                                if n_bulk_out == 1 { ep_data_out = ep.address(); }
+                                match n_bulk_out {
+                                    0 => ep_mcu_out = ep.address(),
+                                    1 => ep_ac_bk_out = ep.address(),
+                                    2 => ep_ac_be_out = ep.address(),
+                                    3 => ep_ac_vi_out = ep.address(),
+                                    4 => ep_ac_vo_out = ep.address(),
+                                    5 => ep_fwdl_out = ep.address(),
+                                    _ => {}
+                                }
                                 n_bulk_out += 1;
                             }
                             (rusb::Direction::In, rusb::TransferType::Bulk) => {
@@ -613,7 +665,7 @@ impl Mt7921au {
         // Build the endpoints struct for the adapter layer
         let endpoints = UsbEndpoints {
             bulk_in: ep_data_in,
-            bulk_out: ep_cmd_out,
+            bulk_out: ep_mcu_out,
             bulk_out_all: all_bulk_out,
         };
 
@@ -622,8 +674,12 @@ impl Mt7921au {
 
         let driver = Self {
             handle: Arc::new(handle),
-            ep_cmd_out,
-            ep_data_out,
+            ep_mcu_out,
+            ep_ac_bk_out,
+            ep_ac_be_out,
+            ep_ac_vi_out,
+            ep_ac_vo_out,
+            ep_fwdl_out,
             ep_data_in,
             ep_event_in,
             channel: 0,
@@ -944,16 +1000,32 @@ impl Mt7921au {
         // Clear RX flush
         self.reg_clear(MT_UDMA_WLCFG_0, MT_WL_RX_FLUSH)?;
 
-        // Enable TX/RX. Linux mt792x_usb.c disables AGG and uses 128 async URBs.
-        // MT7921 firmware does NOT aggregate USB packets regardless of AGG_EN —
-        // each USB completion delivers exactly one packet. We match Linux exactly:
-        // enable TX+RX, clear AGG fields, and spin fast in the RX thread (1ms timeout).
+        // Enable TX/RX with USB RX aggregation.
+        // Linux disables AGG because it uses 128 async URBs (no benefit).
+        // We use synchronous bulk reads where aggregation reduces USB round-trips.
+        // On USB3 SuperSpeed (5Gbps) this batches multiple frames per read.
+        //
+        // AGG_TO  = aggregation timeout (GENMASK(7,0) in WLCFG_0) in 33ns units
+        // AGG_LMT = max frames per aggregate (GENMASK(15,8) in WLCFG_0)
+        // PKT_LMT = packet count limit (GENMASK(7,0) in WLCFG_1)
+        //
+        // Tuning rationale (from PHY capabilities):
+        //   Max AMPDU = 65535 bytes, Max AMSDU = 7935 bytes
+        //   With avg beacon ~200 bytes, 64 frames × 200 = 12.8KB = fits in 65KB buffer
+        //   Timeout: 0xFF ≈ 8.4µs — aggressive enough for real-time scanning
+        //   but long enough to batch multiple back-to-back frames.
         self.reg_set(MT_UDMA_WLCFG_0,
                      MT_WL_RX_EN | MT_WL_TX_EN |
-                     MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN)?;
-        // Clear AGG timeout and limit (matches Linux mt792xu_dma_init exactly)
-        self.reg_clear(MT_UDMA_WLCFG_0, MT_WL_RX_AGG_TO | MT_WL_RX_AGG_LMT)?;
-        self.reg_clear(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT)?;
+                     MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN |
+                     MT_WL_RX_AGG_EN)?;
+        // AGG_TO=0x80 (~4µs), AGG_LMT=16 frames per aggregate
+        // Conservative values that work reliably during init and monitor setup.
+        // Monitor mode set_monitor_mode() can tune these up for RX throughput.
+        self.reg_rmw(MT_UDMA_WLCFG_0,
+                     MT_WL_RX_AGG_TO | MT_WL_RX_AGG_LMT,
+                     0x80 | (0x10 << 8))?;
+        // PKT_LMT=16 in WLCFG_1
+        self.reg_rmw(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT, 0x10)?;
 
         if resume {
             return Ok(());
@@ -1084,7 +1156,8 @@ impl Mt7921au {
             let mut pkt = vec![0u8; final_len];
             pkt[0..4].copy_from_slice(&sdio_hdr.to_le_bytes());
             pkt[MT_SDIO_HDR_SIZE..MT_SDIO_HDR_SIZE + data.len()].copy_from_slice(data);
-            self.handle.write_bulk(self.ep_data_out, &pkt, USB_BULK_TIMEOUT)?;
+            // Firmware scatter goes to AC_BK endpoint (EP 0x04) — confirmed by usbmon
+            self.handle.write_bulk(self.ep_ac_bk_out, &pkt, USB_BULK_TIMEOUT)?;
             return Ok(0);
         }
 
@@ -1163,7 +1236,7 @@ impl Mt7921au {
         }
 
         // Send via inband command endpoint
-        self.handle.write_bulk(self.ep_cmd_out, &pkt, USB_BULK_TIMEOUT)?;
+        self.handle.write_bulk(self.ep_mcu_out, &pkt, USB_BULK_TIMEOUT)?;
 
         // If we need response, read it
         if wait_resp {
@@ -1330,7 +1403,7 @@ impl Mt7921au {
         }
 
 
-        self.handle.write_bulk(self.ep_cmd_out, &pkt, USB_BULK_TIMEOUT)?;
+        self.handle.write_bulk(self.ep_mcu_out, &pkt, USB_BULK_TIMEOUT)?;
 
         if wait_resp {
             return self.mcu_recv_response(seq);
@@ -1378,7 +1451,7 @@ impl Mt7921au {
             pkt[off..off + data.len()].copy_from_slice(data);
         }
 
-        self.handle.write_bulk(self.ep_cmd_out, &pkt, USB_BULK_TIMEOUT)?;
+        self.handle.write_bulk(self.ep_mcu_out, &pkt, USB_BULK_TIMEOUT)?;
 
         if wait_resp {
             return self.mcu_recv_response(seq);
@@ -1516,7 +1589,17 @@ impl Mt7921au {
             Band::Band5g => (&[36, 40, 44, 48, 52, 56, 60, 64,
                                100, 104, 108, 112, 116, 120, 124, 128,
                                132, 136, 140, 144, 149, 153, 157, 161, 165], 1),
-            Band::Band6g => (&[1, 5, 9, 13, 17, 21, 25, 29], 2),
+            Band::Band6g => {
+                // All 59 primary 20 MHz channels: 1-233 step 4
+                const CHANNELS_6G: [u8; 59] = [
+                    1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61,
+                    65, 69, 73, 77, 81, 85, 89, 93, 97, 101, 105, 109, 113, 117,
+                    121, 125, 129, 133, 137, 141, 145, 149, 153, 157, 161, 165, 169,
+                    173, 177, 181, 185, 189, 193, 197, 201, 205, 209, 213, 217, 221,
+                    225, 229, 233,
+                ];
+                (&CHANNELS_6G[..], 2)
+            },
         };
 
         // Send channels in batches of 8 (connac2 batch size)
@@ -1541,13 +1624,97 @@ impl Mt7921au {
 
             // Per-channel SKU TLVs: each is sku_len bytes
             // { channel: u8, pad[3], pwr[sku_entries]: i8 }
+            // SKU entry layout (from captures txpower_sku.txt, eeprom values in 0.5dBm):
+            //   [0..3]   = CCK   1m/2m/5m/11m         (4 entries, 2.4GHz only)
+            //   [4..11]  = OFDM  6m..54m              (8 entries)
+            //   [12..19] = HT20  MCS0..7              (8 entries)
+            //   [20..28] = HT40  MCS0..7 + MCS32      (9 entries)
+            //   [29..38] = VHT20 MCS0..9              (10 entries, 5/6GHz only)
+            //   [39..48] = VHT40 MCS0..9              (10 entries)
+            //   [49..58] = VHT80 MCS0..9              (10 entries)
+            //   [59..68] = VHT160 MCS0..9             (10 entries)
+            //   [69..80] = HE26  MCS0..11             (12 entries)
+            //   [81..92] = HE52  MCS0..11             (12 entries)
+            //   [93..104]= HE106 MCS0..11             (12 entries)
+            //   [105..116]= HE242 MCS0..11            (12 entries)
+            //   [117..128]= HE484 MCS0..11            (12 entries)
+            //   [129..140]= HE996 MCS0..11            (12 entries)
+            //   [141..152]= HE996x2 MCS0..11          (12 entries)
             for (i, &ch) in batch_channels.iter().enumerate() {
                 let off = 4 + i * sku_len;
                 payload[off] = ch;
-                // Fill all power entries with max power (127 = ~63.5 dBm half-units)
-                // The firmware caps this to eFuse limits, so this is safe
+                // Base: fill ALL entries with max (127 half-dBm = 63.5 dBm).
+                // Firmware clamps to min(our_value, efuse), so this is safe.
+                // Then overlay per-rate values from SKU capture below.
                 for j in 4..sku_len {
                     payload[off + j] = 127;
+                }
+                // Per-rate power from SKU capture (eeprom values in 0.5dBm units).
+                // Values from txpower_sku.txt captured on Fenvi USB3 adapter.
+                let pwr = &mut payload[off + 4..off + sku_len];
+                match band {
+                    Band::Band2g => {
+                        // CCK: 37 (18.5dBm)
+                        for p in &mut pwr[0..4] { *p = 40; }
+                        // OFDM: 31-34
+                        pwr[4] = 37; pwr[5] = 36; pwr[6] = 36; pwr[7] = 36;
+                        pwr[8] = 36; pwr[9] = 36; pwr[10] = 34; pwr[11] = 34;
+                        // HT20: 27-33
+                        pwr[12] = 36; pwr[13] = 36; pwr[14] = 36; pwr[15] = 36;
+                        pwr[16] = 36; pwr[17] = 35; pwr[18] = 32; pwr[19] = 30;
+                        // HT40: 27-33
+                        pwr[20] = 36; pwr[21] = 36; pwr[22] = 36; pwr[23] = 36;
+                        pwr[24] = 36; pwr[25] = 35; pwr[26] = 32; pwr[27] = 30;
+                        pwr[28] = 36; // MCS32
+                        // VHT20-VHT160: same as HT range
+                        for j in 29..69 { pwr[j] = 36; }
+                        // HE26-HE996x2: 23-36 per MCS
+                        let he_pwr: [u8; 12] = [36, 36, 36, 36, 36, 35, 32, 30, 29, 28, 26, 26];
+                        for ru in 0..7 {
+                            for (k, &v) in he_pwr.iter().enumerate() {
+                                pwr[69 + ru * 12 + k] = v;
+                            }
+                        }
+                    }
+                    Band::Band5g => {
+                        // OFDM: 31-34
+                        pwr[4] = 37; pwr[5] = 36; pwr[6] = 36; pwr[7] = 36;
+                        pwr[8] = 36; pwr[9] = 36; pwr[10] = 34; pwr[11] = 34;
+                        // HT20/40: same as 2.4G
+                        for j in 12..29 { pwr[j] = 36; }
+                        // VHT20/40: 25-33
+                        let vht_pwr: [u8; 10] = [36, 36, 36, 36, 36, 35, 32, 30, 29, 28];
+                        for bw in 0..2 { // VHT20, VHT40
+                            for (k, &v) in vht_pwr.iter().enumerate() {
+                                pwr[29 + bw * 10 + k] = v;
+                            }
+                        }
+                        // VHT80/160: 27 flat (wider BW = lower per-tone)
+                        for j in 49..69 { pwr[j] = 30; }
+                        // HE26-HE484: per-rate staircase
+                        let he_pwr: [u8; 12] = [36, 36, 36, 36, 36, 35, 32, 30, 29, 28, 26, 26];
+                        for ru in 0..5 { // HE26..HE484
+                            for (k, &v) in he_pwr.iter().enumerate() {
+                                pwr[69 + ru * 12 + k] = v;
+                            }
+                        }
+                        // HE996/996x2: 27 flat (wide RU = lower power density)
+                        for j in 129..153 { pwr[j] = 30; }
+                    }
+                    Band::Band6g => {
+                        // 6GHz: no CCK/HT, only OFDM+VHT+HE
+                        // OFDM: 34 flat
+                        for j in 4..12 { pwr[j] = 34; }
+                        // VHT/HT: 30 flat
+                        for j in 12..69 { pwr[j] = 30; }
+                        // HE: per-rate staircase (lower power for 6GHz regulatory)
+                        let he_pwr: [u8; 12] = [30, 30, 30, 30, 30, 29, 27, 25, 24, 23, 21, 21];
+                        for ru in 0..7 {
+                            for (k, &v) in he_pwr.iter().enumerate() {
+                                pwr[69 + ru * 12 + k] = v;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1629,7 +1796,7 @@ impl Mt7921au {
         }
 
         // Send to inband command endpoint
-        self.handle.write_bulk(self.ep_cmd_out, &pkt, USB_BULK_TIMEOUT)?;
+        self.handle.write_bulk(self.ep_mcu_out, &pkt, USB_BULK_TIMEOUT)?;
 
         if wait_resp {
             return self.mcu_recv_response(seq);
@@ -1989,32 +2156,20 @@ impl Mt7921au {
     /// Set RX path / initial channel info. Required before sniffer mode.
     /// Matches mt7921_mcu_set_chan_info(phy, MCU_EXT_CMD(SET_RX_PATH)).
     fn mcu_set_chan_info(&mut self, ext_cmd: u8, ch: u8, band: Band) -> Result<()> {
-        let band_idx = channel_to_band_idx(ch);
-        // channel_band: 0=2.4GHz, 1=5GHz in Linux enum (but set_chan_info uses different mapping)
-        // Linux: NL80211_BAND_2GHZ=0, NL80211_BAND_5GHZ=1
-        let channel_band: u8 = match band {
-            Band::Band2g => 0,
-            Band::Band5g => 1,
-            Band::Band6g => 2,
-        };
+        let channel_band = band_to_idx(band);
 
         // Struct matches mt7921_mcu_set_chan_info() — 80 bytes total
         let mut req = [0u8; 80];
         req[0] = ch;           // control_ch
         req[1] = ch;           // center_ch
         req[2] = 0;            // bw = 20MHz
-        req[3] = 1;            // tx_streams_num = 1
-        req[4] = 1;            // rx_streams = 1 (or antenna mask)
+        req[3] = 2;            // tx_streams_num = 2 (Fenvi 2x2 MIMO: TX antenna mask 0x3)
+        req[4] = 2;            // rx_streams = 2 (RX antenna mask 0x3 = 2 chains)
         req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL
         req[6] = 0;            // band_idx = phy band index (always 0 for single-band)
         req[7] = 0;            // center_ch2
         // cac_case: le16 at [8-9] = 0
         req[10] = channel_band; // channel_band
-
-        // For CHANNEL_SWITCH: rx_streams = hweight8(rx_streams) = count of antenna bits
-        if ext_cmd == MCU_EXT_CMD_CHANNEL_SWITCH {
-            req[4] = 1; // hweight8(antenna_mask)
-        }
 
         self.mcu_send_ext_cmd(ext_cmd, &req, true)?;
         Ok(())
@@ -2032,8 +2187,8 @@ impl Mt7921au {
         req[0] = ch;
         req[1] = ch;
         req[2] = 0;            // bw = 20MHz
-        req[3] = 1;            // tx_streams_num
-        req[4] = 1;            // rx_streams (hweight8 for CHANNEL_SWITCH)
+        req[3] = 2;            // tx_streams_num (2x2 MIMO)
+        req[4] = 2;            // rx_streams (2x2 MIMO)
         req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL
         req[10] = channel_band;
 
@@ -2062,8 +2217,10 @@ impl Mt7921au {
         const MT_WTBL_UPDATE_BUSY: u32 = 1 << 31;
         const MT792X_WTBL_SIZE: usize = 20;
 
-        // 1. Set max RX length to 1536 in DCR1[15:3]
-        self.reg_rmw(MT_MDP_DCR1, 0xFFF8, 1536 << 3)?;
+        // 1. Set max RX length in DCR1[15:3] (13-bit field, max 8191)
+        // WiFi 6 A-MSDU can be up to 7935 bytes. Use 4096 which handles large frames
+        // while fitting safely in the register field. USB aggregation handles the rest.
+        self.reg_rmw(MT_MDP_DCR1, 0xFFF8, 4096 << 3)?;
 
         // 2. Enable hardware de-aggregation ONLY.
         // RX_HDR_TRANS_EN (bit 19) is intentionally NOT set — in monitor/sniffer mode
@@ -2092,6 +2249,7 @@ impl Mt7921au {
 
         // 4. Per-band init (band 0 and 1) — mt792x_mac_init_band()
         // Linux does 9 register writes per band. We must do all of them.
+        // Only 2 hardware bands: 6GHz shares the band 1 radio (same PHY, MCU handles switching).
         for band_idx in 0..2u32 {
             let tmac_base = 0x820e4000u32 + band_idx * 0x10000;
             let rmac_base = 0x820e5000u32 + band_idx * 0x10000;
@@ -2116,8 +2274,8 @@ impl Mt7921au {
             let mib_scr1 = mib_base + 0x004;
             self.reg_set(mib_scr1, (1 << 0) | (1 << 1))?; // TXDUR_EN | RXDUR_EN
 
-            // e. DMA DCR0: max RX length to 1536 in DCR0[15:3]
-            self.reg_rmw(dma_base, 0xFFF8, 1536 << 3)?;
+            // e. DMA DCR0: max RX length in DCR0[15:3] — match MDP_DCR1
+            self.reg_rmw(dma_base, 0xFFF8, 4096 << 3)?;
             // Disable RXD group 5 (rate report) — hw issues per Linux comment
             self.reg_clear(dma_base, 1 << 23)?; // RXD_G5_EN
 
@@ -2161,12 +2319,13 @@ impl Mt7921au {
         self.mcu_set_channel_domain()?;
         self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, ch, band)?;
 
-        // Set TX power to MAXIMUM for all channels in both bands.
+        // Set TX power to MAXIMUM for all channels in all three bands.
         // The firmware caps values to eFuse hardware limits, so setting 127
         // (max half-dBm value) ensures we get the absolute maximum the hardware supports.
+        // Per-rate staircase from captured SKU tables overlaid on top.
         self.mcu_set_rate_txpower(Band::Band2g)?;
         self.mcu_set_rate_txpower(Band::Band5g)?;
-
+        self.mcu_set_rate_txpower(Band::Band6g)?;
         Ok(())
     }
 
@@ -2180,18 +2339,22 @@ impl Mt7921au {
         //   hw_value(le16), pad(le16), flags(le32) — actually 8 bytes each
 
         // 2.4 GHz channels 1-14
-        let channels_2g: Vec<u8> = (1..=14u16).collect::<Vec<_>>().iter().map(|&c| c as u8).collect();
+        let channels_2g: Vec<u16> = (1..=14u16).collect();
         // 5 GHz channels
         let channels_5g: &[u16] = &[36, 40, 44, 48, 52, 56, 60, 64,
                                       100, 104, 108, 112, 116, 120, 124, 128,
                                       132, 136, 140, 144, 149, 153, 157, 161, 165,
                                       169, 173, 177];
+        // 6 GHz channels (Band 4) — all 59 primary 20 MHz channels from phy_info
+        // 5955-7115 MHz, channels 1-233 in steps of 4
+        let channels_6g: Vec<u16> = (1..=233u16).step_by(4).collect();
 
         let n_2ch = channels_2g.len();
         let n_5ch = channels_5g.len();
+        let n_6ch = channels_6g.len();
         let hdr_size = 12;
         let chan_entry_size = 8; // hw_value(2) + pad(2) + flags(4)
-        let total = hdr_size + (n_2ch + n_5ch) * chan_entry_size;
+        let total = hdr_size + (n_2ch + n_5ch + n_6ch) * chan_entry_size;
 
         let mut data = vec![0u8; total];
 
@@ -2202,16 +2365,19 @@ impl Mt7921au {
         data[6] = 3;  // bw_6g = BW_20_40_80_160M
         data[8] = n_2ch as u8;
         data[9] = n_5ch as u8;
-        data[10] = 0; // n_6ch
+        data[10] = n_6ch as u8; // 6GHz channels — was 0, now all 59!
 
         // Channel entries
         let mut off = hdr_size;
         for &ch in channels_2g.iter() {
-            data[off..off+2].copy_from_slice(&(ch as u16).to_le_bytes());
-            // flags = 0 (no special flags)
+            data[off..off+2].copy_from_slice(&ch.to_le_bytes());
             off += chan_entry_size;
         }
         for &ch in channels_5g {
+            data[off..off+2].copy_from_slice(&ch.to_le_bytes());
+            off += chan_entry_size;
+        }
+        for &ch in channels_6g.iter() {
             data[off..off+2].copy_from_slice(&ch.to_le_bytes());
             off += chan_entry_size;
         }
@@ -2336,8 +2502,7 @@ impl Mt7921au {
     /// Configure sniffer channel via MCU command.
     /// Matches mt7921_mcu_config_sniffer() from the kernel driver.
     fn mcu_config_sniffer_channel(&mut self, ch: u8, band: Band) -> Result<()> {
-        let _freq = channel_to_freq(ch, band);
-        let band_idx = channel_to_band_idx(ch);
+        let band_idx = band_to_idx(band);
 
         // Build TLV payload:
         // struct { band_idx[1], pad[3] } hdr
@@ -2345,15 +2510,15 @@ impl Mt7921au {
         //          control_ch[1], center_ch[1], center_ch2[1], drop_err[1],
         //          pad[4] } tlv
         let mut payload = [0u8; 20];
-        // hdr.band_idx
-        payload[0] = 0;
+        // hdr.band_idx — MUST match the band we're switching to
+        payload[0] = band_idx;
         // tlv.tag = 1 (config)
         payload[4..6].copy_from_slice(&1u16.to_le_bytes());
         // tlv.len = 16
         payload[6..8].copy_from_slice(&16u16.to_le_bytes());
         // tlv.aid = 0 (bytes 8-9)
         // tlv.ch_band (byte 10) — Linux mcu.c:1166 maps: 1=2GHz, 2=5GHz, 3=6GHz
-        // channel_to_band_idx returns 0/1/2 (NL80211 enum), MCU expects 1/2/3
+        // band_to_idx returns 0/1/2 (NL80211 enum), MCU expects 1/2/3
         payload[10] = band_idx + 1;
         // tlv.bw = 0 (20 MHz) (byte 11)
         payload[11] = 0;
@@ -2546,6 +2711,7 @@ impl Mt7921au {
             data: frame_data,
             rssi,
             channel: rx_channel,
+            band: match self.band { Band::Band2g => 0, Band::Band5g => 1, Band::Band6g => 2 },
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default(),
@@ -2749,7 +2915,7 @@ impl ChipDriver for Mt7921au {
             vid: self.vid,
             pid: self.pid,
             rfe_type: 0,
-            bands: vec![Band::Band2g, Band::Band5g],
+            bands: vec![Band::Band2g, Band::Band5g, Band::Band6g],
             max_tx_power_dbm: 20,
             firmware_version: self.fw_version.clone(),
         }
@@ -2779,7 +2945,7 @@ impl ChipDriver for Mt7921au {
                 let mut p = [0u8; 20];
                 p[4..6].copy_from_slice(&1u16.to_le_bytes()); // tag=1 (config)
                 p[6..8].copy_from_slice(&16u16.to_le_bytes()); // len=16
-                p[10] = channel_to_band_idx(channel.number) + 1; // ch_band: MCU expects 1/2/3
+                p[10] = band_to_idx(channel.band) + 1; // ch_band: MCU expects 1/2/3
                 p[12] = channel.number; // control_ch
                 p[14] = channel.number; // center_ch
                 p[16] = 1; // drop_err=1
@@ -2789,6 +2955,10 @@ impl ChipDriver for Mt7921au {
 
         self.channel = channel.number;
         self.band = channel.band;
+        // TX power is set for ALL bands during radio_init(). No need to resend
+        // during channel hop — the firmware already has the limits cached per-channel.
+        // Linux's per-switch TX power updates are for regulatory compliance with
+        // dynamic country switching, which doesn't apply to monitor mode.
         Ok(())
     }
 
@@ -2821,23 +2991,15 @@ impl ChipDriver for Mt7921au {
         self.drain_usb_endpoints()?;
 
         // STEP 1: Create a virtual interface (VIF) in the firmware.
-        // Matches mt7921_add_interface() → mt76_connac_mcu_uni_add_dev().
-        // Without a BSS entry, firmware has no routing destination for RX frames.
         self.mcu_add_dev()?;
 
         // STEP 2: Disable deep sleep — CRITICAL for monitor mode.
-        // Matches mt7921_sniffer_interface_iter() from the kernel driver.
-        // Firmware won't forward RX to USB in deep sleep.
         self.mcu_set_deep_sleep(false)?;
 
-        // STEP 3: Enable sniffer mode — tells firmware to enter monitor mode.
-        // Matches mt7921_mcu_set_sniffer(dev, vif, true).
-        // This is MCU_UNI_CMD_SNIFFER (0x24) with tag=0, enable=1.
+        // STEP 3: Enable sniffer mode.
         self.mcu_set_sniffer(true)?;
 
         // STEP 4: Configure sniffer channel.
-        // Matches mt7921_mcu_config_sniffer() — called when monitor VIF channel changes.
-        // This tells the firmware which channel to sniff on.
         self.mcu_config_sniffer_channel(self.channel, self.band)?;
 
         // STEP 5: Set RX filter for monitor mode — accept ALL frames.
@@ -2884,13 +3046,15 @@ impl ChipDriver for Mt7921au {
         let abort_data = [0u8; 4]; // bss_idx=0, pad[3]
         let _ = self.mcu_send_ce_cmd(0x17, &abort_data, false); // CE_CMD_SET_BSS_ABORT
 
-        // STEP 7: Re-enable UDMA RX with aggregation after all config.
+        // STEP 7: Re-enable UDMA RX with tuned aggregation for monitor mode.
+        // Match the dma_init() values: AGG_TO=0xFF, AGG_LMT=64, PKT_LMT=64
         self.reg_clear(MT_UDMA_WLCFG_0, MT_WL_RX_FLUSH)?;
         self.reg_set(MT_UDMA_WLCFG_0, MT_WL_RX_EN | MT_WL_TX_EN |
                      MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN | MT_WL_RX_AGG_EN)?;
         self.reg_rmw(MT_UDMA_WLCFG_0,
                      MT_WL_RX_AGG_LMT | MT_WL_RX_AGG_TO,
-                     (32 << 8) | 100)?;
+                     0xFF | (0x40 << 8))?;
+        self.reg_rmw(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT, 0x40)?;
         self.reg_set(MT_UWFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_RX_DMA_EN)?;
 
         // Drain again after config — catch any responses from commands above
@@ -2968,9 +3132,9 @@ impl ChipDriver for Mt7921au {
         // DW4-DW5: zero (no PN, no PID)
 
         // DW6: TX_RATE[29:16] | FIXED_BW[2]=1
-        // Rate encoding: MODE[9:6] | NSS[12:10] | IDX[5:0]
-        // OFDM 6Mbps: MODE=1(OFDM), IDX=11 → (1 << 6) | 11 = 0x4B
-        let rate: u32 = (1u32 << 6) | 11;  // OFDM 6Mbps
+        // Rate encoding via TxRate::mt76_rate(): MODE[9:6] | NSS[12:10] | IDX[5:0]
+        // Supports CCK, OFDM, HT(MODE=2), VHT(MODE=3), HE_SU(MODE=4)
+        let rate: u32 = opts.rate.mt76_rate() as u32;
         let dw6: u32 = (rate << 16) | (1u32 << 2);  // TX_RATE + FIXED_BW(20MHz)
         pkt[off+24..off+28].copy_from_slice(&dw6.to_le_bytes());
 
@@ -2986,9 +3150,16 @@ impl ChipDriver for Mt7921au {
         let frame_off = off + txwi_size;
         pkt[frame_off..frame_off + frame.len()].copy_from_slice(frame);
 
-        // Send via data TX endpoint
+        // Select TX endpoint by frame type:
+        //   Management (type=0): EP AC_BE (0x05) with ALTX Q_IDX in TXWI
+        //   Control (type=1): EP AC_VO (0x07) — highest priority
+        //   Data (type=2): EP AC_BE (0x05) — default data queue
+        let tx_ep = match frame_type {
+            1 => self.ep_ac_vo_out,  // Control frames → high priority
+            _ => self.ep_ac_be_out,  // Management + data → AC_BE
+        };
         for retry in 0..opts.retries.max(1) {
-            match self.handle.write_bulk(self.ep_data_out, &pkt, USB_BULK_TIMEOUT) {
+            match self.handle.write_bulk(tx_ep, &pkt, USB_BULK_TIMEOUT) {
                 Ok(_) => return Ok(()),
                 Err(e) if retry < opts.retries.saturating_sub(1) => {
                     thread::sleep(Duration::from_millis(1));
@@ -3005,10 +3176,11 @@ impl ChipDriver for Mt7921au {
     }
 
     fn rx_frame(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
-        // MT7921 has USB aggregation disabled (same as Linux mt792x_usb.c),
-        // so each USB read returns only ONE packet. Many are non-data (MCU events,
-        // TX status). We must loop with short reads to find valid 802.11 frames,
-        // unlike RTL which gets aggregated buffers with many frames per read.
+        // MT7921 with aggregation enabled (AGG_LMT=64, AGG_TO=0xFF).
+        // Each USB read may return multiple packets back-to-back in the buffer.
+        // parse_rx_packet() walks the buffer extracting frames one at a time.
+        // Many packets are non-data (MCU events, TX status) — we loop through
+        // them efficiently with short USB reads between buffer exhaustions.
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -3058,13 +3230,25 @@ impl ChipDriver for Mt7921au {
     }
 
     fn set_tx_power(&mut self, _dbm: i8) -> Result<()> {
-        // TODO: implement via MCU command
+        // Re-send max TX power for the current band. The firmware caps to eFuse
+        // limits, so we always request maximum and let hardware enforce the ceiling.
+        self.mcu_set_rate_txpower(self.band)?;
         Ok(())
     }
 
     fn calibrate(&mut self) -> Result<()> {
         // MT7921AU calibration is handled by the firmware automatically
         Ok(())
+    }
+
+    fn channel_settle_time(&self) -> Duration {
+        // MT7921AU: set_channel() sends MCU_EXT_CMD(CHANNEL_SWITCH) and WAITS
+        // for the firmware response. The firmware blocks 140-500ms for PLL retune
+        // INSIDE that MCU command. By the time set_channel() returns, the radio
+        // is already on the new channel and receiving. No additional settle needed.
+        //
+        // 10ms margin for AGC to converge after the PLL locks.
+        Duration::from_millis(10)
     }
 
     fn take_rx_handle(&mut self) -> Option<crate::core::chip::RxHandle> {
@@ -3225,6 +3409,7 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         data: frame_data,
         rssi,
         channel: rx_channel,
+        band: if rx_channel <= 14 { 0 } else { 1 },
         timestamp: Duration::ZERO,
     }))
 }
