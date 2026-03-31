@@ -83,13 +83,33 @@ fn start(ctx: &mut Ctx, args: &str) {
         None => return,
     };
 
-    // Assign scanner role
+    // Assign scanner role (also ensures RX thread is running)
     ctx.manager.assign_role(adapter_idx, AdapterRole::Scanner);
 
     // Parse scan flags from args
-    let (config, warnings) = parse_scan_flags(args);
+    let (mut config, warnings) = parse_scan_flags(args);
     for w in &warnings {
         ctx.layout.print(&format!("  {} {w}", prism::s().yellow().paint("warning:")));
+    }
+
+    // Auto-enable 6GHz if adapter supports it (unless user passed --no-6ghz explicitly).
+    // The flag --6ghz sets it to true; if user didn't pass --no-6ghz, we auto-detect.
+    let user_explicitly_disabled_6ghz = args.contains("--no-6ghz");
+    if !user_explicitly_disabled_6ghz && !config.scan_6ghz {
+        let bands = shared.supported_bands();
+        if bands.contains(&crate::core::channel::Band::Band6g) {
+            config.scan_6ghz = true;
+            ctx.layout.print(&format!("  {} 6GHz auto-enabled (adapter supports WiFi 6E)",
+                prism::s().cyan().paint("\u{25c6}")));
+        }
+    }
+
+    // Show adapter's channel settle time for transparency
+    let settle = shared.channel_settle_time();
+    if settle.as_millis() >= 50 {
+        ctx.layout.print(&format!("  {} Channel settle: {}ms (chipset PLL retune)",
+            prism::s().dim().paint("\u{25c6}"),
+            settle.as_millis()));
     }
 
     // Create scanner + module, start via SharedAdapter
@@ -103,7 +123,9 @@ fn start(ctx: &mut Ctx, args: &str) {
     let mut scanner_module = ScannerModule::new(Arc::clone(&scanner), ctx.store.clone());
     scanner_module.start(shared);
 
-    let channel_desc = if config.scan_2ghz && config.scan_5ghz {
+    let channel_desc = if config.scan_6ghz && config.scan_2ghz && config.scan_5ghz {
+        "2.4GHz + 5GHz + 6GHz"
+    } else if config.scan_2ghz && config.scan_5ghz {
         "2.4GHz + 5GHz"
     } else if config.scan_5ghz {
         "5GHz only"
@@ -206,7 +228,7 @@ mod tests {
         assert!(config.scan_5ghz);
         assert!(!config.scan_6ghz);
         assert_eq!(config.num_rounds, 0);
-        assert_eq!(config.dwell_time, Duration::from_millis(300));
+        assert_eq!(config.dwell_time, Duration::from_millis(500));
         assert!(config.custom_channels.is_none());
     }
 

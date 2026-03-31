@@ -1499,6 +1499,7 @@ impl Rt3572 {
             data: frame_data,
             rssi: rssi_dbm,
             channel,
+            band: if channel <= 14 { 0 } else { 1 },
             timestamp: Duration::ZERO, // filled by pipeline
         };
 

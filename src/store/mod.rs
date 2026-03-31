@@ -54,7 +54,7 @@ struct Inner {
     probes: RwLock<Vec<ProbeReq>>,
     capture_db: RwLock<CaptureDatabase>,
     events: EventRing<ScanEvent>,
-    channel_stats: RwLock<HashMap<u8, ChannelStats>>,
+    channel_stats: RwLock<HashMap<u16, ChannelStats>>,
     beacon_timing: RwLock<HashMap<MacAddress, BeaconTiming>>,
     frame_count: AtomicU64,
     eapol_frame_count: AtomicU64,
@@ -144,7 +144,7 @@ impl FrameStore {
     }
 
     /// Get a snapshot of channel stats.
-    pub fn get_channel_stats(&self) -> HashMap<u8, ChannelStats> {
+    pub fn get_channel_stats(&self) -> HashMap<u16, ChannelStats> {
         self.inner.channel_stats.read().unwrap().clone()
     }
 
@@ -181,6 +181,12 @@ impl FrameStore {
     /// Set the scan round (called by scanner engine).
     pub fn set_round(&self, round: u32) {
         self.inner.round.store(round, Ordering::Relaxed);
+    }
+
+    /// Clear channel stats (called when starting a new scan to remove stale entries
+    /// from a previous adapter's scan).
+    pub fn clear_channel_stats(&self) {
+        self.inner.channel_stats.write().unwrap().clear();
     }
 
     /// Current channel the scanner is on (set by scanner).
@@ -277,7 +283,7 @@ impl FrameStore {
     /// Get mutable access to channel stats.
     pub fn with_channel_stats_mut<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut HashMap<u8, ChannelStats>) -> R,
+        F: FnOnce(&mut HashMap<u16, ChannelStats>) -> R,
     {
         let mut stats = self.inner.channel_stats.write().unwrap();
         f(&mut stats)

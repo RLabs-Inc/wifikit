@@ -40,6 +40,8 @@ pub struct ParsedFrame {
     pub rssi: i8,
     /// Channel the frame was received on.
     pub channel: u8,
+    /// Band: 0=2.4GHz, 1=5GHz, 2=6GHz.
+    pub band: u8,
     /// Time since adapter init (from RX descriptor).
     pub timestamp: Duration,
 
@@ -377,14 +379,14 @@ const LLC_SNAP_PREFIX: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
 /// consumers via the pipeline channel.
 ///
 /// Adapter-independent — works with any chipset's RxFrame output.
-pub fn parse_frame(raw: &[u8], rssi: i8, channel: u8, timestamp: Duration) -> ParsedFrame {
+pub fn parse_frame(raw: &[u8], rssi: i8, channel: u8, band: u8, timestamp: Duration) -> ParsedFrame {
     let raw_arc = Arc::new(raw.to_vec());
 
     // Minimum frame: FC(2) bytes
     if raw.len() < 2 {
         return ParsedFrame {
             raw: raw_arc,
-            rssi, channel, timestamp,
+            rssi, channel, band, timestamp,
             frame_control: 0, frame_type: 0, frame_subtype: 0,
             duration: 0,
             addr1: None, addr2: None, addr3: None, addr4: None,
@@ -461,7 +463,7 @@ pub fn parse_frame(raw: &[u8], rssi: i8, channel: u8, timestamp: Duration) -> Pa
 
     ParsedFrame {
         raw: raw_arc,
-        rssi, channel, timestamp,
+        rssi, channel, band, timestamp,
         frame_control: fc, frame_type: ftype, frame_subtype: fsubtype,
         duration,
         addr1, addr2, addr3, addr4,
@@ -967,13 +969,13 @@ mod tests {
 
     #[test]
     fn test_parse_frame_too_short() {
-        let frame = parse_frame(&[], -50, 6, Duration::ZERO);
+        let frame = parse_frame(&[], -50, 6, 0, Duration::ZERO);
         assert!(matches!(frame.body, FrameBody::Unparseable { .. }));
     }
 
     #[test]
     fn test_parse_frame_one_byte() {
-        let frame = parse_frame(&[0x80], -50, 6, Duration::ZERO);
+        let frame = parse_frame(&[0x80], -50, 6, 0, Duration::ZERO);
         assert!(matches!(frame.body, FrameBody::Unparseable { .. }));
     }
 
@@ -1004,7 +1006,7 @@ mod tests {
         frame[40] = b's';
         frame[41] = b't';
 
-        let parsed = parse_frame(&frame, -42, 11, Duration::from_millis(100));
+        let parsed = parse_frame(&frame, -42, 11, 0, Duration::from_millis(100));
 
         assert_eq!(parsed.frame_type, 0); // management
         assert_eq!(parsed.frame_subtype, 8); // beacon
@@ -1046,7 +1048,7 @@ mod tests {
         frame[36] = 0x00; // body_len high
         frame[37] = 0x00; // body_len low
 
-        let parsed = parse_frame(&frame, -55, 6, Duration::from_millis(500));
+        let parsed = parse_frame(&frame, -55, 6, 0, Duration::from_millis(500));
 
         assert_eq!(parsed.frame_type, 2); // data
         assert!(parsed.is_qos);
@@ -1077,7 +1079,7 @@ mod tests {
         frame[24] = 0x07; // reason = 7 (Class3FromNonAssoc)
         frame[25] = 0x00;
 
-        let parsed = parse_frame(&frame, -60, 1, Duration::ZERO);
+        let parsed = parse_frame(&frame, -60, 1, 0, Duration::ZERO);
 
         match &parsed.body {
             FrameBody::Deauth { source, target, reason, .. } => {
@@ -1099,7 +1101,7 @@ mod tests {
         frame[4..10].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]); // RA
         frame[10..16].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // TA
 
-        let parsed = parse_frame(&frame, -70, 36, Duration::ZERO);
+        let parsed = parse_frame(&frame, -70, 36, 1, Duration::ZERO);
 
         assert_eq!(parsed.frame_type, 1); // control
         assert_eq!(parsed.frame_subtype, 11); // RTS
@@ -1123,7 +1125,7 @@ mod tests {
         frame[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // addr1 = BSSID
         frame[10..16].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]); // addr2 = STA
 
-        let parsed = parse_frame(&frame, -45, 6, Duration::ZERO);
+        let parsed = parse_frame(&frame, -45, 6, 0, Duration::ZERO);
 
         match &parsed.body {
             FrameBody::Data { payload: DataPayload::Null, direction, .. } => {
@@ -1142,7 +1144,7 @@ mod tests {
         frame[4..10].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
         frame[10..16].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
 
-        let parsed = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let parsed = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
 
         match &parsed.body {
             FrameBody::Data { payload: DataPayload::Encrypted, .. } => {}
@@ -1159,7 +1161,7 @@ mod tests {
             frame[0] = fc0;
             frame[1] = 0x01; // To-DS
 
-            let parsed = parse_frame(&frame, -50, 6, Duration::ZERO);
+            let parsed = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
             assert!(parsed.is_qos, "subtype {} should be QoS", subtype);
         }
 
@@ -1170,7 +1172,7 @@ mod tests {
             frame[0] = fc0;
             frame[1] = 0x01;
 
-            let parsed = parse_frame(&frame, -50, 6, Duration::ZERO);
+            let parsed = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
             assert!(!parsed.is_qos, "subtype {} should NOT be QoS", subtype);
         }
     }
@@ -1257,7 +1259,7 @@ mod tests {
         body.extend_from_slice(&[0x00, 0x04]); // SSID IE: tag=0, len=4
         body.extend_from_slice(b"Test");
         let frame = make_mgmt(8, &body); // subtype 8 = beacon
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Beacon { .. }), "beacon → FrameBody::Beacon");
     }
 
@@ -1267,7 +1269,7 @@ mod tests {
         body.extend_from_slice(&[0x00, 0x04]);
         body.extend_from_slice(b"Test");
         let frame = make_mgmt(5, &body); // subtype 5 = probe response
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Beacon { .. }), "probe resp → FrameBody::Beacon");
     }
 
@@ -1275,7 +1277,7 @@ mod tests {
     fn route_probe_request() {
         let body = vec![0x00, 0x03, b'F', b'o', b'o']; // SSID IE
         let frame = make_mgmt(4, &body); // subtype 4 = probe request
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::ProbeReq { .. }), "probe req → FrameBody::ProbeReq");
     }
 
@@ -1283,7 +1285,7 @@ mod tests {
     fn route_auth() {
         let body = [0x00, 0x00, 0x01, 0x00, 0x00, 0x00]; // algo=0, seq=1, status=0
         let frame = make_mgmt(11, &body); // subtype 11 = auth
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Auth { .. }), "auth → FrameBody::Auth");
     }
 
@@ -1291,7 +1293,7 @@ mod tests {
     fn route_deauth() {
         let body = [0x03, 0x00]; // reason=3
         let frame = make_mgmt(12, &body); // subtype 12 = deauth
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Deauth { .. }), "deauth → FrameBody::Deauth");
     }
 
@@ -1299,7 +1301,7 @@ mod tests {
     fn route_disassoc() {
         let body = [0x08, 0x00]; // reason=8
         let frame = make_mgmt(10, &body); // subtype 10 = disassoc
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Disassoc { .. }), "disassoc → FrameBody::Disassoc");
     }
 
@@ -1309,7 +1311,7 @@ mod tests {
         body.extend_from_slice(&[0x00, 0x04]); // SSID IE
         body.extend_from_slice(b"Test");
         let frame = make_mgmt(0, &body); // subtype 0 = assoc req
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::AssocReq { .. }), "assoc req → FrameBody::AssocReq");
     }
 
@@ -1317,7 +1319,7 @@ mod tests {
     fn route_assoc_resp() {
         let body = [0x01, 0x00, 0x00, 0x00, 0x01, 0x00]; // cap(2) + status=0 + aid=1
         let frame = make_mgmt(1, &body); // subtype 1 = assoc resp
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::AssocResp { .. }), "assoc resp → FrameBody::AssocResp");
     }
 
@@ -1327,7 +1329,7 @@ mod tests {
         body.extend_from_slice(&[0x00, 0x04]); // SSID IE
         body.extend_from_slice(b"Test");
         let frame = make_mgmt(2, &body); // subtype 2 = reassoc req
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::ReassocReq { .. }), "reassoc req → FrameBody::ReassocReq");
     }
 
@@ -1335,7 +1337,7 @@ mod tests {
     fn route_reassoc_resp() {
         let body = [0x01, 0x00, 0x00, 0x00, 0x01, 0x00]; // same as assoc resp
         let frame = make_mgmt(3, &body); // subtype 3 = reassoc resp
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::ReassocResp { .. }), "reassoc resp → FrameBody::ReassocResp");
     }
 
@@ -1343,7 +1345,7 @@ mod tests {
     fn route_action() {
         let body = [0x08, 0x00, 0x01, 0x00]; // category=8 (SA Query), action=0, txid
         let frame = make_mgmt(13, &body); // subtype 13 = action
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Action { .. }), "action → FrameBody::Action");
     }
 
@@ -1352,7 +1354,7 @@ mod tests {
     #[test]
     fn route_data_plain() {
         let frame = make_data_frame(false, true, false, false, &[0x00; 10]);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Data { .. }), "data → FrameBody::Data");
     }
 
@@ -1365,7 +1367,7 @@ mod tests {
         frame[4..10].copy_from_slice(&[0xAA; 6]);
         frame[10..16].copy_from_slice(&[0xBB; 6]);
         frame[16..22].copy_from_slice(&[0xCC; 6]);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload, .. } = &pf.body {
             assert!(matches!(payload, DataPayload::Null), "null data → DataPayload::Null");
         } else {
@@ -1376,7 +1378,7 @@ mod tests {
     #[test]
     fn route_data_encrypted() {
         let frame = make_data_frame(false, true, false, true, &[0x00; 20]);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload, .. } = &pf.body {
             assert!(matches!(payload, DataPayload::Encrypted), "protected=1 → DataPayload::Encrypted");
         } else {
@@ -1389,7 +1391,7 @@ mod tests {
         // LLC/SNAP with ethertype 0x0800 (IPv4)
         let payload = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00, 0x45, 0x00];
         let frame = make_data_frame(false, true, false, false, &payload);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: dp, .. } = &pf.body {
             assert!(matches!(dp, DataPayload::Llc { ethertype: 0x0800 }),
                 "IPv4 LLC → DataPayload::Llc {{ ethertype: 0x0800 }}, got {:?}", dp);
@@ -1405,7 +1407,7 @@ mod tests {
         // M1: pairwise=1, ack=1, mic=0 → ki = 0x008A
         let eapol = make_eapol_key(0x008A);
         let frame = make_data_frame(false, true, false, false, &eapol);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } = &pf.body {
             if let crate::protocol::eapol::ParsedEapol::Key { message, .. } = parsed {
                 assert_eq!(*message, crate::protocol::eapol::HandshakeMessage::M1,
@@ -1423,7 +1425,7 @@ mod tests {
         // Same as above but QoS data frame (subtype 8)
         let eapol = make_eapol_key(0x008A);
         let frame = make_data_frame(false, true, true, false, &eapol);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } = &pf.body {
             if let crate::protocol::eapol::ParsedEapol::Key { message, .. } = parsed {
                 assert_eq!(*message, crate::protocol::eapol::HandshakeMessage::M1,
@@ -1441,7 +1443,7 @@ mod tests {
         // M2: pairwise=1, mic=1, no ack/install/secure → ki = 0x010A
         let eapol = make_eapol_key(0x010A);
         let frame = make_data_frame(true, false, true, false, &eapol);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } = &pf.body {
             if let crate::protocol::eapol::ParsedEapol::Key { message, .. } = parsed {
                 assert_eq!(*message, crate::protocol::eapol::HandshakeMessage::M2,
@@ -1459,7 +1461,7 @@ mod tests {
         // M3: pairwise=1, ack=1, mic=1, install=1, secure=1, encrypted=1 → ki = 0x13CA
         let eapol = make_eapol_key(0x13CA);
         let frame = make_data_frame(false, true, true, false, &eapol);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } = &pf.body {
             if let crate::protocol::eapol::ParsedEapol::Key { message, .. } = parsed {
                 assert_eq!(*message, crate::protocol::eapol::HandshakeMessage::M3,
@@ -1477,7 +1479,7 @@ mod tests {
         // M4: pairwise=1, mic=1, secure=1, no ack/install → ki = 0x030A
         let eapol = make_eapol_key(0x030A);
         let frame = make_data_frame(true, false, true, false, &eapol);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } = &pf.body {
             if let crate::protocol::eapol::ParsedEapol::Key { message, .. } = parsed {
                 assert_eq!(*message, crate::protocol::eapol::HandshakeMessage::M4,
@@ -1495,7 +1497,7 @@ mod tests {
         // M3 with Protected=0 (normal monitor mode capture) — must NOT be Encrypted
         let eapol = make_eapol_key(0x13CA);
         let frame = make_data_frame(false, true, true, false, &eapol);
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload, .. } = &pf.body {
             assert!(!matches!(payload, DataPayload::Encrypted),
                 "M3 with protected=false must NOT be classified as Encrypted");
@@ -1515,7 +1517,7 @@ mod tests {
         frame[1] = 0x00;
         frame[4..10].copy_from_slice(&[0xAA; 6]); // RA
         frame[10..16].copy_from_slice(&[0xBB; 6]); // TA
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Control { detail: ControlDetail::Rts { .. } }),
             "RTS → ControlDetail::Rts");
     }
@@ -1526,7 +1528,7 @@ mod tests {
         frame[0] = 0xC4; // type=1 (ctrl), subtype=12 (CTS)
         frame[1] = 0x00;
         frame[4..10].copy_from_slice(&[0xAA; 6]); // RA
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Control { detail: ControlDetail::Cts { .. } }),
             "CTS → ControlDetail::Cts");
     }
@@ -1537,7 +1539,7 @@ mod tests {
         frame[0] = 0xD4; // type=1 (ctrl), subtype=13 (ACK)
         frame[1] = 0x00;
         frame[4..10].copy_from_slice(&[0xAA; 6]); // RA
-        let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+        let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         assert!(matches!(pf.body, FrameBody::Control { detail: ControlDetail::Ack { .. } }),
             "ACK → ControlDetail::Ack");
     }
@@ -1576,7 +1578,7 @@ mod tests {
             };
 
             let frame = make_mgmt(*subtype, &body);
-            let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+            let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
 
             let variant_name = match &pf.body {
                 FrameBody::Beacon { .. } => "Beacon",
@@ -1616,7 +1618,7 @@ mod tests {
         for (name, ki, expected_msg, to_ds, from_ds) in &cases {
             let eapol = make_eapol_key(*ki);
             let frame = make_data_frame(*to_ds, *from_ds, true, false, &eapol);
-            let pf = parse_frame(&frame, -50, 6, Duration::ZERO);
+            let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
 
             match &pf.body {
                 FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } => {

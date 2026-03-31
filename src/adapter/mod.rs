@@ -220,19 +220,35 @@ impl AdapterManager {
     // assign_role(Scanner) sets scanner_idx, assign_role(Attack) sets attack_idx.
     // clear_role(Scanner) only clears scanner_idx, never touches attack_idx.
 
-    /// Assign a role to an adapter.
+    /// Assign a role to an adapter. Ensures RX thread is running.
     pub fn assign_role(&mut self, index: usize, role: AdapterRole) {
         match role {
             AdapterRole::Scanner => self.scanner_idx = Some(index),
             AdapterRole::Attack  => self.attack_idx = Some(index),
         }
+        // Ensure RX thread is running — may have been idled after a previous role ended.
+        if let Some(slot) = self.slots.get(index) {
+            if let Some(ref shared) = slot.shared {
+                shared.start_rx();
+            }
+        }
     }
 
-    /// Clear a specific role assignment.
-    pub fn clear_role(&mut self, _index: usize, role: AdapterRole) {
+    /// Clear a specific role assignment. Idles RX thread if adapter has no remaining roles.
+    pub fn clear_role(&mut self, index: usize, role: AdapterRole) {
         match role {
             AdapterRole::Scanner => self.scanner_idx = None,
             AdapterRole::Attack  => self.attack_idx = None,
+        }
+        // If this adapter has no remaining roles, idle its RX thread.
+        // Single-adapter mode: clearing Attack still leaves Scanner → RX stays running.
+        let has_role = self.scanner_idx == Some(index) || self.attack_idx == Some(index);
+        if !has_role {
+            if let Some(slot) = self.slots.get(index) {
+                if let Some(ref shared) = slot.shared {
+                    shared.stop_rx();
+                }
+            }
         }
     }
 

@@ -13,6 +13,7 @@ use super::frame::{RxFrame, TxOptions};
 pub enum ChipId {
     Rtl8812au,
     Rtl8812bu,
+    Rtl8852au,
     Mt7921au,
     Mt7612u,
     Mt76x1,
@@ -23,6 +24,7 @@ impl fmt::Display for ChipId {
         match self {
             ChipId::Rtl8812au => write!(f, "RTL8812AU"),
             ChipId::Rtl8812bu => write!(f, "RTL8812BU"),
+            ChipId::Rtl8852au => write!(f, "RTL8852AU"),
             ChipId::Mt7921au => write!(f, "MT7921AU"),
             ChipId::Mt7612u  => write!(f, "MT7612U"),
             ChipId::Mt76x1   => write!(f, "MT76x1"),
@@ -48,6 +50,7 @@ bitflags::bitflags! {
         const BW160    = 1 << 9;
         const CSI      = 1 << 10;
         const TX_POWER = 1 << 11;
+        const BAND_6G  = 1 << 12;
     }
 }
 
@@ -116,7 +119,7 @@ pub const KNOWN_ADAPTERS: &[KnownAdapter] = &[
     KnownAdapter { vid: 0x2357, pid: 0x010E, chip: ChipId::Rtl8812au, name: "TP-Link Archer T4UH V2 (RTL8812AU)" },
     KnownAdapter { vid: 0x2357, pid: 0x010F, chip: ChipId::Rtl8812au, name: "TP-Link (RTL8812AU)" },
     KnownAdapter { vid: 0x2357, pid: 0x0122, chip: ChipId::Rtl8812au, name: "TP-Link (RTL8812AU)" },
-    KnownAdapter { vid: 0x2604, pid: 0x0012, chip: ChipId::Rtl8812au, name: "Tenda U12 (RTL8812AU)" },
+    KnownAdapter { vid: 0x2604, pid: 0x0012, chip: ChipId::Rtl8812au, name: "Tenda U12 (RTL8812AU)" },  // Note: same VID/PID may also be Tenda U18a on RTL8832AU — check chip ID
     KnownAdapter { vid: 0x7392, pid: 0xA822, chip: ChipId::Rtl8812au, name: "Edimax EW-7822UAC (RTL8812AU)" },
     KnownAdapter { vid: 0x0409, pid: 0x0408, chip: ChipId::Rtl8812au, name: "NEC (RTL8812AU)" },
     // RTL8812BU adapters (USB 3.0, 802.11ac dual-band)
@@ -125,6 +128,16 @@ pub const KNOWN_ADAPTERS: &[KnownAdapter] = &[
     KnownAdapter { vid: 0x0B05, pid: 0x184C, chip: ChipId::Rtl8812bu, name: "ASUS USB-AC55 B1 (RTL8812BU)" },
     KnownAdapter { vid: 0x0846, pid: 0x9052, chip: ChipId::Rtl8812bu, name: "Netgear A6100 (RTL8812BU)" },
     KnownAdapter { vid: 0x0BDA, pid: 0xB812, chip: ChipId::Rtl8812bu, name: "Realtek RTL8812BU (generic)" },
+    // RTL8852AU adapters (WiFi 6, AX1800, USB 3.0, 2T2R dual-band)
+    KnownAdapter { vid: 0x2357, pid: 0x013F, chip: ChipId::Rtl8852au, name: "TP-Link Archer TX20U Plus (RTL8852AU)" },
+    KnownAdapter { vid: 0x2357, pid: 0x012F, chip: ChipId::Rtl8852au, name: "TP-Link Archer TX20U Plus (RTL8852AU)" },
+    KnownAdapter { vid: 0x2357, pid: 0x012E, chip: ChipId::Rtl8852au, name: "TP-Link Archer TX20U Nano (RTL8852AU)" },
+    KnownAdapter { vid: 0x0BDA, pid: 0x885A, chip: ChipId::Rtl8852au, name: "Realtek RTL8852AU" },
+    KnownAdapter { vid: 0x0BDA, pid: 0x885C, chip: ChipId::Rtl8852au, name: "Realtek RTL8832AU" },
+    KnownAdapter { vid: 0x0BDA, pid: 0x8832, chip: ChipId::Rtl8852au, name: "Realtek RTL8832AU" },
+    KnownAdapter { vid: 0x0B05, pid: 0x1A62, chip: ChipId::Rtl8852au, name: "ASUS USB-AX56 (RTL8832AU)" },
+    KnownAdapter { vid: 0x0B05, pid: 0x1997, chip: ChipId::Rtl8852au, name: "ASUS USB-AX56 (RTL8832AU)" },
+    KnownAdapter { vid: 0x0411, pid: 0x0312, chip: ChipId::Rtl8852au, name: "BUFFALO WI-U3-1200AX2 (RTL8852AU)" },
     // MT7921AU adapters (USB 3.0, 802.11ax WiFi 6 dual-band)
     KnownAdapter { vid: 0x0E8D, pid: 0x7961, chip: ChipId::Mt7921au, name: "MediaTek MT7921AU (combo BT+WiFi)" },
     KnownAdapter { vid: 0x3574, pid: 0x6211, chip: ChipId::Mt7921au, name: "COMFAST CF-952AX (MT7921AU)" },
@@ -207,6 +220,30 @@ pub trait ChipDriver: Send {
 
     // Calibration
     fn calibrate(&mut self) -> Result<()>;
+
+    // ── Capabilities (adapters override these) ──
+
+    /// Minimum time to wait after set_channel() before the radio is receiving.
+    /// Accounts for PLL retune, AGC settling, and firmware processing.
+    /// The scanner sleeps this duration after each channel switch.
+    ///
+    /// Default: 10ms (conservative for register-based chips).
+    /// Override for MCU-based chips with longer firmware retune (e.g., MT7921: 200ms).
+    fn channel_settle_time(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+
+    /// Which bands this adapter supports. Derived from supported_channels().
+    /// Used by the scanner to auto-enable band scanning.
+    fn supported_bands(&self) -> Vec<Band> {
+        let mut bands = Vec::new();
+        for ch in self.supported_channels() {
+            if !bands.contains(&ch.band) {
+                bands.push(ch.band);
+            }
+        }
+        bands
+    }
 
     // ── RX split support (pipeline architecture) ──
 

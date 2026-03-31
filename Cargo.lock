@@ -298,16 +298,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "prism"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "libc",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,6 +322,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "rlabs-prism"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe30f63b6951ea98ca3caeb1c398d4a5357f4991722b995c3314c46bbc5b3e0c"
+dependencies = [
+ "crossterm",
+ "libc",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -510,7 +512,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "prism",
+ "rlabs-prism",
  "rusb",
  "sha2",
  "thiserror",

@@ -36,7 +36,7 @@ use crate::core::channel::Channel;
 ///
 /// Called once per frame by the pipeline thread. Must be fast —
 /// the pipeline thread processes frames at 300+ fps.
-pub fn process_frame(pf: &ParsedFrame, channel: u8, store: &FrameStore) {
+pub fn process_frame(pf: &ParsedFrame, channel: u8, band: u8, store: &FrameStore) {
     // Unparseable frames — skip
     if matches!(&pf.body, FrameBody::Unparseable { .. }) {
         return;
@@ -44,19 +44,15 @@ pub fn process_frame(pf: &ParsedFrame, channel: u8, store: &FrameStore) {
 
     store.inc_frame_count();
 
-    // Retry bit tracking
-    if pf.retry {
-        store.with_channel_stats_mut(|stats| {
-            if let Some(cs) = stats.get_mut(&channel) {
-                cs.retry_count += 1;
-            }
-        });
-    }
-
-    // Channel stats frame counting
+    // Channel stats: create entry on first frame, count every frame + retries.
+    // Key is (band<<8 | channel) to distinguish 6GHz ch1 from 2.4GHz ch1.
+    let key = crate::store::stats::channel_key(channel, band);
     store.with_channel_stats_mut(|stats| {
-        if let Some(cs) = stats.get_mut(&channel) {
-            cs.frame_count += 1;
+        let cs = stats.entry(key)
+            .or_insert_with(|| ChannelStats::new(channel, band));
+        cs.frame_count += 1;
+        if pf.retry {
+            cs.retry_count += 1;
         }
     });
 

@@ -465,10 +465,12 @@ impl Shell {
                 self.layout.print(line);
             }
 
-            // Clear attack adapter role when attack completes
+            // Clear attack adapter role when attack completes.
+            // AdapterManager.clear_role() handles RX thread lifecycle:
+            // if the adapter has no remaining roles, its RX thread is idled.
             if module.module_type() == ModuleType::Attack {
-                if let Some((idx, _)) = self.manager.attack_adapter() {
-                    self.manager.clear_role(idx, crate::adapter::AdapterRole::Attack);
+                if let Some((atk_idx, _)) = self.manager.attack_adapter() {
+                    self.manager.clear_role(atk_idx, crate::adapter::AdapterRole::Attack);
                 }
             }
         }

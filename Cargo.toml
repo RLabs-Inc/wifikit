@@ -10,7 +10,7 @@ rusb = "0.9"
 thiserror = "2"
 crossterm = "0.28"
 unicode-width = "0.2"
-prism = { path = "../prism-rs" }
+prism = { package = "rlabs-prism", version = "0.1" }
 
 # Crypto (RustCrypto family — pure Rust, no system deps)
 sha2 = "0.10"

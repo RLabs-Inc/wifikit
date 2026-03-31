@@ -1378,14 +1378,31 @@ impl Rtl8852au {
     //  Channel setting (minimal — sets via BB/RF register for now)
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Channel switching — currently stores channel only.
-    /// TODO: Implement H2C channel switch commands (4 H2C packets via EP7)
-    /// matching the usbmon capture at lines 40233-40236.
-    /// Direct BB register writes bypass firmware and break the radio config.
+    /// Channel switching — verbatim pcap replay per channel.
+    /// Uses complete register + bulk command sequences from usbmon capture.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
-        // Store channel number — the usbmon replay configured the radio
-        // for a default channel. Full channel hopping needs H2C commands.
-        self.channel = ch;
+        use rtl8852a_post_boot::PostBootOp;
+
+        let seq: Option<&[PostBootOp]> = match ch {
+            1  => Some(super::rtl8852a_phase_ch1::CH1_SEQUENCE),
+            6  => Some(super::rtl8852a_phase_ch6_2g::CH6_2G_SEQUENCE),
+            11 => Some(super::rtl8852a_phase_ch11_2g::CH11_2G_SEQUENCE),
+            36 => Some(super::rtl8852a_phase_ch36_5g::CH36_5G_SEQUENCE),
+            48 => Some(super::rtl8852a_phase_ch48_5g::CH48_5G_SEQUENCE),
+            149 => Some(super::rtl8852a_phase_ch149_5g::CH149_5G_SEQUENCE),
+            165 => Some(super::rtl8852a_phase_ch165_5g::CH165_5G_SEQUENCE),
+            // For channels without pcap data, use the BB direct method as fallback
+            _ => None,
+        };
+
+        if let Some(seq) = seq {
+            self.replay_phase_complete(&format!("Ch{}", ch), seq, false)?;
+            self.channel = ch;
+        } else {
+            // Fallback: BB register direct switching for channels without pcap data
+            self.set_channel_bb_direct(ch)?;
+            self.channel = ch;
+        }
         Ok(())
     }
 
@@ -1588,23 +1605,33 @@ impl Rtl8852au {
 
         for op in seq {
             match op {
-                PostBootOp::Read(addr, width) => {
-                    let _ = match width {
-                        1 => self.read8(*addr).map(|_| ()),
-                        2 => self.read16(*addr).map(|_| ()),
-                        _ => self.read32(*addr).map(|_| ()),
+                PostBootOp::Read(full_addr, width) => {
+                    let _ = if *full_addr > 0xFFFF {
+                        self.read32_ext(*full_addr).map(|_| ())
+                    } else {
+                        let addr = *full_addr as u16;
+                        match width {
+                            1 => self.read8(addr).map(|_| ()),
+                            2 => self.read16(addr).map(|_| ()),
+                            _ => self.read32(addr).map(|_| ()),
+                        }
                     };
                     read_ok += 1;
                 }
-                PostBootOp::Write(addr, val, width) => {
-                    let result = match width {
-                        1 => self.write8(*addr, *val as u8),
-                        2 => self.write16(*addr, *val as u16),
-                        _ => self.write32(*addr, *val),
+                PostBootOp::Write(full_addr, val, width) => {
+                    let result = if *full_addr > 0xFFFF {
+                        self.write32_ext(*full_addr, *val)
+                    } else {
+                        let addr = *full_addr as u16;
+                        match width {
+                            1 => self.write8(addr, *val as u8),
+                            2 => self.write16(addr, *val as u16),
+                            _ => self.write32(addr, *val),
+                        }
                     };
                     if let Err(e) = result {
                         if write_fail < 3 {
-                            eprintln!("[RTL8852AU]   W 0x{:04X} = 0x{:08X} FAILED: {}", addr, val, e);
+                            eprintln!("[RTL8852AU]   W 0x{:08X} = 0x{:08X} FAILED: {}", full_addr, val, e);
                         }
                         write_fail += 1;
                     } else {
@@ -1613,11 +1640,9 @@ impl Rtl8852au {
                 }
                 PostBootOp::BulkOut(ep, data) => {
                     if *ep == 0x05 {
-                        // EP5 TX probe frames — skip during init replay
                         bulk_fail += 1;
                         continue;
                     }
-                    // EP7 H2C firmware commands — these ARE init config
                     let target_ep = self.ep_fw;
                     match self.handle.write_bulk(target_ep, data, Duration::from_millis(1000)) {
                         Ok(_) => {
@@ -1641,6 +1666,112 @@ impl Rtl8852au {
 
         eprintln!("[RTL8852AU] {} complete: R={} W={}/{} Bulk={}/{}",
             name, read_ok, write_ok, write_ok + write_fail, bulk_ok, bulk_ok + bulk_fail);
+        Ok(())
+    }
+
+    /// COMPLETE replay — sends ALL operations including EP5 bulk.
+    /// skip_fw_bulk: if true, skips the first 182 EP7 bulk commands (FW download chunks)
+    /// that we already sent via load_firmware(). Not skipping a step — avoiding duplicate FW load.
+    fn replay_phase_complete(&self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
+                              skip_fw_bulk: bool) -> Result<()> {
+        use rtl8852a_post_boot::PostBootOp;
+        eprintln!("[RTL8852AU] {}: replaying {} ops{}...",
+            name, seq.len(),
+            if skip_fw_bulk { " (skip FW download bulk)" } else { "" });
+
+        let mut read_ok = 0usize;
+        let mut write_ok = 0usize;
+        let mut write_fail = 0usize;
+        let mut bulk_ok = 0usize;
+        let mut bulk_fail = 0usize;
+        let mut bulk_skip = 0usize;
+        let mut ep7_count = 0usize;
+        let total = seq.len();
+
+        // FW download = first 182 EP7 bulk commands (128B header + 181 sections)
+        const FW_DOWNLOAD_EP7_COUNT: usize = 182;
+
+        for op in seq {
+            match op {
+                PostBootOp::Read(full_addr, width) => {
+                    // Addresses > 0xFFFF have wIndex in upper 16 bits (BB/RF space)
+                    let _ = if *full_addr > 0xFFFF {
+                        self.read32_ext(*full_addr).map(|_| ())
+                    } else {
+                        let addr = *full_addr as u16;
+                        match width {
+                            1 => self.read8(addr).map(|_| ()),
+                            2 => self.read16(addr).map(|_| ()),
+                            _ => self.read32(addr).map(|_| ()),
+                        }
+                    };
+                    read_ok += 1;
+                }
+                PostBootOp::Write(full_addr, val, width) => {
+                    // Addresses > 0xFFFF have wIndex in upper 16 bits (BB/RF space)
+                    let result = if *full_addr > 0xFFFF {
+                        self.write32_ext(*full_addr, *val)
+                    } else {
+                        let addr = *full_addr as u16;
+                        match width {
+                            1 => self.write8(addr, *val as u8),
+                            2 => self.write16(addr, *val as u16),
+                            _ => self.write32(addr, *val),
+                        }
+                    };
+                    if let Err(e) = result {
+                        if write_fail < 5 {
+                            eprintln!("[RTL8852AU]   W 0x{:08X} = 0x{:08X} FAILED: {}",
+                                full_addr, val, e);
+                        }
+                        write_fail += 1;
+                    } else {
+                        write_ok += 1;
+                    }
+                }
+                PostBootOp::BulkOut(ep, data) => {
+                    // Skip FW download EP7 bulk commands (already loaded via load_firmware)
+                    if skip_fw_bulk && *ep == 0x07 {
+                        ep7_count += 1;
+                        if ep7_count <= FW_DOWNLOAD_EP7_COUNT {
+                            bulk_skip += 1;
+                            continue;
+                        }
+                    }
+
+                    let target_ep = if *ep == 0x07 { self.ep_fw } else { self.ep_out };
+                    // Short timeout — H2C commands respond instantly or not at all
+                    let timeout = Duration::from_millis(200);
+                    match self.handle.write_bulk(target_ep, data, timeout) {
+                        Ok(_) => {
+                            bulk_ok += 1;
+                            if bulk_ok <= 10 || bulk_ok % 50 == 0 {
+                                eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): OK [#{}]",
+                                    ep, data.len(), bulk_ok);
+                            }
+                        }
+                        Err(e) => {
+                            bulk_fail += 1;
+                            if bulk_fail <= 3 {
+                                eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): FAILED: {} [#{}]",
+                                    ep, data.len(), e, bulk_ok + bulk_fail);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let done = read_ok + write_ok + write_fail + bulk_ok + bulk_fail + bulk_skip;
+            if done % 5000 == 0 && done > 0 {
+                eprintln!("[RTL8852AU]   {}/{}: R={} W={}/{} B={}/{} skip={}",
+                    done, total, read_ok, write_ok, write_ok + write_fail,
+                    bulk_ok, bulk_ok + bulk_fail, bulk_skip);
+            }
+        }
+
+        eprintln!("[RTL8852AU] {} complete: R={} W={}/{} Bulk={}/{} skipped={}",
+            name, read_ok, write_ok, write_ok + write_fail,
+            bulk_ok, bulk_ok + bulk_fail, bulk_skip);
         Ok(())
     }
 
@@ -1691,30 +1822,40 @@ impl Rtl8852au {
 
         for (idx, op) in post_fwdl.iter().enumerate() {
             match op {
-                PostBootOp::Read(addr, width) => {
-                    let _ = match width {
-                        1 => self.read8(*addr).map(|_| ()),
-                        2 => self.read16(*addr).map(|_| ()),
-                        _ => self.read32(*addr).map(|_| ()),
+                PostBootOp::Read(full_addr, width) => {
+                    let _ = if *full_addr > 0xFFFF {
+                        self.read32_ext(*full_addr).map(|_| ())
+                    } else {
+                        let addr = *full_addr as u16;
+                        match width {
+                            1 => self.read8(addr).map(|_| ()),
+                            2 => self.read16(addr).map(|_| ()),
+                            _ => self.read32(addr).map(|_| ()),
+                        }
                     };
                     read_ok += 1;
                 }
-                PostBootOp::Write(addr, val, width) => {
+                PostBootOp::Write(full_addr, val, width) => {
                     // Skip board-specific registers
-                    if Self::SKIP_REGS.contains(addr) {
+                    let short_addr = (*full_addr & 0xFFFF) as u16;
+                    if Self::SKIP_REGS.contains(&short_addr) {
                         skipped += 1;
                         continue;
                     }
-                    let result = match width {
-                        1 => self.write8(*addr, *val as u8),
-                        2 => self.write16(*addr, *val as u16),
-                        _ => self.write32(*addr, *val),
+                    let result = if *full_addr > 0xFFFF {
+                        self.write32_ext(*full_addr, *val)
+                    } else {
+                        match width {
+                            1 => self.write8(short_addr, *val as u8),
+                            2 => self.write16(short_addr, *val as u16),
+                            _ => self.write32(short_addr, *val),
+                        }
                     };
                     match result {
                         Ok(()) => write_ok += 1,
                         Err(e) => {
                             if write_fail < 5 {
-                                eprintln!("[RTL8852AU]   W 0x{:04X} = 0x{:08X} FAILED: {}", addr, val, e);
+                                eprintln!("[RTL8852AU]   W 0x{:08X} = 0x{:08X} FAILED: {}", full_addr, val, e);
                             }
                             write_fail += 1;
                         }
@@ -1834,7 +1975,7 @@ impl Rtl8852au {
     ];
 
     fn chip_init(&mut self) -> Result<()> {
-        eprintln!("[RTL8852AU] ═══ RTL8852AU WiFi 6 Init (HYBRID: our FWDL + pcap post-boot) ═══");
+        eprintln!("[RTL8852AU] ═══ RTL8852AU WiFi 6 Init (COMPLETE — no shortcuts) ═══");
 
         // Verify USB communication
         let chip_id = self.read8(0x00FC)?;
@@ -1846,7 +1987,7 @@ impl Rtl8852au {
         eprintln!("[RTL8852AU] EP: tx=0x{:02X} rx=0x{:02X} fw=0x{:02X}",
             self.ep_out, self.ep_in, self.ep_fw);
 
-        // ── Phase 0: Pre-FWDL (our proven code) ──
+        // ── Phase 0: Pre-FWDL (our proven read-modify-write code) ──
         self.power_on()?;
         self.dmac_pre_init_and_enable_cpu()?;
 
@@ -1870,17 +2011,25 @@ impl Rtl8852au {
         }
         eprintln!("[RTL8852AU] USB endpoints re-synced");
 
-        // ── Phase 2: FULL pcap replay (post-FWDL portion) ──
-        // Replay ALL ops from 01_fw_and_post_boot + monitor + ch1 + txpower + rxtx
-        // Skip: bulk commands (FW already uploaded), 0x0010 (board-specific power reg)
-        self.replay_pcap_post_fwdl()?;
+        // ── Phase 2: Post-FWDL — COMPLETE replay (skip FW download bulk, keep EVERYTHING else) ──
+        self.replay_phase_complete("Post-FWDL",
+            super::rtl8852a_phase_post_fwdl::POST_FWDL_SEQUENCE, true)?;
 
-        self.dump_key_regs("After full pcap replay");
+        // ── Phase 3: Monitor mode ──
+        self.replay_phase_complete("Monitor",
+            super::rtl8852a_phase_monitor::MONITOR_SEQUENCE, false)?;
+
+        // ── Phase 4: Default channel (ch1 2.4GHz) ──
+        self.replay_phase_complete("Channel 1",
+            super::rtl8852a_phase_ch1::CH1_SEQUENCE, false)?;
+        self.channel = 1;
+
+        self.dump_key_regs("After complete init");
 
         // ── Read MAC address ──
         self.read_mac_address()?;
 
-        eprintln!("[RTL8852AU] ═══ Init complete ═══");
+        eprintln!("[RTL8852AU] ═══ Init complete (ALL phases replayed, nothing skipped) ═══");
         Ok(())
     }
 
@@ -2098,7 +2247,12 @@ impl ChipDriver for Rtl8852au {
     }
 
     fn set_monitor_mode(&mut self) -> Result<()> {
-        self.set_monitor_internal()
+        // Monitor mode is already configured by init's pcap phase replay.
+        // Do NOT call set_monitor_internal() — it overwrites pcap-configured
+        // RX filter values (0x031644BF) with hand-coded values that break RX.
+        let fltr = self.read32(R_AX_RX_FLTR_OPT)?;
+        eprintln!("[RTL8852AU] Monitor mode (pcap-configured): RX_FLTR=0x{:08X}", fltr);
+        Ok(())
     }
 
     fn tx_frame(&mut self, frame: &[u8], opts: &TxOptions) -> Result<()> {

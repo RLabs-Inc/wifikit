@@ -727,10 +727,13 @@ pub fn render_channels(
     let (show_frames, show_fps) = auto_columns_channels(w);
 
     // Merge AP-derived data with real ChannelStats
-    let mut channel_map: std::collections::BTreeMap<u8, ChannelEntry> = std::collections::BTreeMap::new();
+    // Key is (band<<8 | channel) to separate 6GHz channels from 2.4GHz.
+    let mut channel_map: std::collections::BTreeMap<u16, ChannelEntry> = std::collections::BTreeMap::new();
 
     for ap in &snap.aps {
-        let entry = channel_map.entry(ap.channel).or_insert_with(|| ChannelEntry::new(ap.channel));
+        let band = if ap.channel <= 14 { 0u8 } else { 1 };
+        let key = crate::store::stats::channel_key(ap.channel, band);
+        let entry = channel_map.entry(key).or_insert_with(|| ChannelEntry::new(ap.channel));
         entry.ap_count += 1;
         entry.beacon_total += ap.beacon_count;
     }
@@ -738,16 +741,19 @@ pub fn render_channels(
     for sta in &snap.stations {
         if let Some(bssid) = &sta.bssid {
             if let Some(ap) = snap.aps.iter().find(|a| &a.bssid == bssid) {
-                if let Some(entry) = channel_map.get_mut(&ap.channel) {
+                let band = if ap.channel <= 14 { 0u8 } else { 1 };
+                let key = crate::store::stats::channel_key(ap.channel, band);
+                if let Some(entry) = channel_map.get_mut(&key) {
                     entry.sta_count += 1;
                 }
             }
         }
     }
 
-    // Overlay real ChannelStats data
+    // Overlay real ChannelStats data (band comes directly from the stats)
     for cs in &snap.channel_stats {
-        let entry = channel_map.entry(cs.channel).or_insert_with(|| ChannelEntry::new(cs.channel));
+        let key = crate::store::stats::channel_key(cs.channel, cs.band);
+        let entry = channel_map.entry(key).or_insert_with(|| ChannelEntry::with_band(cs.channel, cs.band));
         entry.frames = cs.frame_count;
         entry.fps = cs.fps;
         entry.retries = cs.retry_count;
@@ -854,9 +860,18 @@ struct ChannelEntry {
 
 impl ChannelEntry {
     fn new(channel: u8) -> Self {
+        Self::with_band(channel, if channel <= 14 { 0 } else { 1 })
+    }
+
+    fn with_band(channel: u8, band: u8) -> Self {
         Self {
             channel,
-            band: if channel <= 14 { "2.4G" } else { "5G" },
+            band: match band {
+                0 => "2.4G",
+                1 => "5G",
+                2 => "6G",
+                _ => "?",
+            },
             ap_count: 0,
             sta_count: 0,
             beacon_total: 0,

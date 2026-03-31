@@ -28,12 +28,19 @@ pub struct ChannelStats {
     pub(crate) dwell_start: Instant,
 }
 
+/// Encode (channel, band) into a u16 key for HashMap lookups.
+/// High byte = band (0=2.4G, 1=5G, 2=6G), low byte = channel number.
+/// This distinguishes 6GHz channel 1 from 2.4GHz channel 1.
+pub fn channel_key(channel: u8, band: u8) -> u16 {
+    (band as u16) << 8 | channel as u16
+}
+
 impl ChannelStats {
-    pub(crate) fn new(channel: u8) -> Self {
+    pub(crate) fn new(channel: u8, band: u8) -> Self {
         let now = Instant::now();
         Self {
             channel,
-            band: if channel <= 14 { 0 } else { 1 },
+            band,
             ap_count: 0,
             sta_count: 0,
             frame_count: 0,

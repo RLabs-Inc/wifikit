@@ -64,10 +64,19 @@ struct SharedAdapterInner {
     /// Current channel the radio is tuned to (updated by set_channel).
     /// The RX thread reads this to tag frames with the correct channel.
     current_channel: AtomicU8,
+    /// Current band: 0=2.4GHz, 1=5GHz, 2=6GHz. Updated alongside current_channel.
+    current_band: AtomicU8,
     /// Locked channel number (0 = no lock, scanner hops freely).
     locked_channel: AtomicU8,
-    /// Whether the adapter is alive (not shut down).
+    /// Whether the RX thread should keep running.
+    /// Set to false by stop_rx() → thread exits. Set to true by start_rx() → new thread.
+    /// Also set to false by shutdown() (permanent death).
     alive: AtomicBool,
+    /// Whether the adapter has been permanently shut down (USB closed).
+    /// Unlike `alive` (which toggles for stop_rx/start_rx), this is one-way.
+    shut_down: AtomicBool,
+    /// RX thread join handle. None when RX is stopped (idle adapter).
+    rx_thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Who holds the channel lock (for status bar display).
     lock_holder: Mutex<Option<String>>,
     /// Static adapter info (chip, VID/PID, name) — no lock needed.
@@ -121,8 +130,11 @@ impl SharedAdapter {
                 adapter: Mutex::new(adapter),
                 gate: gate.clone(),
                 current_channel: AtomicU8::new(0),
+                current_band: AtomicU8::new(0),
                 locked_channel: AtomicU8::new(NO_CHANNEL_LOCK),
                 alive: AtomicBool::new(true),
+                shut_down: AtomicBool::new(false),
+                rx_thread: Mutex::new(None),
                 lock_holder: Mutex::new(None),
                 info: info.clone(),
                 mac,
@@ -133,7 +145,8 @@ impl SharedAdapter {
         if let Some(rx_handle) = rx_handle {
             on_status("Starting RX thread (FrameGate)...");
             let inner_clone = Arc::clone(&shared.inner);
-            start_rx_thread(rx_handle, gate, inner_clone);
+            let handle = start_rx_thread(rx_handle, gate, inner_clone);
+            *shared.inner.rx_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
             on_status("RX thread active.");
         } else {
             on_status("RX thread not available (driver doesn't support split RX).");
@@ -187,12 +200,19 @@ impl SharedAdapter {
                 drop(lh);
 
                 // Set the channel on the adapter (TX path mutex)
+                let ch = Channel::new(channel);
+                let band_idx = match ch.band {
+                    crate::core::channel::Band::Band2g => 0u8,
+                    crate::core::channel::Band::Band5g => 1,
+                    crate::core::channel::Band::Band6g => 2,
+                };
                 let mut adapter = self.inner.adapter.lock()
                     .unwrap_or_else(|e| e.into_inner());
-                match adapter.driver.set_channel(Channel::new(channel)) {
+                match adapter.driver.set_channel(ch) {
                     Ok(()) => {
-                        // Update current channel for RX thread frame tagging
+                        // Update current channel + band for RX thread frame tagging
                         self.inner.current_channel.store(channel, Ordering::SeqCst);
+                        self.inner.current_band.store(band_idx, Ordering::SeqCst);
                         Ok(())
                     }
                     Err(e) => {
@@ -257,7 +277,7 @@ impl SharedAdapter {
     where
         F: FnOnce(&mut Adapter) -> Result<T>,
     {
-        if !self.inner.alive.load(Ordering::SeqCst) {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
             return Err(crate::core::Error::AdapterNotInitialized);
         }
         let mut adapter = self.inner.adapter.lock()
@@ -265,15 +285,29 @@ impl SharedAdapter {
         f(&mut adapter)
     }
 
-    /// Set the radio channel. Respects channel lock.
+    /// Set the radio channel (2.4/5GHz by number). Respects channel lock.
     pub fn set_channel(&self, channel: u8) -> Result<()> {
+        self.set_channel_full(Channel::new(channel))
+    }
+
+    /// Set the radio channel with full band information. Respects channel lock.
+    /// Use this for 6GHz channels where the number alone is ambiguous.
+    pub fn set_channel_full(&self, channel: Channel) -> Result<()> {
         let locked = self.locked_channel();
-        if locked != NO_CHANNEL_LOCK && locked != channel {
+        if locked != NO_CHANNEL_LOCK && locked != channel.number {
             return Ok(());
         }
-        self.inner.current_channel.store(channel, Ordering::SeqCst);
+        self.inner.current_channel.store(channel.number, Ordering::SeqCst);
+        self.inner.current_band.store(
+            match channel.band {
+                crate::core::channel::Band::Band2g => 0,
+                crate::core::channel::Band::Band5g => 1,
+                crate::core::channel::Band::Band6g => 2,
+            },
+            Ordering::SeqCst,
+        );
         self.with_adapter(|adapter| {
-            adapter.driver.set_channel(Channel::new(channel))
+            adapter.driver.set_channel(channel)
         })
     }
 
@@ -304,13 +338,109 @@ impl SharedAdapter {
         self.inner.current_channel.load(Ordering::SeqCst)
     }
 
-    // ── Lifecycle ──
+    /// Get the current band: 0=2.4GHz, 1=5GHz, 2=6GHz.
+    pub fn current_band(&self) -> u8 {
+        self.inner.current_band.load(Ordering::SeqCst)
+    }
 
-    /// Shut down the adapter. Stops RX thread, closes USB.
-    /// After this, all operations return `AdapterNotInitialized`.
-    pub fn shutdown(&self) {
-        // Signal RX thread to stop
+    // ── Chipset capability queries ──
+
+    /// Get the channel settle time for this adapter's chipset.
+    /// Each chip reports its own PLL retune time (e.g., 5ms for RTL, 200ms for MT7921).
+    pub fn channel_settle_time(&self) -> Duration {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Duration::from_millis(10);
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.driver.channel_settle_time()
+    }
+
+    /// Get supported channels from the chipset driver.
+    pub fn supported_channels(&self) -> Vec<Channel> {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.driver.supported_channels().to_vec()
+    }
+
+    /// Get supported bands from the chipset driver.
+    pub fn supported_bands(&self) -> Vec<crate::core::channel::Band> {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.driver.supported_bands()
+    }
+
+    // ── RX thread lifecycle ──
+    //
+    // The RX thread can be stopped and restarted without affecting the adapter.
+    // USB stays claimed, monitor mode stays active, firmware stays loaded.
+    // Only the RX reading loop starts/stops.
+    //
+    // Used by the shell to idle a dedicated attack adapter when the attack
+    // finishes, then wake it up when a new attack starts. No re-init needed.
+
+    /// Stop the RX thread. The adapter stays initialized and ready.
+    ///
+    /// Blocks until the thread exits (max ~RX_POLL_TIMEOUT for the USB read
+    /// to timeout and check the alive flag). Safe to call if already stopped.
+    pub fn stop_rx(&self) {
         self.inner.alive.store(false, Ordering::SeqCst);
+        let handle = self.inner.rx_thread.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    }
+
+    /// Start (or restart) the RX thread. Gets a fresh RxHandle from the driver
+    /// and spawns a new thread. Safe to call if already running (no-op).
+    ///
+    /// This is the inverse of stop_rx(): the adapter was idle, now frames flow again.
+    pub fn start_rx(&self) {
+        // Already running — nothing to do
+        if self.inner.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        // Permanently shut down — can't restart
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Get a fresh RxHandle from the driver (creates new MCU channel for MediaTek)
+        let rx_handle = {
+            let mut adapter = self.inner.adapter.lock()
+                .unwrap_or_else(|e| e.into_inner());
+            adapter.driver.take_rx_handle()
+        };
+
+        if let Some(rx_handle) = rx_handle {
+            self.inner.alive.store(true, Ordering::SeqCst);
+            let gate = self.inner.gate.clone();
+            let inner_clone = Arc::clone(&self.inner);
+            let handle = start_rx_thread(rx_handle, gate, inner_clone);
+            *self.inner.rx_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        }
+    }
+
+    /// Check if the RX thread is currently running.
+    pub fn is_rx_active(&self) -> bool {
+        self.inner.alive.load(Ordering::SeqCst)
+    }
+
+    // ── Adapter lifecycle ──
+
+    /// Shut down the adapter permanently. Stops RX thread, closes USB.
+    /// After this, all operations return `AdapterNotInitialized`.
+    /// Cannot be restarted — use stop_rx()/start_rx() for temporary idle.
+    pub fn shutdown(&self) {
+        // Stop RX thread first (blocks until thread exits)
+        self.stop_rx();
+        // Mark as permanently dead
+        self.inner.shut_down.store(true, Ordering::SeqCst);
         // Close the adapter (releases USB)
         let mut adapter = self.inner.adapter.lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -342,7 +472,7 @@ fn start_rx_thread(
     rx_handle: RxHandle,
     gate: FrameGate,
     inner: Arc<SharedAdapterInner>,
-) {
+) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("rx-usb".into())
         .spawn(move || {
@@ -524,7 +654,7 @@ fn start_rx_thread(
                 let _ = log.flush();
             }
         })
-        .expect("failed to spawn rx-usb thread");
+        .expect("failed to spawn rx-usb thread")
 }
 
 #[cfg(test)]
@@ -535,5 +665,16 @@ mod tests {
     fn test_shared_adapter_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<SharedAdapter>();
+    }
+
+    #[test]
+    fn test_rx_lifecycle_methods_exist() {
+        // Compile-time verification that the API surface exists.
+        // Can't test with real USB, but we verify the method signatures.
+        fn _assert_api(sa: &SharedAdapter) {
+            let _: bool = sa.is_rx_active();
+            sa.stop_rx();
+            sa.start_rx();
+        }
     }
 }

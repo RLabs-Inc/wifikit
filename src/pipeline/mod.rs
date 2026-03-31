@@ -315,6 +315,7 @@ fn pipeline_thread(
             &rx_frame.data,
             rx_frame.rssi,
             rx_frame.channel,
+            rx_frame.band,
             rx_frame.timestamp,
         );
 
@@ -359,7 +360,7 @@ fn pipeline_thread(
         }
 
         // ── 4. Update the FrameStore ──
-        extractor::process_frame(&parsed, parsed.channel, &store);
+        extractor::process_frame(&parsed, parsed.channel, parsed.band, &store);
 
         // ── 5. Broadcast to subscribers ──
         let arc_frame = Arc::new(parsed);
@@ -453,7 +454,7 @@ mod tests {
         data[32] = 0x64; data[33] = 0x00; // beacon interval
         data[36] = 0x00; data[37] = 0x04; // SSID IE
         data[38] = b'T'; data[39] = b'e'; data[40] = b's'; data[41] = b't';
-        RxFrame { data, rssi: -42, channel: 6, timestamp: Duration::from_millis(100) }
+        RxFrame { data, rssi: -42, channel: 6, band: 0, timestamp: Duration::from_millis(100) }
     }
 
     fn make_data_frame() -> RxFrame {
@@ -462,7 +463,7 @@ mod tests {
         data[1] = 0x02; // from-ds
         data[4..10].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]); // addr1=STA
         data[10..16].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // addr2=BSSID
-        RxFrame { data, rssi: -55, channel: 11, timestamp: Duration::from_millis(200) }
+        RxFrame { data, rssi: -55, channel: 11, band: 0, timestamp: Duration::from_millis(200) }
     }
 
     /// Helper: wait briefly for the pipeline thread to process submitted frames.

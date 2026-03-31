@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::adapter::SharedAdapter;
+use crate::core::channel::{Band, Channel};
 use crate::core::TxOptions;
 use crate::protocol::frames;
 use crate::store::FrameStore;
@@ -73,7 +74,7 @@ pub struct ScanConfig {
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            dwell_time: Duration::from_millis(300),
+            dwell_time: Duration::from_millis(500),
             num_rounds: 0,
             scan_2ghz: true,
             scan_5ghz: true,
@@ -132,24 +133,53 @@ impl Scanner {
         }
     }
 
-    /// Build the channel list from config (band flags + custom override).
-    fn build_channel_list(&self) -> Vec<u8> {
+    /// Build the channel list from adapter capabilities + config filters.
+    ///
+    /// Returns full Channel structs (with band info) so the scanner knows
+    /// the exact band for each channel — critical for 6GHz where channel
+    /// numbers collide with 2.4GHz.
+    ///
+    /// If adapter_channels is provided, use the adapter's own channel list
+    /// filtered by the config's band flags. Otherwise, fall back to hardcoded lists.
+    /// Custom channels override everything.
+    fn build_channel_list(&self, adapter_channels: Option<&[Channel]>) -> Vec<Channel> {
         if let Some(ref custom) = self.config.custom_channels {
-            return custom.clone();
+            return custom.iter().map(|&ch| Channel::new(ch)).collect();
         }
 
+        // If the adapter reports its channels, use those (filtered by band config).
+        if let Some(adapter_chs) = adapter_channels {
+            let mut channels = Vec::new();
+            for ch in adapter_chs {
+                match ch.band {
+                    Band::Band2g if self.config.scan_2ghz => channels.push(*ch),
+                    Band::Band5g if self.config.scan_5ghz => channels.push(*ch),
+                    Band::Band6g if self.config.scan_6ghz => channels.push(*ch),
+                    _ => {}
+                }
+            }
+            return channels;
+        }
+
+        // Fallback: hardcoded lists (no adapter available).
         let mut channels = Vec::with_capacity(
             CHANNELS_24GHZ.len() + CHANNELS_5GHZ.len() + CHANNELS_6GHZ.len(),
         );
 
         if self.config.scan_2ghz {
-            channels.extend_from_slice(CHANNELS_24GHZ);
+            for &ch in CHANNELS_24GHZ {
+                channels.push(Channel::new(ch));
+            }
         }
         if self.config.scan_5ghz {
-            channels.extend_from_slice(CHANNELS_5GHZ);
+            for &ch in CHANNELS_5GHZ {
+                channels.push(Channel::new(ch));
+            }
         }
         if self.config.scan_6ghz {
-            channels.extend_from_slice(CHANNELS_6GHZ);
+            for &ch in CHANNELS_6GHZ {
+                channels.push(Channel::new_6ghz(ch));
+            }
         }
 
         channels
@@ -167,18 +197,32 @@ impl Scanner {
     ///
     /// After completing all channels, increment the round counter.
     pub fn run(&self, shared: &SharedAdapter, store: &FrameStore) {
-        let channels = self.build_channel_list();
+        // Query adapter for its capabilities — channels and settle time.
+        let adapter_channels = shared.supported_channels();
+        let settle_time = shared.channel_settle_time();
+        let channels = self.build_channel_list(
+            if adapter_channels.is_empty() { None } else { Some(&adapter_channels) }
+        );
         if channels.is_empty() {
             return;
         }
 
         self.running.store(true, Ordering::SeqCst);
         self.round.store(0, Ordering::SeqCst);
+        store.set_round(0);
+
+        // Clear stale channel stats from any previous scan (different adapter
+        // may have scanned different channels — e.g., MT7921 6GHz entries
+        // would persist when switching to RTL8812BU).
+        store.clear_channel_stats();
 
         let mac = shared.mac();
 
+        // Track the previous channel's band for proper end_dwell keying.
+        let mut prev_band_idx: u8 = 0;
+
         'outer: loop {
-            for &ch in &channels {
+            for ch in &channels {
                 if !self.running.load(Ordering::SeqCst) {
                     break 'outer;
                 }
@@ -193,17 +237,51 @@ impl Scanner {
                     continue;
                 }
 
-                // Switch channel.
-                if let Err(_e) = shared.set_channel(ch) {
+                // Band index from the Channel struct (correct for 6GHz).
+                let band_idx = match ch.band {
+                    Band::Band2g => 0u8,
+                    Band::Band5g => 1,
+                    Band::Band6g => 2,
+                };
+
+                // End dwell on previous channel (if any) before switching.
+                // This calculates per-channel FPS for the channel we're leaving.
+                {
+                    let prev_ch = self.current_channel.load(Ordering::SeqCst);
+                    if prev_ch != 0 {
+                        let prev_key = crate::store::stats::channel_key(prev_ch, prev_band_idx);
+                        store.with_channel_stats_mut(|stats| {
+                            if let Some(cs) = stats.get_mut(&prev_key) {
+                                cs.end_dwell();
+                            }
+                        });
+                    }
+                }
+
+                // Switch channel — use full Channel struct for proper 6GHz handling.
+                if let Err(_e) = shared.set_channel_full(*ch) {
                     // Channel not supported by this adapter — skip silently.
                     continue;
                 }
-                self.current_channel.store(ch, Ordering::SeqCst);
-                store.set_current_channel(ch);
+                self.current_channel.store(ch.number, Ordering::SeqCst);
+                store.set_current_channel(ch.number);
+                prev_band_idx = band_idx;
+
+                // Start dwell tracking on the new channel.
+                // Create the entry if it doesn't exist yet — this ensures
+                // frame_count_at_dwell_start is set BEFORE frames arrive,
+                // so FPS is accurate from the very first round.
+                let key = crate::store::stats::channel_key(ch.number, band_idx);
+                store.with_channel_stats_mut(|stats| {
+                    stats.entry(key)
+                        .or_insert_with(|| crate::store::stats::ChannelStats::new(ch.number, band_idx))
+                        .start_dwell();
+                });
 
                 // Wait for PHY to stabilize after channel switch.
-                if !self.config.channel_settle.is_zero() {
-                    std::thread::sleep(self.config.channel_settle);
+                // Settle time comes from the chipset — each adapter knows its PLL retune time.
+                if !settle_time.is_zero() {
+                    std::thread::sleep(settle_time);
                 }
 
                 // Active scan: send broadcast probe request.
@@ -288,26 +366,27 @@ mod tests {
     #[test]
     fn test_default_config_values() {
         let cfg = ScanConfig::default();
-        assert_eq!(cfg.dwell_time, Duration::from_millis(300));
+        assert_eq!(cfg.dwell_time, Duration::from_millis(500));
         assert_eq!(cfg.num_rounds, 0);
         assert!(cfg.scan_2ghz);
         assert!(cfg.scan_5ghz);
         assert!(!cfg.scan_6ghz);
         assert!(!cfg.active);
         assert!(cfg.custom_channels.is_none());
-        assert_eq!(cfg.channel_settle, Duration::from_millis(5));
+        assert_eq!(cfg.channel_settle, Duration::from_millis(5)); // still in config for backward compat
     }
 
     #[test]
     fn test_build_channel_list_default() {
         let scanner = Scanner::new(ScanConfig::default());
-        let channels = scanner.build_channel_list();
+        let channels = scanner.build_channel_list(None);
+        let nums: Vec<u8> = channels.iter().map(|c| c.number).collect();
         // 13 (2.4GHz) + 25 (5GHz) = 38
-        assert_eq!(channels.len(), 38);
-        assert_eq!(channels[0], 1);
-        assert_eq!(channels[12], 13);
-        assert_eq!(channels[13], 36);
-        assert_eq!(channels[37], 165);
+        assert_eq!(nums.len(), 38);
+        assert_eq!(nums[0], 1);
+        assert_eq!(nums[12], 13);
+        assert_eq!(nums[13], 36);
+        assert_eq!(nums[37], 165);
     }
 
     #[test]
@@ -316,10 +395,11 @@ mod tests {
             scan_5ghz: false,
             ..ScanConfig::default()
         });
-        let channels = scanner.build_channel_list();
-        assert_eq!(channels.len(), 13);
-        assert_eq!(channels[0], 1);
-        assert_eq!(channels[12], 13);
+        let channels = scanner.build_channel_list(None);
+        let nums: Vec<u8> = channels.iter().map(|c| c.number).collect();
+        assert_eq!(nums.len(), 13);
+        assert_eq!(nums[0], 1);
+        assert_eq!(nums[12], 13);
     }
 
     #[test]
@@ -328,10 +408,11 @@ mod tests {
             scan_2ghz: false,
             ..ScanConfig::default()
         });
-        let channels = scanner.build_channel_list();
-        assert_eq!(channels.len(), 25);
-        assert_eq!(channels[0], 36);
-        assert_eq!(channels[24], 165);
+        let channels = scanner.build_channel_list(None);
+        let nums: Vec<u8> = channels.iter().map(|c| c.number).collect();
+        assert_eq!(nums.len(), 25);
+        assert_eq!(nums[0], 36);
+        assert_eq!(nums[24], 165);
     }
 
     #[test]
@@ -340,9 +421,13 @@ mod tests {
             scan_6ghz: true,
             ..ScanConfig::default()
         });
-        let channels = scanner.build_channel_list();
+        let channels = scanner.build_channel_list(None);
         // 13 + 25 + 59 = 97
         assert_eq!(channels.len(), 97);
+        // Verify 6GHz channels have correct band
+        let last = channels.last().unwrap();
+        assert_eq!(last.number, 233);
+        assert_eq!(last.band, Band::Band6g);
     }
 
     #[test]
@@ -351,8 +436,9 @@ mod tests {
             custom_channels: Some(vec![1, 6, 11, 36, 149]),
             ..ScanConfig::default()
         });
-        let channels = scanner.build_channel_list();
-        assert_eq!(channels, vec![1, 6, 11, 36, 149]);
+        let channels = scanner.build_channel_list(None);
+        let nums: Vec<u8> = channels.iter().map(|c| c.number).collect();
+        assert_eq!(nums, vec![1, 6, 11, 36, 149]);
     }
 
     #[test]
@@ -363,8 +449,30 @@ mod tests {
             scan_6ghz: false,
             ..ScanConfig::default()
         });
-        let channels = scanner.build_channel_list();
+        let channels = scanner.build_channel_list(None);
         assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn test_build_channel_list_adapter_6ghz_labeled_correctly() {
+        // Simulate an adapter that supports 6GHz
+        let adapter_channels = vec![
+            Channel::new(1),          // 2.4GHz ch1
+            Channel::new(36),         // 5GHz ch36
+            Channel::new_6ghz(1),     // 6GHz ch1
+            Channel::new_6ghz(5),     // 6GHz ch5
+        ];
+        let scanner = Scanner::new(ScanConfig {
+            scan_6ghz: true,
+            ..ScanConfig::default()
+        });
+        let channels = scanner.build_channel_list(Some(&adapter_channels));
+        assert_eq!(channels.len(), 4);
+        assert_eq!(channels[0].band, Band::Band2g);
+        assert_eq!(channels[1].band, Band::Band5g);
+        assert_eq!(channels[2].band, Band::Band6g);
+        assert_eq!(channels[2].number, 1); // 6GHz ch1, distinct from 2.4GHz ch1
+        assert_eq!(channels[3].band, Band::Band6g);
     }
 
     #[test]
