@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use wifikit::core::chip::ChipDriver;
 use wifikit::core::{Channel, Band};
+use wifikit::core::channel::Bandwidth;
 
 // ── Config ──
 
@@ -22,6 +23,8 @@ struct BenchConfig {
     channel: u8,
     /// Band for single channel (when channel is 6GHz-ambiguous)
     band: Option<Band>,
+    /// Bandwidth (20/40/80/160 MHz)
+    bandwidth: Bandwidth,
     /// Dwell time per channel in ms (hop mode)
     dwell_ms: u64,
     /// Total benchmark duration in seconds
@@ -39,6 +42,7 @@ impl Default for BenchConfig {
         Self {
             channel: 0,
             band: None,
+            bandwidth: Bandwidth::Bw20,
             dwell_ms: 500,
             duration_secs: 30,
             hop: false,
@@ -78,6 +82,18 @@ fn parse_args() -> BenchConfig {
                 i += 1;
                 if i < args.len() { cfg.duration_secs = args[i].parse().unwrap_or(30); }
             }
+            "--bw" => {
+                i += 1;
+                if i < args.len() {
+                    cfg.bandwidth = match args[i].as_str() {
+                        "20" => Bandwidth::Bw20,
+                        "40" => Bandwidth::Bw40,
+                        "80" => Bandwidth::Bw80,
+                        "160" => Bandwidth::Bw160,
+                        _ => Bandwidth::Bw20,
+                    };
+                }
+            }
             "--hop" => { cfg.hop = true; }
             "--bands" => {
                 i += 1;
@@ -101,6 +117,8 @@ fn parse_args() -> BenchConfig {
                 eprintln!("Usage:");
                 eprintln!("  bench_mt7921                         Park on ch6, measure 30s");
                 eprintln!("  bench_mt7921 --channel 36            Park on ch36 (5GHz)");
+                eprintln!("  bench_mt7921 --channel 36 --bw 80    Park on ch36 80MHz");
+                eprintln!("  bench_mt7921 --channel 36 --bw 40    Park on ch36 40MHz");
                 eprintln!("  bench_mt7921 --channel 1 --band 6g   Park on 6GHz ch1");
                 eprintln!("  bench_mt7921 --hop --dwell 500       Hop all bands, 500ms/ch");
                 eprintln!("  bench_mt7921 --hop --bands 6g        Hop 6GHz only");
@@ -352,8 +370,14 @@ fn main() {
         eprintln!("  Channels: [{}]", ch_str.join(", "));
     }
 
-    eprintln!("\n  Duration: {}s | Dwell: {}ms | Mode: {}",
-        cfg.duration_secs, cfg.dwell_ms,
+    let bw_str = match cfg.bandwidth {
+        Bandwidth::Bw20 => "20MHz",
+        Bandwidth::Bw40 => "40MHz",
+        Bandwidth::Bw80 => "80MHz",
+        Bandwidth::Bw160 => "160MHz",
+    };
+    eprintln!("\n  Duration: {}s | Dwell: {}ms | BW: {} | Mode: {}",
+        cfg.duration_secs, cfg.dwell_ms, bw_str,
         if cfg.hop || cfg.channel == 0 { "hop" } else { "park" });
 
     // ── Run benchmark ──
@@ -362,12 +386,13 @@ fn main() {
         run_hop_bench(&mut driver, &channels, &cfg);
     } else {
         let ch = if cfg.channel > 0 {
-            match cfg.band {
+            let base = match cfg.band {
                 Some(Band::Band6g) => Channel::new_6ghz(cfg.channel),
                 _ => Channel::new(cfg.channel),
-            }
+            };
+            base.with_bandwidth(cfg.bandwidth)
         } else {
-            channels[0]
+            channels[0].with_bandwidth(cfg.bandwidth)
         };
         run_park_bench(&mut driver, ch, &cfg);
     }
@@ -379,20 +404,21 @@ fn build_channels(cfg: &BenchConfig, supported: &[Channel]) -> Vec<Channel> {
             Some(Band::Band6g) => Channel::new_6ghz(cfg.channel),
             _ => Channel::new(cfg.channel),
         };
-        return vec![ch];
+        return vec![ch.with_bandwidth(cfg.bandwidth)];
     }
 
     supported.iter().filter(|ch| match ch.band {
         Band::Band2g => cfg.bands_2g,
         Band::Band5g => cfg.bands_5g,
         Band::Band6g => cfg.bands_6g,
-    }).copied().collect()
+    }).map(|ch| ch.with_bandwidth(cfg.bandwidth)).collect()
 }
 
 /// Park on a single channel and measure raw RX throughput.
 fn run_park_bench(driver: &mut wifikit::chips::mt7921au::Mt7921au, ch: Channel, cfg: &BenchConfig) {
     let band_name = match ch.band { Band::Band2g => "2.4GHz", Band::Band5g => "5GHz", Band::Band6g => "6GHz" };
-    eprintln!("\n── Park on ch{} ({}) ──", ch.number, band_name);
+    let bw_str = match ch.bandwidth { Bandwidth::Bw20 => "20MHz", Bandwidth::Bw40 => "40MHz", Bandwidth::Bw80 => "80MHz", Bandwidth::Bw160 => "160MHz" };
+    eprintln!("\n── Park on ch{} ({} {}) ──", ch.number, band_name, bw_str);
 
     // Switch channel
     let sw_start = Instant::now();

@@ -18,6 +18,7 @@ mod rtl8852a_post_boot;
 mod rtl8852a_pre_fwdl;
 mod rtl8852a_phase_pre_fwdl;
 mod rtl8852a_phase_post_fwdl;
+mod rtl8852a_phase_inter_fwdl;
 mod rtl8852a_phase_monitor;
 mod rtl8852a_phase_ch1;
 mod rtl8852a_phase_ch6_2g;

@@ -34,6 +34,115 @@ macro_rules! bitflags_manual {
 #[allow(unused_imports)]
 pub(crate) use bitflags_manual;
 
+/// PPDU type as reported by MAC AX gen2 RX descriptor DW1[3:0].
+/// Values from mac_def.h: mac_ax_rx_ppdu_type enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PpduType {
+    #[default]
+    Cck = 0,
+    Ofdm = 1,
+    HT = 2,
+    VhtSu = 3,
+    VhtMu = 4,
+    HeSu = 5,
+    HeMu = 6,
+    HeTb = 7,
+}
+
+impl PpduType {
+    pub fn from_raw(val: u8) -> Self {
+        match val {
+            0 => Self::Cck,
+            1 => Self::Ofdm,
+            2 => Self::HT,
+            3 => Self::VhtSu,
+            4 => Self::VhtMu,
+            5 => Self::HeSu,
+            6 => Self::HeMu,
+            7 => Self::HeTb,
+            _ => Self::Cck,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cck => "CCK",
+            Self::Ofdm => "OFDM",
+            Self::HT => "HT",
+            Self::VhtSu => "VHT-SU",
+            Self::VhtMu => "VHT-MU",
+            Self::HeSu => "HE-SU",
+            Self::HeMu => "HE-MU",
+            Self::HeTb => "HE-TB",
+        }
+    }
+}
+
+/// Guard interval / LTF type from RX descriptor DW1[27:25].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum GuardInterval {
+    #[default]
+    Gi800ns = 0,
+    Gi400ns = 1,
+    Gi1600ns = 2,
+    Gi3200ns = 3,
+}
+
+impl GuardInterval {
+    pub fn from_raw(val: u8) -> Self {
+        match val {
+            0 => Self::Gi800ns,
+            1 => Self::Gi400ns,
+            2 => Self::Gi1600ns,
+            3 => Self::Gi3200ns,
+            _ => Self::Gi800ns,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gi800ns => "0.8μs",
+            Self::Gi400ns => "0.4μs",
+            Self::Gi1600ns => "1.6μs",
+            Self::Gi3200ns => "3.2μs",
+        }
+    }
+}
+
+/// Bandwidth from RX descriptor DW1[31:30].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum RxBandwidth {
+    #[default]
+    Bw20 = 0,
+    Bw40 = 1,
+    Bw80 = 2,
+    Bw160 = 3,
+}
+
+impl RxBandwidth {
+    pub fn from_raw(val: u8) -> Self {
+        match val {
+            0 => Self::Bw20,
+            1 => Self::Bw40,
+            2 => Self::Bw80,
+            3 => Self::Bw160,
+            _ => Self::Bw20,
+        }
+    }
+
+    pub fn mhz(&self) -> u16 {
+        match self {
+            Self::Bw20 => 20,
+            Self::Bw40 => 40,
+            Self::Bw80 => 80,
+            Self::Bw160 => 160,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RxFrame {
     pub data: Vec<u8>,
@@ -43,6 +152,61 @@ pub struct RxFrame {
     /// Set by the RX thread from the adapter's current band.
     pub band: u8,
     pub timestamp: Duration,
+
+    // --- PHY status fields (populated by drivers that support PPDU correlation) ---
+
+    /// Per-path RSSI in dBm. [path_a, path_b, path_c, path_d].
+    /// 0 = not populated.
+    pub rssi_path: [i8; 4],
+    /// Average noise floor in dBm from PPDU IE0/IE1.
+    /// 0 = not populated.
+    pub noise_floor: i8,
+    /// Average SNR from PPDU IE1 (OFDM/HT/VHT/HE). 6-bit unsigned, 0-63 dB.
+    /// 0 = not populated.
+    pub snr: u8,
+    /// RX data rate encoding from DW1[24:16]. 9-bit value.
+    /// Legacy: 0x00-0x0B, HT: 0x80+MCS, VHT: (NSS<<4)|MCS, HE: (NSS<<4)|MCS.
+    pub data_rate: u16,
+    /// PPDU type — Legacy/HT/VHT/HE-SU/HE-MU etc.
+    pub ppdu_type: PpduType,
+    /// Channel bandwidth.
+    pub bandwidth: RxBandwidth,
+    /// Guard interval / LTF type.
+    pub gi_ltf: GuardInterval,
+    /// LDPC coding detected in this PPDU.
+    pub is_ldpc: bool,
+    /// STBC detected in this PPDU.
+    pub is_stbc: bool,
+    /// Beamforming detected in this PPDU.
+    pub is_bf: bool,
+    /// AMPDU aggregate flag from DW3.
+    pub is_ampdu: bool,
+    /// AMSDU aggregate flag from DW3.
+    pub is_amsdu: bool,
+}
+
+impl Default for RxFrame {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            rssi: 0,
+            channel: 0,
+            band: 0,
+            timestamp: Duration::ZERO,
+            rssi_path: [0; 4],
+            noise_floor: 0,
+            snr: 0,
+            data_rate: 0,
+            ppdu_type: PpduType::Cck,
+            bandwidth: RxBandwidth::Bw20,
+            gi_ltf: GuardInterval::Gi800ns,
+            is_ldpc: false,
+            is_stbc: false,
+            is_bf: false,
+            is_ampdu: false,
+            is_amsdu: false,
+        }
+    }
 }
 
 impl RxFrame {
@@ -80,6 +244,10 @@ pub struct TxOptions {
     pub rate: TxRate,
     pub retries: u8,
     pub flags: TxFlags,
+    /// Guard interval: 0=normal (0.8μs), 1=short (0.4μs HT/VHT, 1.6μs HE), 2=extended (3.2μs HE)
+    pub gi: u8,
+    /// Bandwidth for TX: 0=20MHz, 1=40MHz, 2=80MHz, 3=160MHz
+    pub bw: u8,
 }
 
 impl Default for TxOptions {
@@ -88,6 +256,8 @@ impl Default for TxOptions {
             rate: TxRate::Ofdm6m,
             retries: 12,
             flags: TxFlags::empty(),
+            gi: 0,
+            bw: 0,
         }
     }
 }
@@ -193,6 +363,9 @@ bitflags_manual! {
         NO_ACK    = 0x01,
         NO_RETRY  = 0x02,
         HW_SEQ    = 0x04,
+        WANT_ACK  = 0x08,  // Request ACK (clears NO_ACK and BA_DISABLE in TXWI)
+        LDPC      = 0x10,  // Enable LDPC coding
+        STBC      = 0x20,  // Enable Space-Time Block Coding
     }
 }
 
@@ -211,7 +384,7 @@ mod tests {
         data[10..16].copy_from_slice(&[0x7C, 0x10, 0xC9, 0x03, 0x10, 0xE0]);
         // addr3 (BSSID) = same as SA
         data[16..22].copy_from_slice(&[0x7C, 0x10, 0xC9, 0x03, 0x10, 0xE0]);
-        RxFrame { data, rssi: -42, channel: 6, band: 0, timestamp: Duration::from_millis(100) }
+        RxFrame { data, rssi: -42, channel: 6, band: 0, timestamp: Duration::from_millis(100), ..Default::default() }
     }
 
     #[test]
@@ -255,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_rxframe_too_short_returns_none() {
-        let frame = RxFrame { data: vec![0x80], rssi: 0, channel: 1, band: 0, timestamp: Duration::ZERO };
+        let frame = RxFrame { data: vec![0x80], rssi: 0, channel: 1, band: 0, timestamp: Duration::ZERO, ..Default::default() };
         assert!(frame.addr1().is_none());
         assert!(frame.addr2().is_none());
         assert!(frame.addr3().is_none());

@@ -1987,6 +1987,7 @@ impl Rtl8812bu {
             channel,
             band: if channel <= 14 { 0 } else { 1 },
             timestamp: Duration::from_micros(tsfl as u64),
+            ..Default::default()
         };
 
         (consumed, Some(frame))

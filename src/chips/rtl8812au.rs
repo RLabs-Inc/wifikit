@@ -1383,6 +1383,7 @@ impl Rtl8812au {
             channel,
             band: if channel <= 14 { 0 } else { 1 },
             timestamp: Duration::ZERO,
+            ..Default::default()
         };
 
         (consumed, Some(frame))

@@ -2767,6 +2767,7 @@ impl Mt7612u {
             channel: self.current_channel.number,
             band: match self.current_channel.band { Band::Band2g => 0, Band::Band5g => 1, Band::Band6g => 2 },
             timestamp: Duration::ZERO,
+            ..Default::default()
         }, consumed))
     }
 
@@ -3182,6 +3183,7 @@ fn mt7612u_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Parse
         channel,
         band: if channel <= 14 { 0 } else { 1 },
         timestamp: Duration::ZERO,
+        ..Default::default()
     }))
 }
 

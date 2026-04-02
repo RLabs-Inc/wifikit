@@ -1500,7 +1500,8 @@ impl Rt3572 {
             rssi: rssi_dbm,
             channel,
             band: if channel <= 14 { 0 } else { 1 },
-            timestamp: Duration::ZERO, // filled by pipeline
+            timestamp: Duration::ZERO,
+            ..Default::default()
         };
 
         (total_aligned.min(buf.len()), Some(frame))

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use wifikit::core::chip::ChipDriver;
 use wifikit::core::{Channel, Band};
+use wifikit::core::frame::TxOptions;
 
 // ── Config ──
 
@@ -327,16 +328,13 @@ fn build_channels(cfg: &BenchConfig, supported: &[Channel]) -> Vec<Channel> {
         return vec![Channel::new(cfg.channel)];
     }
 
-    // Only channels we have pcap data for
-    let pcap_channels: &[u8] = &[1, 6, 11, 36, 48, 149, 165];
-
+    // All supported channels — programmatic register-based switching works for all 39
     supported.iter().filter(|ch| {
-        let band_ok = match ch.band {
+        match ch.band {
             Band::Band2g => cfg.bands_2g,
             Band::Band5g => cfg.bands_5g,
             Band::Band6g => false,
-        };
-        band_ok && pcap_channels.contains(&ch.number)
+        }
     }).copied().collect()
 }
 
@@ -411,6 +409,19 @@ fn run_hop_bench(driver: &mut wifikit::chips::rtl8852au::Rtl8852au, channels: &[
             continue;
         }
         switch_stats.record(sw_start.elapsed());
+
+        // Active scan: send 3 broadcast probe requests at 10ms intervals
+        // (matches Linux driver's SCAN_PROBE_TIMES=3, SCAN_PROBE_INTERVAL=10ms)
+        let mac = driver.mac();
+        if let Some(probe) = wifikit::protocol::frames::build_probe_request(
+            &mac, "", &[]
+        ) {
+            let opts = TxOptions::default();
+            for i in 0..3 {
+                let _ = driver.tx_frame(&probe, &opts);
+                if i < 2 { std::thread::sleep(Duration::from_millis(10)); }
+            }
+        }
 
         let dwell_end = Instant::now() + dwell;
         while Instant::now() < dwell_end && Instant::now() < deadline {

@@ -36,7 +36,7 @@ use rusb::{DeviceHandle, GlobalContext};
 use crate::core::{
     Channel, Band, MacAddress, Result, Error,
     chip::{ChipDriver, ChipInfo, ChipId, ChipCaps},
-    frame::{RxFrame, TxOptions},
+    frame::{RxFrame, TxOptions, TxFlags, TxRate},
     adapter::UsbEndpoints,
 };
 
@@ -482,6 +482,103 @@ fn channel_to_band_idx(ch: u8) -> u8 {
         1..=14 => 0,    // NL80211_BAND_2GHZ = 0
         36..=177 => 1,  // NL80211_BAND_5GHZ = 1
         _ => 2,         // NL80211_BAND_6GHZ = 2
+    }
+}
+
+/// Calculate center channel and CMD_CBW bw value from a Channel struct.
+/// Returns (center_ch, bw) where bw matches the CMD_CBW_* enum:
+///   0=20MHz, 1=40MHz, 2=80MHz, 3=160MHz
+///
+/// 5GHz VHT80 groups (primary channels → center):
+///   36,40,44,48 → 42    52,56,60,64 → 58     100,104,108,112 → 106
+///   116,120,124,128→122  132,136,140,144→138   149,153,157,161→155
+///
+/// For 40MHz, center = primary ± 2 depending on upper/lower position.
+/// For monitor mode we always use SCA (upper) so center = primary + 2.
+fn channel_center_and_bw(ch: Channel) -> (u8, u8) {
+    use crate::core::channel::Bandwidth;
+    match ch.bandwidth {
+        Bandwidth::Bw20 => (ch.number, 0),
+        Bandwidth::Bw40 => {
+            // For 40MHz, calculate center channel.
+            // 5GHz: channels come in groups of 2 (36+40, 44+48, etc.)
+            // The center is between the two: (lower + upper) / 2 = lower + 2
+            // We determine position by (ch - base) % 8
+            let center = match ch.band {
+                Band::Band5g => {
+                    // 5GHz 40MHz groups: 36-40, 44-48, 52-56, 60-64, ...
+                    // Each group spans 4 channels (20MHz each)
+                    // Lower channel of pair: (ch - 36) % 8 < 4
+                    let base = if ch.number >= 149 { 149 }
+                              else if ch.number >= 100 { 100 }
+                              else { 36 };
+                    let offset = (ch.number - base) % 8;
+                    if offset < 4 {
+                        ch.number + 2  // lower of pair → center is +2
+                    } else {
+                        ch.number - 2  // upper of pair → center is -2
+                    }
+                }
+                Band::Band2g => {
+                    // 2.4GHz: center = primary + 2 (HT40+)
+                    // For channels 1-7, use HT40+ (center = ch + 2)
+                    // For channels 8-13, use HT40- (center = ch - 2)
+                    if ch.number <= 7 { ch.number + 2 } else { ch.number - 2 }
+                }
+                Band::Band6g => {
+                    // 6GHz: channels in steps of 4, groups of 2 for 40MHz
+                    // e.g., 1+5→3, 9+13→11, etc.
+                    let offset = ((ch.number - 1) / 4) % 2;
+                    if offset == 0 { ch.number + 2 } else { ch.number - 2 }
+                }
+            };
+            (center, 1) // CMD_CBW_40MHZ = 1
+        }
+        Bandwidth::Bw80 => {
+            // 80MHz: 4 primary channels per group
+            let center = match ch.band {
+                Band::Band5g => {
+                    match ch.number {
+                        36..=48   => 42,
+                        52..=64   => 58,
+                        100..=112 => 106,
+                        116..=128 => 122,
+                        132..=144 => 138,
+                        149..=161 => 155,
+                        // Fallback: approximate
+                        _ => ch.number,
+                    }
+                }
+                Band::Band6g => {
+                    // 6GHz 80MHz groups: 1-13→7, 17-29→23, 33-45→39, ...
+                    // Group of 4 channels (step 4): center = first_of_group + 6
+                    let group = ((ch.number - 1) / 16) * 16 + 1;
+                    group + 6
+                }
+                Band::Band2g => ch.number, // 80MHz not applicable on 2.4G
+            };
+            (center, 2) // CMD_CBW_80MHZ = 2
+        }
+        Bandwidth::Bw160 => {
+            // 160MHz: 8 primary channels per group
+            let center = match ch.band {
+                Band::Band5g => {
+                    match ch.number {
+                        36..=64   => 50,
+                        100..=128 => 114,
+                        // 149-177 doesn't support 160MHz in most regions
+                        _ => ch.number,
+                    }
+                }
+                Band::Band6g => {
+                    // 160MHz groups: 1-29→15, 33-61→47, ...
+                    let group = ((ch.number - 1) / 32) * 32 + 1;
+                    group + 14
+                }
+                Band::Band2g => ch.number,
+            };
+            (center, 3) // CMD_CBW_160MHZ = 3
+        }
     }
 }
 
@@ -1580,7 +1677,24 @@ impl Mt7921au {
     /// all channels in the current band, which is sufficient for monitor mode.
     ///
     /// Uses EXT cmd TX_POWER_FEATURE_CTRL (0x58).
+    /// Set per-rate TX power limits for all channels in a band.
+    /// `max_dbm` = maximum power in dBm (0 = use hardware max from SKU tables).
+    /// Values are in half-dBm units internally. Firmware clamps to eFuse limits.
+    fn mcu_set_rate_txpower_limited(&mut self, band: Band, max_dbm: i8) -> Result<()> {
+        // Convert dBm to half-dBm. 0 means "no limit" (use SKU defaults).
+        let max_half_dbm: u8 = if max_dbm > 0 {
+            (max_dbm as u8).saturating_mul(2)
+        } else {
+            127 // no limit — firmware uses eFuse max
+        };
+        self.mcu_set_rate_txpower_inner(band, max_half_dbm)
+    }
+
     fn mcu_set_rate_txpower(&mut self, band: Band) -> Result<()> {
+        self.mcu_set_rate_txpower_inner(band, 0) // 0 = use SKU defaults, no clamping
+    }
+
+    fn mcu_set_rate_txpower_inner(&mut self, band: Band, max_half_dbm: u8) -> Result<()> {
         // TX power feature ctrl sub-command for rate power
         const TX_POWER_LIMIT_TABLE_RATE: u8 = 4;
 
@@ -1713,6 +1827,15 @@ impl Mt7921au {
                             for (k, &v) in he_pwr.iter().enumerate() {
                                 pwr[69 + ru * 12 + k] = v;
                             }
+                        }
+                    }
+                }
+
+                // Clamp all per-rate values to requested max if set
+                if max_half_dbm > 0 && max_half_dbm < 127 {
+                    for j in 4..sku_len {
+                        if payload[off + j] > max_half_dbm {
+                            payload[off + j] = max_half_dbm;
                         }
                     }
                 }
@@ -2153,46 +2276,56 @@ impl Mt7921au {
         Ok(())
     }
 
-    /// Set RX path / initial channel info. Required before sniffer mode.
-    /// Matches mt7921_mcu_set_chan_info(phy, MCU_EXT_CMD(SET_RX_PATH)).
-    fn mcu_set_chan_info(&mut self, ext_cmd: u8, ch: u8, band: Band) -> Result<()> {
-        let channel_band = band_to_idx(band);
+    /// Set RX path / channel info via MCU command.
+    /// Matches mt7921_mcu_set_chan_info() from Linux mt7921/mcu.c:863.
+    /// Accepts a full Channel struct to support bandwidth (20/40/80/160 MHz).
+    fn mcu_set_chan_info(&mut self, ext_cmd: u8, channel: Channel) -> Result<()> {
+        let channel_band = band_to_idx(channel.band);
+        let (center_ch, bw) = channel_center_and_bw(channel);
 
         // Struct matches mt7921_mcu_set_chan_info() — 80 bytes total
+        // Linux: mt7921/mcu.c:863
         let mut req = [0u8; 80];
-        req[0] = ch;           // control_ch
-        req[1] = ch;           // center_ch
-        req[2] = 0;            // bw = 20MHz
-        req[3] = 2;            // tx_streams_num = 2 (Fenvi 2x2 MIMO: TX antenna mask 0x3)
-        req[4] = 2;            // rx_streams = 2 (RX antenna mask 0x3 = 2 chains)
-        req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL
-        req[6] = 0;            // band_idx = phy band index (always 0 for single-band)
-        req[7] = 0;            // center_ch2
+        req[0] = channel.number; // control_ch
+        req[1] = center_ch;     // center_ch
+        req[2] = bw;            // bw: 0=20, 1=40, 2=80, 3=160 (CMD_CBW_*)
+        req[3] = 2;             // tx_streams_num = hweight8(antenna_mask 0x3) = 2
+        // rx_streams: Linux sends antenna_mask (0x3) for SET_RX_PATH,
+        // but hweight8(antenna_mask) (2) for CHANNEL_SWITCH.
+        req[4] = if ext_cmd == MCU_EXT_CMD_SET_RX_PATH {
+            0x3              // antenna_mask (bitmask: both antennas)
+        } else {
+            2                // hweight8(0x3) = 2 (stream count)
+        };
+        req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL (monitor mode)
+        req[6] = 0;            // band_idx = PHY band index (always 0, single-PHY device)
+        req[7] = 0;            // center_ch2 (only for 80+80)
         // cac_case: le16 at [8-9] = 0
-        req[10] = channel_band; // channel_band
+        req[10] = channel_band; // channel_band: 0=2.4G, 1=5G, 2=6G
 
         self.mcu_send_ext_cmd(ext_cmd, &req, true)?;
         Ok(())
     }
 
     /// Fire-and-forget variant — sends channel switch without waiting for MCU response.
-    fn mcu_set_chan_info_no_wait(&mut self, ext_cmd: u8, ch: u8, band: Band) -> Result<()> {
-        let channel_band: u8 = match band {
-            Band::Band2g => 0,
-            Band::Band5g => 1,
-            Band::Band6g => 2,
-        };
+    fn mcu_set_chan_info_no_wait(&mut self, ext_cmd: u8, channel: Channel) -> Result<()> {
+        let channel_band = band_to_idx(channel.band);
+        let (center_ch, bw) = channel_center_and_bw(channel);
 
         let mut req = [0u8; 80];
-        req[0] = ch;
-        req[1] = ch;
-        req[2] = 0;            // bw = 20MHz
-        req[3] = 2;            // tx_streams_num (2x2 MIMO)
-        req[4] = 2;            // rx_streams (2x2 MIMO)
+        req[0] = channel.number; // control_ch
+        req[1] = center_ch;     // center_ch
+        req[2] = bw;            // bw: CMD_CBW_*
+        req[3] = 2;             // tx_streams_num = hweight8(0x3) = 2
+        req[4] = if ext_cmd == MCU_EXT_CMD_SET_RX_PATH {
+            0x3              // antenna_mask for SET_RX_PATH
+        } else {
+            2                // stream count for CHANNEL_SWITCH
+        };
         req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL
-        req[10] = channel_band;
+        req[10] = channel_band; // channel_band: 0=2.4G, 1=5G, 2=6G
 
-        self.mcu_send_ext_cmd(ext_cmd, &req, false)?; // false = don't wait
+        self.mcu_send_ext_cmd(ext_cmd, &req, false)?;
         Ok(())
     }
 
@@ -2317,7 +2450,7 @@ impl Mt7921au {
         self.mac_init()?;
         self.wtbl_clear_all()?;
         self.mcu_set_channel_domain()?;
-        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, ch, band)?;
+        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, Channel::new(ch))?;
 
         // Set TX power to MAXIMUM for all channels in all three bands.
         // The firmware caps values to eFuse hardware limits, so setting 127
@@ -2450,6 +2583,46 @@ impl Mt7921au {
         Ok(())
     }
 
+    /// Remove the virtual interface from the firmware.
+    /// Matches mt76_connac_mcu_uni_add_dev() with enable=false.
+    /// Linux sends BSS_INFO_UPDATE(active=0) first, then DEV_INFO_UPDATE(active=0).
+    fn mcu_remove_dev(&mut self) -> Result<()> {
+        let omac_idx: u8 = 0;
+        let band_idx: u8 = 0;
+        let bss_idx: u8 = 0;
+        let wcid_idx: u16 = 543;
+        let conn_type: u32 = (1u32 << 1) | (1u32 << 16); // CONNECTION_INFRA_AP
+
+        // 1. BSS_INFO_UPDATE with active=0 (disable BSS first)
+        let mut bss_req = [0u8; 36];
+        bss_req[0] = bss_idx;
+        let t = 4;
+        bss_req[t..t+2].copy_from_slice(&0u16.to_le_bytes()); // tag = UNI_BSS_INFO_BASIC
+        bss_req[t+2..t+4].copy_from_slice(&32u16.to_le_bytes()); // len
+        bss_req[t+4] = 0; // active = false (DISABLE)
+        bss_req[t+5] = omac_idx;
+        bss_req[t+6] = omac_idx;
+        bss_req[t+7] = band_idx;
+        bss_req[t+8..t+12].copy_from_slice(&conn_type.to_le_bytes());
+        bss_req[t+20..t+22].copy_from_slice(&wcid_idx.to_le_bytes());
+        bss_req[t+26..t+28].copy_from_slice(&wcid_idx.to_le_bytes());
+
+        self.mcu_send_uni_cmd(0x02, &bss_req, true)?;
+
+        // 2. DEV_INFO_UPDATE with active=0 (deregister MAC)
+        let mut dev_req = [0u8; 16];
+        dev_req[0] = omac_idx;
+        dev_req[1] = band_idx;
+        dev_req[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag = DEV_INFO_ACTIVE
+        dev_req[6..8].copy_from_slice(&12u16.to_le_bytes()); // len
+        dev_req[8] = 0; // active = false (DISABLE)
+        dev_req[10..16].copy_from_slice(&self.mac_addr.0);
+
+        self.mcu_send_uni_cmd(0x01, &dev_req, true)?;
+
+        Ok(())
+    }
+
     /// Drain all pending data from both USB bulk IN endpoints.
     /// Linux pre-submits URBs during init so firmware events are consumed
     /// continuously. We read on-demand, so events accumulate. This drains
@@ -2500,37 +2673,50 @@ impl Mt7921au {
     }
 
     /// Configure sniffer channel via MCU command.
-    /// Matches mt7921_mcu_config_sniffer() from the kernel driver.
-    fn mcu_config_sniffer_channel(&mut self, ch: u8, band: Band) -> Result<()> {
-        let band_idx = band_to_idx(band);
+    /// Matches mt7921_mcu_config_sniffer() from Linux mt7921/mcu.c:1161.
+    fn mcu_config_sniffer_channel(&mut self, channel: Channel) -> Result<()> {
+        let (center_ch, cmd_bw) = channel_center_and_bw(channel);
+
+        // Sniffer bw mapping differs from chan_info CMD_CBW_*!
+        // Linux ch_width[]: 20/40→0, 80→1, 160→2, 80+80→3
+        let sniffer_bw: u8 = match cmd_bw {
+            0 | 1 => 0,  // 20MHz and 40MHz both map to 0
+            2 => 1,       // 80MHz → 1
+            3 => 2,       // 160MHz → 2
+            _ => 0,
+        };
+
+        // sco: secondary channel offset
+        // Linux: 1=SCA (control < center), 3=SCB (control > center), 0=none
+        let sco: u8 = if center_ch > channel.number { 1 }
+                       else if center_ch < channel.number { 3 }
+                       else { 0 };
 
         // Build TLV payload:
         // struct { band_idx[1], pad[3] } hdr
         // struct { tag[2], len[2], aid[2], ch_band[1], bw[1],
-        //          control_ch[1], center_ch[1], center_ch2[1], drop_err[1],
-        //          pad[4] } tlv
+        //          control_ch[1], sco[1], center_ch[1], center_ch2[1],
+        //          drop_err[1], pad[3] } tlv
         let mut payload = [0u8; 20];
-        // hdr.band_idx — MUST match the band we're switching to
-        payload[0] = band_idx;
+        // hdr.band_idx = PHY band index (always 0 for single-PHY MT7921AU)
+        payload[0] = 0;
         // tlv.tag = 1 (config)
         payload[4..6].copy_from_slice(&1u16.to_le_bytes());
         // tlv.len = 16
         payload[6..8].copy_from_slice(&16u16.to_le_bytes());
-        // tlv.aid = 0 (bytes 8-9)
         // tlv.ch_band (byte 10) — Linux mcu.c:1166 maps: 1=2GHz, 2=5GHz, 3=6GHz
-        // band_to_idx returns 0/1/2 (NL80211 enum), MCU expects 1/2/3
-        payload[10] = band_idx + 1;
-        // tlv.bw = 0 (20 MHz) (byte 11)
-        payload[11] = 0;
+        payload[10] = band_to_idx(channel.band) + 1;
+        // tlv.bw (byte 11) — sniffer bw encoding
+        payload[11] = sniffer_bw;
         // tlv.control_ch (byte 12)
-        payload[12] = ch;
-        // tlv.sco = 0 (secondary channel offset, 0 for 20MHz) (byte 13)
-        payload[13] = 0;
+        payload[12] = channel.number;
+        // tlv.sco (byte 13) — secondary channel offset
+        payload[13] = sco;
         // tlv.center_ch (byte 14)
-        payload[14] = ch;
+        payload[14] = center_ch;
         // tlv.center_ch2 = 0 (byte 15)
         payload[15] = 0;
-        // tlv.drop_err = 1 (drop errored frames, matches Linux) (byte 16)
+        // tlv.drop_err = 1 (byte 16)
         payload[16] = 1;
 
         // Try with wait_resp first; if it times out, send without waiting.
@@ -2715,6 +2901,7 @@ impl Mt7921au {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default(),
+            ..Default::default()
         })
     }
 
@@ -2884,6 +3071,218 @@ impl Mt7921au {
     pub fn usb_handle(&self) -> Arc<DeviceHandle<GlobalContext>> {
         Arc::clone(&self.handle)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  AP Mode — Rogue AP / Evil Twin
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Start a rogue access point with the given SSID and BSSID.
+    /// The firmware handles beacon transmission automatically via beacon offload.
+    /// Monitor mode RX remains active — we see all frames while beaconing.
+    ///
+    /// For evil twin: use the target AP's SSID and our MAC as BSSID.
+    /// For karma: respond to probe requests with matching SSIDs.
+    pub fn start_ap(&mut self, ssid: &str, bssid: &[u8; 6], beacon_interval: u16) -> Result<()> {
+        if !self.mcu_running {
+            return Err(Error::ChipInitFailed {
+                chip: "MT7921AU".into(),
+                stage: crate::core::error::InitStage::MonitorMode,
+                reason: "MCU not running".into(),
+            });
+        }
+
+        // Update MAC to AP BSSID so firmware ACKs frames from clients
+        self.set_mac(MacAddress(*bssid))?;
+
+        // Build beacon and upload to firmware.
+        // Our existing VIF (from mcu_add_dev in set_monitor_mode) already has
+        // CONNECTION_INFRA_AP — same as what Linux uses for AP mode.
+        // We just need to give the firmware a beacon template.
+        let beacon = build_beacon_frame(ssid, bssid, self.channel, beacon_interval);
+
+        // Try firmware beacon offload first (ideal — firmware handles timing)
+        match self.mcu_beacon_offload(&beacon, true) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                // Firmware beacon offload not working — fall back to software beacons.
+                // We'll TX the beacon ourselves from a timer thread.
+                // For now, just inject one beacon to prove TX works, and the caller
+                // can loop beacon injection.
+                eprintln!("  [AP] Firmware beacon offload not available, using software beacons");
+            }
+        }
+
+        // Software beacon fallback: inject beacon frame via TX path
+        let tx_opts = TxOptions {
+            rate: TxRate::Ofdm6m,
+            flags: TxFlags::NO_ACK, // beacons are broadcast
+            retries: 0,
+            ..Default::default()
+        };
+        self.tx_frame(&beacon, &tx_opts)?;
+
+        Ok(())
+    }
+
+    /// Stop the rogue AP — disable beacon offload.
+    pub fn stop_ap(&mut self) -> Result<()> {
+        // Beacon offload disable is handled by BSS deactivation.
+        // Re-register as monitor mode VIF.
+        self.mcu_add_dev()?;
+        Ok(())
+    }
+
+    /// Upload beacon template to firmware for automatic transmission.
+    /// Matches mt7921_mcu_uni_add_beacon_offload() from Linux.
+    fn mcu_beacon_offload(&mut self, beacon_frame: &[u8], enable: bool) -> Result<()> {
+        // Build the TXWI (32 bytes) for the beacon — firmware needs it to know the rate
+        let txwi = self.build_beacon_txwi(beacon_frame);
+
+        // struct { bss_idx, pad[3] } hdr (4 bytes)
+        // struct bcn_content_tlv {
+        //   tag(2), len(2), tim_ie_pos(2), csa_ie_pos(2), bcc_ie_pos(2),
+        //   enable(1), type(1), pkt_len(2), pkt[512]
+        // } (528 bytes)
+        let tlv_len = 16 + 512; // fixed TLV size
+        let total = 4 + tlv_len;
+        let mut payload = vec![0u8; total];
+
+        payload[0] = 0; // bss_idx
+
+        // TLV
+        let t = 4;
+        payload[t..t+2].copy_from_slice(&7u16.to_le_bytes()); // tag = UNI_BSS_INFO_BCN_CONTENT
+        payload[t+2..t+4].copy_from_slice(&(tlv_len as u16).to_le_bytes()); // len
+        // tim_ie_pos, csa_ie_pos, bcc_ie_pos — leave 0 for now
+        payload[t+10] = if enable { 1 } else { 0 }; // enable
+        payload[t+11] = 0; // type = 0 (legacy: TXD + payload)
+
+        // pkt = TXWI(32) + beacon frame
+        let pkt_len = 32 + beacon_frame.len();
+        payload[t+12..t+14].copy_from_slice(&(pkt_len as u16).to_le_bytes());
+
+        // Copy TXWI + beacon into pkt buffer (starting at t+16)
+        let pkt_off = t + 16;
+        payload[pkt_off..pkt_off+32].copy_from_slice(&txwi);
+        if pkt_off + 32 + beacon_frame.len() <= total {
+            payload[pkt_off+32..pkt_off+32+beacon_frame.len()].copy_from_slice(beacon_frame);
+        }
+
+        self.mcu_send_uni_cmd(0x02, &payload, true)?; // BSS_INFO_UPDATE with BCN_CONTENT tag
+        Ok(())
+    }
+
+    /// Build a minimal TXWI for beacon transmission.
+    fn build_beacon_txwi(&self, beacon: &[u8]) -> [u8; 32] {
+        let mut txwi = [0u8; 32];
+        let frame_len = beacon.len();
+
+        // DW0: TX_BYTES | PKT_FMT=SF(1) | Q_IDX=ALTX0(0x10) for beacons
+        let dw0: u32 = ((32 + frame_len) as u32 & 0xFFFF)
+            | (1u32 << 23) // PKT_FMT = MT_TX_TYPE_SF
+            | (0x10u32 << 25); // Q_IDX = ALTX0
+        txwi[0..4].copy_from_slice(&dw0.to_le_bytes());
+
+        // DW1: LONG_FORMAT | HDR_FORMAT=802.11(2) | HDR_INFO=12 (24/2)
+        let dw1: u32 = (1u32 << 31) | (2u32 << 16) | (12u32 << 11);
+        txwi[4..8].copy_from_slice(&dw1.to_le_bytes());
+
+        // DW2: FRAME_TYPE=0(mgmt) | SUB_TYPE=8(beacon) | FIX_RATE
+        let dw2: u32 = (0u32 << 4) | 8 | (1u32 << 31); // FIX_RATE
+        txwi[8..12].copy_from_slice(&dw2.to_le_bytes());
+
+        // DW3: NO_ACK (beacons are broadcast)
+        let dw3: u32 = 1; // NO_ACK
+        txwi[12..16].copy_from_slice(&dw3.to_le_bytes());
+
+        // DW6: TX_RATE = OFDM 6M for beacons | FIXED_BW
+        let rate = (1u32 << 6) | 11; // MODE=OFDM(1), IDX=11 (6Mbps)
+        let dw6: u32 = (rate << 16) | (1u32 << 2);
+        txwi[24..28].copy_from_slice(&dw6.to_le_bytes());
+
+        txwi
+    }
+}
+
+/// Build a standard 802.11 beacon frame. Public for use by test binaries.
+pub fn build_beacon_frame_pub(ssid: &str, bssid: &[u8; 6], channel: u8, beacon_interval: u16) -> Vec<u8> {
+    build_beacon_frame(ssid, bssid, channel, beacon_interval)
+}
+
+/// Build a standard 802.11 beacon frame.
+fn build_beacon_frame(ssid: &str, bssid: &[u8; 6], channel: u8, beacon_interval: u16) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(256);
+
+    // Frame Control: type=0(mgmt), subtype=8(beacon)
+    frame.push(0x80); // FC byte 0
+    frame.push(0x00); // FC byte 1
+
+    // Duration
+    frame.push(0x00);
+    frame.push(0x00);
+
+    // addr1 (DA) = broadcast
+    frame.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // addr2 (SA) = BSSID
+    frame.extend_from_slice(bssid);
+    // addr3 (BSSID) = BSSID
+    frame.extend_from_slice(bssid);
+
+    // Sequence control (firmware manages this)
+    frame.push(0x00);
+    frame.push(0x00);
+
+    // Fixed parameters (12 bytes)
+    // Timestamp (8 bytes) — firmware fills this
+    frame.extend_from_slice(&[0u8; 8]);
+    // Beacon interval (2 bytes, in TU = 1024 μs)
+    frame.extend_from_slice(&beacon_interval.to_le_bytes());
+    // Capability info (2 bytes): ESS(bit0) + short preamble(bit5)
+    frame.extend_from_slice(&[0x21, 0x00]); // ESS + short preamble
+
+    // Tagged parameters
+
+    // SSID (tag 0)
+    frame.push(0x00); // tag
+    frame.push(ssid.len().min(32) as u8); // len
+    frame.extend_from_slice(&ssid.as_bytes()[..ssid.len().min(32)]);
+
+    // Supported Rates (tag 1) — 802.11a/g rates
+    let rates: &[u8] = if channel > 14 {
+        // 5GHz: OFDM only
+        &[0x0C, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6C] // 6,9,12,18,24,36,48,54
+    } else {
+        // 2.4GHz: CCK + OFDM
+        &[0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24] // 1*,2*,5.5*,11*,6,9,12,18
+    };
+    frame.push(0x01); // tag
+    frame.push(rates.len() as u8);
+    frame.extend_from_slice(rates);
+
+    // DS Parameter Set (tag 3) — channel
+    frame.push(0x03); // tag
+    frame.push(0x01); // len
+    frame.push(channel);
+
+    // TIM (tag 5) — Traffic Indication Map (minimal)
+    frame.push(0x05); // tag
+    frame.push(0x04); // len
+    frame.push(0x00); // DTIM count
+    frame.push(0x01); // DTIM period
+    frame.push(0x00); // bitmap control
+    frame.push(0x00); // partial virtual bitmap
+
+    // RSN (tag 48) — for WPA2 AP, add later if needed
+
+    // Extended Supported Rates (tag 50) for 2.4GHz
+    if channel <= 14 {
+        let ext_rates: &[u8] = &[0x30, 0x48, 0x60, 0x6C]; // 24,36,48,54
+        frame.push(50); // tag
+        frame.push(ext_rates.len() as u8);
+        frame.extend_from_slice(ext_rates);
+    }
+
+    frame
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2930,35 +3329,26 @@ impl ChipDriver for Mt7921au {
             });
         }
 
-        // Use MCU_EXT_CMD(CHANNEL_SWITCH) — wait for response.
-        // Firmware takes 140-500ms to retune PLL regardless of whether we wait.
-        // Fire-and-forget tested (Session 68): same fps because firmware retune time
-        // is the bottleneck, not our wait. Keeping wait for MCU flow reliability.
-        // recv_timeout reduced from 200ms→10ms which doubled hopping fps (43→90).
-        self.mcu_set_chan_info(MCU_EXT_CMD_CHANNEL_SWITCH, channel.number, channel.band)?;
+        // CRITICAL: usbmon capture reveals Linux NEVER uses MCU_EXT_CMD_CHANNEL_SWITCH
+        // for MT7921AU monitor mode. It uses SET_RX_PATH (0x4E) instead.
+        // CHANNEL_SWITCH (0x08) silently fails on 6GHz — MCU accepts it but radio
+        // never retunes. SET_RX_PATH sends rx_streams as antenna_mask (0x3).
+        //
+        // Linux full sequence includes MAC reset + channel domain + TX power resend,
+        // but we try SET_RX_PATH alone first — the MAC reset kills sniffer state
+        // and TX power resend causes MCU command storms.
+        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, channel)?;
 
-        // In sniffer mode, also try the sniffer-specific channel config (tag=1).
-        // Note: This times out on our firmware version (20231109) but we send it
-        // fire-and-forget just in case. The EXT channel switch above is sufficient.
+        // In sniffer mode, also send the sniffer-specific channel config.
+        // Linux calls mt7921_mcu_config_sniffer() on every chanctx change for
+        // monitor mode interfaces. This carries the bandwidth and sco fields
+        // that control the actual capture width.
         if self.sniffer_enabled {
-            let _ = self.mcu_send_uni_cmd(MCU_UNI_CMD_SNIFFER, &{
-                let mut p = [0u8; 20];
-                p[4..6].copy_from_slice(&1u16.to_le_bytes()); // tag=1 (config)
-                p[6..8].copy_from_slice(&16u16.to_le_bytes()); // len=16
-                p[10] = band_to_idx(channel.band) + 1; // ch_band: MCU expects 1/2/3
-                p[12] = channel.number; // control_ch
-                p[14] = channel.number; // center_ch
-                p[16] = 1; // drop_err=1
-                p
-            }, false); // don't wait for response
+            let _ = self.mcu_config_sniffer_channel(channel);
         }
 
         self.channel = channel.number;
         self.band = channel.band;
-        // TX power is set for ALL bands during radio_init(). No need to resend
-        // during channel hop — the firmware already has the limits cached per-channel.
-        // Linux's per-switch TX power updates are for regulatory compliance with
-        // dynamic country switching, which doesn't apply to monitor mode.
         Ok(())
     }
 
@@ -3000,7 +3390,7 @@ impl ChipDriver for Mt7921au {
         self.mcu_set_sniffer(true)?;
 
         // STEP 4: Configure sniffer channel.
-        self.mcu_config_sniffer_channel(self.channel, self.band)?;
+        self.mcu_config_sniffer_channel(Channel::new(self.channel))?;
 
         // STEP 5: Set RX filter for monitor mode — accept ALL frames.
         // Matches mt7921_configure_filter() from main.c.
@@ -3119,8 +3509,12 @@ impl ChipDriver for Mt7921au {
         dw2 |= 1u32 << 31;  // FIX_RATE — use rate from DW6, not rate adaptation
         pkt[off+8..off+12].copy_from_slice(&dw2.to_le_bytes());
 
-        // DW3: NO_ACK[0]=1 | REM_TX_COUNT[15:11]=15 | BA_DISABLE[28]=1 | SN_VALID[31] | SEQ[27:16]
-        let mut dw3: u32 = 1 | (15u32 << 11) | (1u32 << 28);
+        // DW3: NO_ACK[0] | REM_TX_COUNT[15:11] | BA_DISABLE[28] | SN_VALID[31] | SEQ[27:16]
+        let want_ack = opts.flags.contains(TxFlags::WANT_ACK);
+        let no_ack = !want_ack; // Default: no ACK for monitor mode injection
+        let mut dw3: u32 = (15u32 << 11); // REM_TX_COUNT = 15 (max retries)
+        if no_ack { dw3 |= 1; }            // NO_ACK bit 0
+        if !want_ack { dw3 |= 1u32 << 28; } // BA_DISABLE bit 28
         // Set explicit sequence number from the 802.11 frame header
         if frame.len() >= 24 {
             let seq_ctrl = u16::from_le_bytes([frame[22], frame[23]]);
@@ -3131,11 +3525,15 @@ impl ChipDriver for Mt7921au {
 
         // DW4-DW5: zero (no PN, no PID)
 
-        // DW6: TX_RATE[29:16] | FIXED_BW[2]=1
+        // DW6: TX_RATE[29:16] | SGI[15:14] | LDPC[11] | FIXED_BW[2]
         // Rate encoding via TxRate::mt76_rate(): MODE[9:6] | NSS[12:10] | IDX[5:0]
-        // Supports CCK, OFDM, HT(MODE=2), VHT(MODE=3), HE_SU(MODE=4)
-        let rate: u32 = opts.rate.mt76_rate() as u32;
-        let dw6: u32 = (rate << 16) | (1u32 << 2);  // TX_RATE + FIXED_BW(20MHz)
+        // SGI: 0=normal GI (0.8μs), 1=short GI (0.4μs HT/VHT, 1.6μs HE), 2=HE extended (3.2μs)
+        let mut rate_val: u32 = opts.rate.mt76_rate() as u32;
+        if opts.flags.contains(TxFlags::STBC) { rate_val |= 1 << 13; } // STBC bit in rate field
+        let mut dw6: u32 = (rate_val << 16)
+            | (1u32 << 2)                                 // FIXED_BW
+            | (((opts.gi as u32) & 0x3) << 14);           // SGI[15:14]
+        if opts.flags.contains(TxFlags::LDPC) { dw6 |= 1u32 << 11; } // LDPC
         pkt[off+24..off+28].copy_from_slice(&dw6.to_le_bytes());
 
         // DW7: zero (HW_AMSDU cleared when FIX_RATE)
@@ -3220,8 +3618,29 @@ impl ChipDriver for Mt7921au {
     }
 
     fn set_mac(&mut self, mac: MacAddress) -> Result<()> {
+        let old_mac = self.mac_addr;
         self.mac_addr = mac;
-        // TODO: set MAC via MCU command after full MCU command set is implemented
+
+        // MT7921AU supports POWERED_ADDR_CHANGE — MAC can change while interface is up.
+        // Re-send DEV_INFO_UPDATE with new MAC address in-place (no remove needed).
+        // The firmware updates the OMAC address for the existing VIF.
+        if self.mcu_running {
+            // DEV_INFO_UPDATE with active=true and new MAC
+            let mut dev_req = [0u8; 16];
+            dev_req[0] = 0; // omac_idx
+            dev_req[1] = 0; // band_idx
+            dev_req[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag = DEV_INFO_ACTIVE
+            dev_req[6..8].copy_from_slice(&12u16.to_le_bytes()); // len
+            dev_req[8] = 1; // active = true
+            dev_req[9] = 0; // link_idx
+            dev_req[10..16].copy_from_slice(&self.mac_addr.0); // new MAC
+
+            if let Err(e) = self.mcu_send_uni_cmd(0x01, &dev_req, true) {
+                self.mac_addr = old_mac; // rollback
+                return Err(e);
+            }
+        }
+
         Ok(())
     }
 
@@ -3229,10 +3648,16 @@ impl ChipDriver for Mt7921au {
         20 // Default max TX power for MT7921AU
     }
 
-    fn set_tx_power(&mut self, _dbm: i8) -> Result<()> {
-        // Re-send max TX power for the current band. The firmware caps to eFuse
-        // limits, so we always request maximum and let hardware enforce the ceiling.
-        self.mcu_set_rate_txpower(self.band)?;
+    fn set_tx_power(&mut self, dbm: i8) -> Result<()> {
+        // Send TX power for current band, clamped to requested dBm.
+        // dbm <= 0 means "use hardware max" (firmware caps to eFuse limits).
+        // dbm > 0 clamps all per-rate values to that limit.
+        // Useful for stealth operation or targeted injection at reduced power.
+        if dbm <= 0 {
+            self.mcu_set_rate_txpower(self.band)?;
+        } else {
+            self.mcu_set_rate_txpower_limited(self.band, dbm)?;
+        }
         Ok(())
     }
 
@@ -3411,6 +3836,7 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         channel: rx_channel,
         band: if rx_channel <= 14 { 0 } else { 1 },
         timestamp: Duration::ZERO,
+        ..Default::default()
     }))
 }
 

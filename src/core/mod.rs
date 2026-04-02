@@ -16,7 +16,7 @@ pub use adapter::{Adapter, AdapterInfo};
 pub use chip::{ChipDriver, ChipId, ChipCaps, AdapterState};
 pub use channel::{Channel, Band, Bandwidth};
 pub use mac::MacAddress;
-pub use frame::{RxFrame, TxOptions};
+pub use frame::{RxFrame, TxOptions, TxFlags, PpduType, GuardInterval, RxBandwidth};
 pub use event::EventRing;
 pub use parsed_frame::ParsedFrame;
 pub use taxonomy::{AttackType, Category, Status, Capability, ALL_ATTACKS};

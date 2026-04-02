@@ -42,6 +42,7 @@ fn main() {
         rate: TxRate::Ofdm6m,
         flags: TxFlags::empty(),
         retries: 0,
+        ..Default::default()
     };
 
     for i in 0..3 {

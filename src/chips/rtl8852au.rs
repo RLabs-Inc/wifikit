@@ -23,7 +23,7 @@ use rusb::{DeviceHandle, GlobalContext};
 use crate::core::{
     Channel, Band, MacAddress, Result, Error,
     chip::{ChipDriver, ChipInfo, ChipId, ChipCaps},
-    frame::{RxFrame, TxOptions, TxRate, TxFlags},
+    frame::{RxFrame, TxOptions, TxRate, TxFlags, PpduType, GuardInterval, RxBandwidth},
     adapter::UsbEndpoints,
 };
 
@@ -53,6 +53,10 @@ const FWDL_WAIT_US: u32 = 400_000;
 // FW header parsing
 const FWHDR_HDR_LEN: usize = 32;
 const FWHDR_SECTION_LEN: usize = 16;
+
+// H2C command categories (from fwcmd_intf.h)
+const FWCMD_H2C_CAT_TEST: u32 = 0;
+const FWCMD_H2C_CAT_OUTSRC: u32 = 2;
 
 // ── MAC AX Registers ──
 
@@ -153,9 +157,8 @@ const B_AX_WCPU_EN: u32 = 1 << 1;
 // SYS_CLK_CTRL bits
 const B_AX_CPU_CLK_EN: u32 = 1 << 14;
 
-// RX descriptor RPKT_TYPE values
+// RX descriptor RPKT_TYPE — WiFi is 0, all others defined in PPDU section below
 const RPKT_TYPE_WIFI: u8 = 0;
-const RPKT_TYPE_C2H: u8 = 0x0A;
 
 // RX filter bits
 const B_AX_SNIFFER_MODE: u32 = 1 << 0;
@@ -225,6 +228,272 @@ fn tx_rate_to_hw(rate: &TxRate, channel: u8) -> u8 {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  PPDU status correlation — MAC AX gen2 architecture
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// WiFi frames arrive with rpkt_type=0 but drv_info_size=0 (no embedded PHY status).
+// RSSI/SNR/LDPC/STBC/noise arrive in separate PPDU status packets (rpkt_type=1).
+// Correlation is via ppdu_cnt (3-bit counter, 8 slots) in DW1[6:4].
+//
+// Flow (from hal_rx.c):
+//   1. WiFi frame → store metadata in slot[ppdu_cnt], set valid=false
+//   2. PPDU status → parse physts, store in slot[ppdu_cnt], set valid=true
+//   3. Next WiFi frame with same ppdu_cnt picks up the stored PHY info
+//
+// Reference: phl_def.h:2365 PHL_MAX_PPDU_CNT=8
+
+const PPDU_SLOT_COUNT: usize = 8;
+
+/// RX packet types from rxdesc.h
+const RPKT_TYPE_PPDU: u8 = 1;
+const RPKT_TYPE_CH_INFO: u8 = 2;
+const RPKT_TYPE_BB_SCORE: u8 = 3;
+const RPKT_TYPE_TXCMD_RPT: u8 = 4;
+const RPKT_TYPE_SS2FW_RPT: u8 = 5;
+const RPKT_TYPE_TXRPT: u8 = 6;
+const RPKT_TYPE_C2H: u8 = 10;
+
+/// PHY status parsed from a PPDU status packet (rpkt_type=1).
+/// Corresponds to physts_hdr_info + IE0 (CCK) or IE1 (OFDM/HT/VHT/HE).
+#[derive(Clone, Copy)]
+struct PpduPhyStatus {
+    valid: bool,
+    rssi_avg: i8,
+    rssi_path: [i8; 4],
+    noise_floor: i8,
+    snr: u8,
+    is_ldpc: bool,
+    is_stbc: bool,
+    is_bf: bool,
+}
+
+impl Default for PpduPhyStatus {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            rssi_avg: 0,
+            rssi_path: [0; 4],
+            noise_floor: 0,
+            snr: 0,
+            is_ldpc: false,
+            is_stbc: false,
+            is_bf: false,
+        }
+    }
+}
+
+/// Cache for PPDU status correlation. 8 slots indexed by ppdu_cnt.
+///
+/// Architecture: WiFi frames arrive BEFORE their matching PPDU status in the USB
+/// buffer. So we must store the pending WiFi frame and only return it once the
+/// PPDU status fills in the PHY info. If the next WiFi frame arrives before a
+/// PPDU status (different ppdu_cnt), we return the pending frame with whatever
+/// info we have (possibly rssi=0).
+struct PpduStatusCache {
+    slots: [PpduPhyStatus; PPDU_SLOT_COUNT],
+    /// Pending WiFi frame waiting for its PPDU status.
+    pending_frame: Option<(u8, RxFrame)>, // (ppdu_cnt, frame)
+}
+
+impl PpduStatusCache {
+    fn new() -> Self {
+        Self {
+            slots: [PpduPhyStatus::default(); PPDU_SLOT_COUNT],
+            pending_frame: None,
+        }
+    }
+
+    /// Store PHY status from a PPDU status packet.
+    /// If there's a pending frame with matching ppdu_cnt, applies the PHY info
+    /// and returns the completed frame.
+    fn store_ppdu(&mut self, ppdu_cnt: u8, phy: PpduPhyStatus) -> Option<RxFrame> {
+        let idx = (ppdu_cnt & 0x7) as usize;
+        self.slots[idx] = phy;
+
+        // Check if the pending frame matches this PPDU status
+        if let Some((pending_cnt, ref mut frame)) = self.pending_frame {
+            if pending_cnt == ppdu_cnt {
+                Self::apply_phy_to_frame(frame, &phy);
+                return self.pending_frame.take().map(|(_, f)| f);
+            }
+        }
+        None
+    }
+
+    /// Store a WiFi frame as pending, waiting for its PPDU status.
+    /// Returns any previously pending frame that never got its PPDU status.
+    fn store_pending(&mut self, ppdu_cnt: u8, frame: RxFrame) -> Option<RxFrame> {
+        // If there's already a pending frame, return it (it missed its PPDU)
+        let old = self.pending_frame.take().map(|(_, f)| f);
+        self.pending_frame = Some((ppdu_cnt, frame));
+        old
+    }
+
+    /// Look up pre-stored PPDU status (from a previous cycle or batch).
+    fn lookup(&self, ppdu_cnt: u8) -> Option<&PpduPhyStatus> {
+        let idx = (ppdu_cnt & 0x7) as usize;
+        if self.slots[idx].valid {
+            Some(&self.slots[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Flush any pending frame (e.g., at end of buffer).
+    fn flush_pending(&mut self) -> Option<RxFrame> {
+        self.pending_frame.take().map(|(_, f)| f)
+    }
+
+    fn apply_phy_to_frame(frame: &mut RxFrame, phy: &PpduPhyStatus) {
+        frame.rssi = phy.rssi_avg;
+        frame.rssi_path = phy.rssi_path;
+        frame.noise_floor = phy.noise_floor;
+        frame.snr = phy.snr;
+        frame.is_ldpc = phy.is_ldpc;
+        frame.is_stbc = phy.is_stbc;
+        frame.is_bf = phy.is_bf;
+    }
+}
+
+/// Convert U(8,1) RSSI value to dBm.
+/// From halbb_physts.h:29: TRANS_2_RSSI(X) = (X >> 1)
+/// Then hal_api_bb.c subtracts 110 for dBm offset.
+fn rssi_u81_to_dbm(val: u8) -> i8 {
+    if val == 0 { return 0; }
+    ((val >> 1) as i16 - 110).clamp(-127, 0) as i8
+}
+
+/// Parse a PPDU status payload, handling the mac_info header if present.
+///
+/// When `mac_info_vld=1`, the payload structure is:
+///   mac_info header (8 bytes: 2 DWs)
+///   usr_num * 4 bytes (user entries)
+///   4 bytes padding if usr_num is odd (8-byte alignment)
+///   rx_cnt (96 bytes, if rx_cnt_vld set in DW0 bit 29)
+///   plcp (plcp_len * 8 bytes, from DW1[23:16])
+///   physts (remaining bytes)
+///
+/// When `mac_info_vld=0`, the payload IS the physts directly.
+///
+/// Reference: phy_rpt.c:482 mac_parse_ppdu()
+const MAC_AX_RX_CNT_SIZE: usize = 96;
+
+fn parse_ppdu_payload(data: &[u8], mac_info_vld: bool) -> Option<PpduPhyStatus> {
+    if mac_info_vld {
+        // Skip mac_info header to find physts
+        if data.len() < 8 { return None; }
+
+        let dw0 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let dw1 = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+        let usr_num = (dw0 & 0xF) as usize;
+        let rx_cnt_vld = dw0 & (1 << 29) != 0;
+        let plcp_len = ((dw1 >> 16) & 0xFF) as usize;
+        let plcp_size = plcp_len * 8;
+
+        let mut offset: usize = 8; // mac_info header
+        offset += usr_num * 4;     // user entries
+        if usr_num & 1 != 0 { offset += 4; } // 8-byte alignment padding
+        if rx_cnt_vld { offset += MAC_AX_RX_CNT_SIZE; }
+        offset += plcp_size;
+
+        if offset >= data.len() { return None; }
+        parse_physts_header(&data[offset..])
+    } else {
+        parse_physts_header(data)
+    }
+}
+
+/// Parse physts_hdr_info (8 bytes) from the start of a physts buffer.
+/// Layout from halbb_physts_ie_l_endian.h:34-43:
+///   byte 0: ie_bitmap_select(5) | rsvd(1) | null_tb_ppdu(1) | is_valid(1)
+///   byte 1: physts_total_length (unit: 8 bytes)
+///   byte 2: rsvd
+///   byte 3: rssi_avg_td — U(8,1)
+///   bytes 4-7: rssi_td[0..3] — per-path U(8,1)
+fn parse_physts_header(data: &[u8]) -> Option<PpduPhyStatus> {
+    if data.len() < 8 { return None; }
+
+    let is_valid = data[0] & 0x80 != 0;
+    if !is_valid { return None; }
+
+    let ie_bitmap_select = data[0] & 0x1F;
+    let physts_total_length = data[1] as usize * 8;
+    let rssi_avg = rssi_u81_to_dbm(data[3]);
+    let rssi_path = [
+        rssi_u81_to_dbm(data[4]),
+        rssi_u81_to_dbm(data[5]),
+        rssi_u81_to_dbm(data[6]),
+        rssi_u81_to_dbm(data[7]),
+    ];
+
+    let mut phy = PpduPhyStatus {
+        valid: true,
+        rssi_avg,
+        rssi_path,
+        noise_floor: 0,
+        snr: 0,
+        is_ldpc: false,
+        is_stbc: false,
+        is_bf: false,
+    };
+
+    // Parse Information Elements after the 8-byte header
+    let ie_data = &data[8..data.len().min(physts_total_length.max(8))];
+
+    // IE bitmap tells us which IEs are present.
+    // ie_bitmap_select selects which bitmap set (type 1 = 5-bit fixed, type 2 = 12-bit variable).
+    // For our purposes: if bitmap bit 0 set → IE0 (CCK), bit 1 → IE1 (OFDM/HT/VHT/HE)
+    // IE0 and IE1 are mutually exclusive (CCK vs OFDM).
+    if ie_bitmap_select & 0x01 != 0 {
+        // IE0 — CCK (physts_ie_0_info, 16 bytes = 4 DWs)
+        parse_physts_ie0(ie_data, &mut phy);
+    } else if ie_bitmap_select & 0x02 != 0 {
+        // IE1 — OFDM/HT/VHT/HE (physts_ie_1_info, 24 bytes = 6 DWs)
+        parse_physts_ie1(ie_data, &mut phy);
+    }
+
+    Some(phy)
+}
+
+/// Parse IE0 (CCK) — physts_ie_0_info from halbb_physts_ie_l_endian.h:50-92
+/// 16 bytes (4 DWs).
+fn parse_physts_ie0(data: &[u8], phy: &mut PpduPhyStatus) {
+    if data.len() < 8 { return; }
+    // DW1 byte 0: avg_idle_noise_pwr
+    phy.noise_floor = rssi_u81_to_dbm(data[4]);
+    // CCK doesn't have LDPC/STBC/BF
+}
+
+/// Parse IE1 (OFDM/HT/VHT/HE) — physts_ie_1_info from halbb_physts_ie_l_endian.h:94-144
+/// 24 bytes (6 DWs).
+fn parse_physts_ie1(data: &[u8], phy: &mut PpduPhyStatus) {
+    if data.len() < 16 { return; }
+    // DW0:
+    //   byte 1: rssi_avg_fd (frequency-domain RSSI, supplementary to time-domain)
+    //   byte 2: ch_idx_seg0
+    //   byte 3[3:0]: rxsc, byte 3[7:4]: rx_path_en_bitmap
+    // DW1:
+    //   byte 4: avg_idle_noise_pwr
+    phy.noise_floor = rssi_u81_to_dbm(data[4]);
+    // DW2:
+    //   byte 8[5:0]: avg_snr (6-bit unsigned, 0-63 dB)
+    phy.snr = data[8] & 0x3F;
+    //   byte 11[4]: is_ldpc
+    //   byte 11[6]: is_stbc
+    if data.len() >= 12 {
+        phy.is_ldpc = data[11] & 0x10 != 0;
+        phy.is_stbc = data[11] & 0x40 != 0;
+    }
+    // DW3:
+    //   byte 12[0]: is_bf (after bf_gain_max[6:0] and is_awgn)
+    //   Actually: byte 13[0]: is_bf, byte 13[7:1]: avg_cn_seg0
+    if data.len() >= 14 {
+        phy.is_bf = data[13] & 0x01 != 0;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  Driver struct
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -243,16 +512,23 @@ pub struct Rtl8852au {
     vid: u16,
     pid: u16,
     fw_version: String,
+    ppdu_cache: PpduStatusCache,
 }
 
-/// Standalone parse function for RxHandle
+/// Standalone parse function for RxHandle — uses thread-local PPDU cache.
 fn parse_rx_packet_standalone(buf: &[u8], channel: u8) -> (usize, crate::core::chip::ParsedPacket) {
-    let (consumed, frame) = Rtl8852au::parse_rx_packet(buf, channel);
-    let packet = match frame {
-        Some(f) => crate::core::chip::ParsedPacket::Frame(f),
-        None => crate::core::chip::ParsedPacket::Skip,
-    };
-    (consumed, packet)
+    thread_local! {
+        static PPDU_CACHE: std::cell::RefCell<PpduStatusCache> =
+            std::cell::RefCell::new(PpduStatusCache::new());
+    }
+    PPDU_CACHE.with(|cache| {
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(buf, channel, &mut cache.borrow_mut());
+        let packet = match frame {
+            Some(f) => crate::core::chip::ParsedPacket::Frame(f),
+            None => crate::core::chip::ParsedPacket::Skip,
+        };
+        (consumed, packet)
+    })
 }
 
 /// RTL8852AU capability flags — WiFi 6 with HE support
@@ -309,6 +585,7 @@ impl Rtl8852au {
             vid,
             pid,
             fw_version: String::new(),
+            ppdu_cache: PpduStatusCache::new(),
         };
 
         Ok((driver, endpoints))
@@ -731,7 +1008,6 @@ impl Rtl8852au {
     // ══════════════════════════════════════════════════════════════════════════
 
     fn power_on(&mut self) -> Result<()> {
-        eprintln!("[RTL8852AU] Power on sequence...");
 
         // Phase 0: Boot mode check
         let gpio_mux = self.read32(R_AX_GPIO_MUXCFG)?;
@@ -744,7 +1020,6 @@ impl Rtl8852au {
 
         // Check current power state
         let pwr_state = (self.read32(R_AX_IC_PWR_STATE)? >> 8) & 0x3;
-        eprintln!("[RTL8852AU] Current power state: {}", pwr_state);
 
         // Phase 1: Reset FW ctrl and prepare for power-on
         self.write32(R_AX_WCPU_FW_CTRL, 0)?;
@@ -781,13 +1056,11 @@ impl Rtl8852au {
 
         // Step 4: Poll power ready
         self.poll8(0x0006, 0x02, 0x02, 200)?;
-        eprintln!("[RTL8852AU] Power ready confirmed");
 
         // Step 5-7: Request power on and wait for ack
         self.write8_mask(0x0006, 0x01, 0x01)?;  // Set bit 0
         self.write8_mask(0x0005, 0x01, 0x01)?;  // Request power on
         self.poll8(0x0005, 0x01, 0x00, 200)?;   // Wait for ack
-        eprintln!("[RTL8852AU] Power on acknowledged");
 
         // Step 9-13: MAC clock toggle sequence (stabilization)
         for _ in 0..2 {
@@ -811,12 +1084,10 @@ impl Rtl8852au {
         // Notify BT coex
         self.write8(R_AX_SCOREBOARD as u16 + 3, 0x01)?;
 
-        eprintln!("[RTL8852AU] Power on complete");
         Ok(())
     }
 
     fn power_off(&mut self) -> Result<()> {
-        eprintln!("[RTL8852AU] Power off...");
         // Disable WCPU
         self.clear_bits32(R_AX_PLATFORM_ENABLE, B_AX_WCPU_EN)?;
         // Power off table (simplified)
@@ -830,7 +1101,6 @@ impl Rtl8852au {
     // ══════════════════════════════════════════════════════════════════════════
 
     fn usb_init(&self) -> Result<()> {
-        eprintln!("[RTL8852AU] USB init...");
 
         // Set USB IO mode
         self.set_bits32(R_AX_USB_HOST_REQUEST_2, 1 << 4)?;
@@ -852,7 +1122,6 @@ impl Rtl8852au {
         let rx_agg = self.read32(R_AX_RXAGG_0)?;
         self.write32(R_AX_RXAGG_0, rx_agg | (1 << 31))?;  // AGG enable
 
-        eprintln!("[RTL8852AU] USB init complete");
         Ok(())
     }
 
@@ -866,7 +1135,6 @@ impl Rtl8852au {
     /// This replaces both dmac_pre_init AND enable_cpu_for_fwdl with the exact
     /// register sequence that the Linux driver performs between power-on and firmware download.
     fn dmac_pre_init_and_enable_cpu(&self) -> Result<()> {
-        eprintln!("[RTL8852AU] DMAC pre-init + CPU enable (usbmon replay)...");
 
         // ── SYS_CFG (0x0190/0x0194) — clear LDO boost ──
         let v = self.read32(0x0190)?;
@@ -916,7 +1184,6 @@ impl Rtl8852au {
         for i in 0..5000u32 {
             let val = self.read32(0x8D00)?;
             if val != 0 {
-                eprintln!("[RTL8852AU]   DMA ready: {:#010X} ({}iters)", val, i);
                 break;
             }
             if i == 4999 {
@@ -955,7 +1222,6 @@ impl Rtl8852au {
         // ── Chip info reads ──
         let chip_id = self.read32(0x00FC)?;
         let sys_cfg = self.read32(0x00F0)?;
-        eprintln!("[RTL8852AU]   Chip: {:#010X}, SYS_CFG1: {:#010X}", chip_id, sys_cfg);
 
         // ── HPON writeback ──
         let v = self.read32(R_AX_PLATFORM_ENABLE)?;
@@ -994,13 +1260,6 @@ impl Rtl8852au {
         self.write32(R_AX_SYS_CLK_CTRL, v | B_AX_CPU_CLK_EN)?;
 
         // ── DIAGNOSTIC: dump key registers before FWDL trigger ──
-        eprintln!("[RTL8852AU]   Pre-FWDL state:");
-        eprintln!("[RTL8852AU]     0x0004 (SYS_FUNC_EN)  = {:#010X} (usbmon: 0x40030082)", self.read32(0x0004)?);
-        eprintln!("[RTL8852AU]     0x0008 (SYS_CLK_CTRL) = {:#010X} (usbmon: 0x0020EC21)", self.read32(0x0008)?);
-        eprintln!("[RTL8852AU]     0x0088 (PLATFORM_EN)  = {:#010X} (usbmon: 0x0000054D)", self.read32(0x0088)?);
-        eprintln!("[RTL8852AU]     0x01E0 (FW_CTRL)      = {:#010X} (usbmon: 0x00000000)", self.read32(0x01E0)?);
-        eprintln!("[RTL8852AU]     0x0060 (GPIO_EXT)     = {:#010X}", self.read32(0x0060)?);
-        eprintln!("[RTL8852AU]     0x0080 (HCI_CTRL)     = {:#010X}", self.read32(0x0080)?);
 
         // ── FWDL trigger: write FWDL_EN to 0x01E0, set boot reason, enable WCPU ──
         let _ = self.read32(R_AX_WCPU_FW_CTRL)?;
@@ -1012,14 +1271,11 @@ impl Rtl8852au {
         let v = self.read32(R_AX_PLATFORM_ENABLE)?;
         self.write32(R_AX_PLATFORM_ENABLE, v | B_AX_WCPU_EN)?;
         let after = self.read32(R_AX_PLATFORM_ENABLE)?;
-        eprintln!("[RTL8852AU]   PLATFORM_EN after WCPU_EN: {:#010X} (usbmon: 0x0000054F)", after);
 
         // ── Poll 0x01E0 for H2C_PATH_RDY (bit 1) ──
-        eprintln!("[RTL8852AU] Polling for H2C path ready...");
         for i in 0..FWDL_WAIT_US {
             let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
             if ctrl & B_AX_H2C_PATH_RDY != 0 {
-                eprintln!("[RTL8852AU]   H2C path ready: {:#04X} ({}us)", ctrl, i);
                 return Ok(());
             }
             if i == FWDL_WAIT_US - 1 {
@@ -1028,7 +1284,6 @@ impl Rtl8852au {
                 return Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed });
             }
             if i % 100000 == 0 && i > 0 {
-                eprintln!("[RTL8852AU]   Polling... 0x01E0={:#04X} ({}us)", ctrl, i);
             }
             thread::sleep(Duration::from_micros(1));
         }
@@ -1042,7 +1297,6 @@ impl Rtl8852au {
     fn load_firmware(&mut self) -> Result<()> {
         // Find firmware file
         let fw_data = self.find_firmware()?;
-        eprintln!("[RTL8852AU] Firmware loaded: {} bytes", fw_data.len());
 
         // Parse FW header
         if fw_data.len() < FWHDR_HDR_LEN {
@@ -1058,7 +1312,6 @@ impl Rtl8852au {
         let minor = fw_data[5];
         let sub = fw_data[6];
         self.fw_version = format!("{}.{}.{}", major, minor, sub);
-        eprintln!("[RTL8852AU] FW version: {}, {} sections", self.fw_version, section_num);
 
         // Parse section info
         let mut sections: Vec<(u32, usize, usize)> = Vec::new(); // (dl_addr, offset, len)
@@ -1076,8 +1329,6 @@ impl Rtl8852au {
             if has_checksum {
                 sec_size += 8; // FWDL_SECTION_CHKSUM_LEN
             }
-            eprintln!("[RTL8852AU]   Section {}: addr=0x{:08X} size={} checksum={}",
-                i, sec_dl_addr, sec_size, has_checksum);
             sections.push((sec_dl_addr, data_offset, sec_size));
             data_offset += sec_size;
         }
@@ -1092,14 +1343,12 @@ impl Rtl8852au {
         // Proceed directly to FW header download
 
         // Step 4: Phase 1 — send FW header
-        eprintln!("[RTL8852AU] Sending FW header ({} bytes)...", fw_hdr.len());
         self.fwdl_send_h2c(&fw_hdr)?;
 
         // Wait for FWDL path ready
         for i in 0..FWDL_WAIT_US {
             let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
             if ctrl & B_AX_FWDL_PATH_RDY != 0 {
-                eprintln!("[RTL8852AU] FWDL path ready after {}us", i);
                 break;
             }
             if i == FWDL_WAIT_US - 1 {
@@ -1114,23 +1363,19 @@ impl Rtl8852au {
 
         // Step 5: Phase 2 — send FW sections
         for (i, &(_dl_addr, offset, size)) in sections.iter().enumerate() {
-            eprintln!("[RTL8852AU] Downloading section {} ({} bytes)...", i, size);
             let section_data = &fw_data[offset..offset + size];
             self.fwdl_send_section(section_data)?;
         }
 
         // Step 6: Wait for FW init ready
         thread::sleep(Duration::from_millis(5));
-        eprintln!("[RTL8852AU] Waiting for FW init ready...");
         for i in 0..FWDL_WAIT_US {
             let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
             let sts = (ctrl >> B_AX_FWDL_STS_SH) & B_AX_FWDL_STS_MSK;
             if sts == FWDL_WCPU_FW_INIT_RDY {
-                eprintln!("[RTL8852AU] FW init ready! ({}us)", i);
                 return Ok(());
             }
             if i % 50000 == 0 && i > 0 {
-                eprintln!("[RTL8852AU]   Still waiting... sts={} (0x01E0={:#04X})", sts, ctrl);
             }
             thread::sleep(Duration::from_micros(1));
         }
@@ -1164,13 +1409,10 @@ impl Rtl8852au {
     }
 
     fn enable_cpu_for_fwdl(&self) -> Result<()> {
-        eprintln!("[RTL8852AU] Enabling CPU for FWDL...");
 
         // Check WCPU not already enabled
         let platform = self.read32(R_AX_PLATFORM_ENABLE)?;
-        eprintln!("[RTL8852AU]   Pre-enable PLATFORM_EN = {:#010X}", platform);
         if platform & B_AX_WCPU_EN != 0 {
-            eprintln!("[RTL8852AU]   WCPU already enabled, disabling first...");
             self.disable_cpu()?;
         }
 
@@ -1183,7 +1425,6 @@ impl Rtl8852au {
 
         // Configure WCPU_FW_CTRL: clear PATH_RDY bits, set FWDL_STS=0, set FWDL_EN
         let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
-        eprintln!("[RTL8852AU]   Pre-FWDL FW_CTRL = {:#04X}", fw_ctrl);
         // Clear everything, then set only FWDL_EN
         self.write8(R_AX_WCPU_FW_CTRL, B_AX_WCPU_FWDL_EN)?;
 
@@ -1195,7 +1436,6 @@ impl Rtl8852au {
 
         let fw_ctrl_after = self.read8(R_AX_WCPU_FW_CTRL)?;
         let platform_after = self.read32(R_AX_PLATFORM_ENABLE)?;
-        eprintln!("[RTL8852AU]   Post-enable FW_CTRL = {:#04X}, PLATFORM_EN = {:#010X}", fw_ctrl_after, platform_after);
 
         Ok(())
     }
@@ -1279,7 +1519,6 @@ impl Rtl8852au {
     /// Complete MAC/DMA operational init — from init.c dmac_func_en() + cmac_func_en().
     /// Register values computed from bit definitions in mac_reg.h.
     fn mac_init(&self) -> Result<()> {
-        eprintln!("[RTL8852AU] MAC init...");
 
         // ── DMAC function enable (0x8400) ──
         // B_AX_DMAC_CRPRT(31) | MAC_FUNC_EN(30) | DMAC_FUNC_EN(29) | MPDU_PROC_EN(28) |
@@ -1305,7 +1544,6 @@ impl Rtl8852au {
         // SCHEDULER_CKEN(2) | TMAC_CKEN(1) | RMAC_CKEN(0)
         self.write32(R_AX_CK_EN, 0x4000003F)?;
 
-        eprintln!("[RTL8852AU] MAC init complete");
         Ok(())
     }
 
@@ -1316,7 +1554,6 @@ impl Rtl8852au {
     /// Complete monitor mode setup — Phase 4 from usbmon capture.
     /// Sets all RX filter, frame accept, and sniffer mode registers.
     fn set_monitor_internal(&mut self) -> Result<()> {
-        eprintln!("[RTL8852AU] Setting monitor mode (usbmon Phase 4)...");
 
         // ── 4a. MAC RX filter ──
         self.write32(0xC33C, 0x472C4675)?;               // Frame type filter
@@ -1368,8 +1605,6 @@ impl Rtl8852au {
         self.write32(0xC804, 0x00000000)?;               // NAV override
 
         let fltr = self.read32(R_AX_RX_FLTR_OPT)?;
-        eprintln!("[RTL8852AU] RX filter: {:#010X}", fltr);
-        eprintln!("[RTL8852AU] Monitor mode set");
 
         Ok(())
     }
@@ -1378,44 +1613,71 @@ impl Rtl8852au {
     //  Channel setting (minimal — sets via BB/RF register for now)
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Channel switching — verbatim pcap replay per channel.
-    /// Uses complete register + bulk command sequences from usbmon capture.
+    /// Channel switching — programmatic register-based implementation.
+    /// Complete port from vendor driver (halbb_ctrl_bw_ch_8852a + hal_chan.c).
+    /// Works for all 39 channels (1-14 2.4GHz + 25 5GHz), 20MHz bandwidth.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
-        use rtl8852a_post_boot::PostBootOp;
-
-        let seq: Option<&[PostBootOp]> = match ch {
-            1  => Some(super::rtl8852a_phase_ch1::CH1_SEQUENCE),
-            6  => Some(super::rtl8852a_phase_ch6_2g::CH6_2G_SEQUENCE),
-            11 => Some(super::rtl8852a_phase_ch11_2g::CH11_2G_SEQUENCE),
-            36 => Some(super::rtl8852a_phase_ch36_5g::CH36_5G_SEQUENCE),
-            48 => Some(super::rtl8852a_phase_ch48_5g::CH48_5G_SEQUENCE),
-            149 => Some(super::rtl8852a_phase_ch149_5g::CH149_5G_SEQUENCE),
-            165 => Some(super::rtl8852a_phase_ch165_5g::CH165_5G_SEQUENCE),
-            // For channels without pcap data, use the BB direct method as fallback
-            _ => None,
-        };
-
-        if let Some(seq) = seq {
-            self.replay_phase_complete(&format!("Ch{}", ch), seq, false)?;
-            self.channel = ch;
-        } else {
-            // Fallback: BB register direct switching for channels without pcap data
-            self.set_channel_bb_direct(ch)?;
-            self.channel = ch;
-        }
-        Ok(())
+        self.set_channel_programmatic(ch)
     }
 
-    /// Complete channel switching via BB registers — ported from halbb_ctrl_bw_ch_8852a.
-    /// NOT USED: bypasses firmware, breaks radio state. Kept for reference.
-    /// Real channel switching needs H2C commands to firmware.
-    #[allow(dead_code)]
-    fn set_channel_bb_direct(&mut self, ch: u8) -> Result<()> {
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Channel switching — complete port from vendor driver
+    //
+    //  Flow (from hal_chan.c rtw_hal_set_ch_bw + halbb_ctrl_bw_ch_8852a):
+    //    1. hal_reset(enable)  — pause TX, disable PPDU/ADC/DFS, reset BB
+    //    2. mac_set_bw()       — MAC WMAC_RFMOD + TXRATE_CHK + TXSC
+    //    3. bb_ctrl_ch()       — RF PLL, mode select, SCO comp, bandedge, CCK
+    //    4. bb_ctrl_bw()       — BB bandwidth registers
+    //    5. bb_ctrl_cck_en()   — CCK enable (2G) / disable (5G)
+    //    6. bb_reset()         — full BB reset cycle (0xFF toggle)
+    //    7. hal_reset(disable) — re-enable PPDU/ADC/DFS, resume TX
+    //
+    //  Reference: hal_chan.c, halbb_8852a_api.c, halbb_8852a_2_api.c, hw.c
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Complete programmatic channel switch — all 39 channels, 20MHz bandwidth.
+    /// Ported from halbb_ctrl_bw_ch_8852a + hal_chan.c + cfg_mac_bw.
+    fn set_channel_programmatic(&mut self, ch: u8) -> Result<()> {
         let is_2g = ch <= 14;
         let central_ch = ch; // For 20MHz BW, primary == central
 
-        // ═══ RF channel setting (Path A + Path B) ═══
-        // From halbb_ch_setting_8852a: write RF reg 0x18 with channel + band flags
+        // ═══ Step 1: hal_reset(enable) — pause radio before switching ═══
+        // From hal_com_i.c:219-250
+
+        // Disable PPDU status reporting (BB reg 0x20FC bits [31:24] = 0xF)
+        self.set_reg_bb(0x20FC, 0xFF000000, 0xF)?;
+        // Disable DFS (BB reg 0x0 bit 31 = 0)
+        self.set_reg_bb(0x0, 1u32 << 31, 0)?;
+        // Disable TSSI continuous mode (both paths)
+        // Path A: BB reg 0x5818 bit 30, Path B: BB reg 0x7818 bit 30
+        // From halbb_tssi_cont_en_8852a_2: tssi_trk_man = {0x5818, 0x7818}, bit 30
+        // disable = set bit 30 to 1
+        self.set_reg_bb(0x5818, 1 << 30, 1)?;
+        self.set_reg_bb(0x7818, 1 << 30, 1)?;
+        // Wait 40µs for hardware to settle
+        thread::sleep(Duration::from_micros(40));
+        // BB reset enable = false (BB reg 0x704 bit 1 = 0)
+        self.set_reg_bb(0x0704, 0x2, 0)?;
+
+        // ═══ Step 2: MAC BW config (cfg_mac_bw) ═══
+        // From hw.c:1573. For 20MHz, bits[1:0] = 0, TXSC = 0.
+        // R_AX_WMAC_RFMOD = 0xC010: clear BW bits [1:0] for 20MHz
+        let rfmod = self.read8(0xC010)?;
+        self.write8(0xC010, rfmod & !0x03)?;
+        // R_AX_TXRATE_CHK = 0xC628: CCK check for 5GHz channels
+        if !is_2g {
+            let chk = self.read8(0xC628)?;
+            self.write8(0xC628, chk | 0x03)?; // CHECK_CCK_EN | RTS_LIMIT_IN_OFDM6
+        } else {
+            let chk = self.read8(0xC628)?;
+            self.write8(0xC628, chk & !0x03)?;
+        }
+
+        // ═══ Step 3: BB channel switch (halbb_ctrl_ch_8852a) ═══
+        // From halbb_8852a_api.c:407-506
+
+        // RF channel setting — Path A + Path B
+        // halbb_ch_setting_8852a: write RF reg 0x18 with channel + band flags
         for path in 0..2u8 {
             let rf_reg18 = self.read_rf(path, 0x18, 0x000FFFFF)?;
             let mut new_val = rf_reg18 & !0x303FF; // clear [17:16],[9:8],[7:0]
@@ -1431,63 +1693,65 @@ impl Rtl8852au {
             self.write_rf(path, 0xCF, 0x1, 1)?;
         }
 
-        // ═══ BB mode select (BB register space — 0x10000 offset) ═══
-        // Path A (0x156C bits [31:30]): 1=2G, 0=5G
-        // Path B (0x162C bits [31:30]): 1=2G, 0=5G
+        // Mode select — 1=2G, 0=5G
+        // Path A: BB reg 0x156C bits [31:30]
+        // Path B: BB reg 0x162C bits [31:30]
         let mode_val: u32 = if is_2g { 1 } else { 0 };
         self.set_reg_bb(0x156C, 0xC0000000, mode_val)?;
         self.set_reg_bb(0x162C, 0xC0000000, mode_val)?;
 
-        // ═══ SCO compensation ═══
+        // SCO compensation (BB reg 0x1878 bits [6:0])
         let sco_comp = Self::sco_mapping(central_ch) as u32;
         self.set_reg_bb(0x1878, 0x7F, sco_comp)?;
 
-        // ═══ Bandwidth setting (20MHz) ═══
+        // Bandedge enable (BB reg 0x1390 bit 30)
+        self.set_reg_bb(0x1390, 1 << 30, 1)?;
+
+        // CCK parameters (2.4GHz only)
+        if central_ch == 14 {
+            self.set_reg_bb(0x7800, 0x00FFFFFF, 0x3B13FF)?;
+            self.set_reg_bb(0x7804, 0x00FFFFFF, 0x1C42DE)?;
+            self.set_reg_bb(0x7808, 0x00FFFFFF, 0xFDB0AD)?;
+            self.set_reg_bb(0x780C, 0x00FFFFFF, 0xF60F6E)?;
+            self.set_reg_bb(0x7810, 0x00FFFFFF, 0xFD8F92)?;
+            self.set_reg_bb(0x7814, 0x00FFFFFF, 0x02D011)?;
+            self.set_reg_bb(0x7818, 0x00FFFFFF, 0x01C02C)?;
+            self.set_reg_bb(0x781C, 0x00FFFFFF, 0xFFF00A)?;
+        } else if is_2g {
+            self.set_reg_bb(0x7800, 0x00FFFFFF, 0x3D23FF)?;
+            self.set_reg_bb(0x7804, 0x00FFFFFF, 0x29B354)?;
+            self.set_reg_bb(0x7808, 0x00FFFFFF, 0x0FC1C8)?;
+            self.set_reg_bb(0x780C, 0x00FFFFFF, 0xFDB053)?;
+            self.set_reg_bb(0x7810, 0x00FFFFFF, 0xF86F9A)?;
+            self.set_reg_bb(0x7814, 0x00FFFFFF, 0xFAEF92)?;
+            self.set_reg_bb(0x7818, 0x00FFFFFF, 0xFE5FCC)?;
+            self.set_reg_bb(0x781C, 0x00FFFFFF, 0xFFDFF5)?;
+        }
+
+        // ═══ Step 4: BB bandwidth (halbb_ctrl_bw_8852a, 20MHz) ═══
+        // From halbb_8852a_api.c:272-373
+
         // RF_BW [31:30] = 0x0 (20MHz)
         self.set_reg_bb(0x1878, 0xC0000000, 0x0)?;
-        // small BW [13:12] = 0x0
+        // Small BW [13:12] = 0x0
         self.set_reg_bb(0x187C, 0x3000, 0x0)?;
-        // Pri ch [11:8] = 0x0
+        // Primary channel index [11:8] = 0x0 (20MHz: no primary offset)
         self.set_reg_bb(0x187C, 0xF00, 0x0)?;
 
-        // Per-path BW setting (RF reg 0x18 bandwidth field)
+        // Per-path RF BW setting (RF reg 0x18 bits [13:11])
         for path in 0..2u8 {
             let rf_reg18 = self.read_rf(path, 0x18, 0x000FFFFF)?;
-            // Clear BW bits [13:11], set for 20MHz (0b000)
-            let new_val = rf_reg18 & !0x3800;
+            let new_val = rf_reg18 & !0x3800; // Clear BW bits, 20MHz = 0b000
             self.write_rf(path, 0x18, 0x000FFFFF, new_val)?;
         }
 
-        // ═══ Bandedge enable ═══
-        self.set_reg_bb(0x1390, 1 << 30, 1)?;
-
-        // ═══ CCK parameters ═══
+        // ═══ Step 5: CCK enable/disable (halbb_ctrl_cck_en_8852a) ═══
         if is_2g {
-            // CCK enable
-            self.set_reg_bb(0x7800, 1 << 27, 0)?;
+            self.set_reg_bb(0x7800, 1 << 27, 0)?; // CCK enable
             self.set_reg_bb(0x7844, 1u32 << 31, 0)?;
 
-            if central_ch == 14 {
-                self.set_reg_bb(0x7800, 0x00FFFFFF, 0x3B13FF)?;
-                self.set_reg_bb(0x7804, 0x00FFFFFF, 0x1C42DE)?;
-                self.set_reg_bb(0x7808, 0x00FFFFFF, 0xFDB0AD)?;
-                self.set_reg_bb(0x780C, 0x00FFFFFF, 0xF60F6E)?;
-                self.set_reg_bb(0x7810, 0x00FFFFFF, 0xFD8F92)?;
-                self.set_reg_bb(0x7814, 0x00FFFFFF, 0x02D011)?;
-                self.set_reg_bb(0x7818, 0x00FFFFFF, 0x01C02C)?;
-                self.set_reg_bb(0x781C, 0x00FFFFFF, 0xFFF00A)?;
-            } else {
-                self.set_reg_bb(0x7800, 0x00FFFFFF, 0x3D23FF)?;
-                self.set_reg_bb(0x7804, 0x00FFFFFF, 0x29B354)?;
-                self.set_reg_bb(0x7808, 0x00FFFFFF, 0x0FC1C8)?;
-                self.set_reg_bb(0x780C, 0x00FFFFFF, 0xFDB053)?;
-                self.set_reg_bb(0x7810, 0x00FFFFFF, 0xF86F9A)?;
-                self.set_reg_bb(0x7814, 0x00FFFFFF, 0xFAEF92)?;
-                self.set_reg_bb(0x7818, 0x00FFFFFF, 0xFE5FCC)?;
-                self.set_reg_bb(0x781C, 0x00FFFFFF, 0xFFDFF5)?;
-            }
-
-            // CCK SCO compensation
+            // CCK SCO compensation (halbb_ctrl_sco_cck_8852a)
+            // Barker and CCK threshold tables indexed by channel (1-14)
             let sco_barker: [u32; 14] = [
                 0x1CFEA, 0x1D0E1, 0x1D1D7, 0x1D2CD, 0x1D3C3, 0x1D4B9, 0x1D5B0,
                 0x1D6A6, 0x1D79C, 0x1D892, 0x1D988, 0x1DA7F, 0x1DB75, 0x1DDC4,
@@ -1500,30 +1764,29 @@ impl Rtl8852au {
             self.set_reg_bb(0x78B0, 0x7FFFF, sco_barker[ch_idx])?;
             self.set_reg_bb(0x78B4, 0x7FFFF, sco_cck[ch_idx])?;
         } else {
-            // 5GHz: disable CCK
-            self.set_reg_bb(0x7800, 1 << 27, 1)?;
+            self.set_reg_bb(0x7800, 1 << 27, 1)?; // CCK disable
             self.set_reg_bb(0x7844, 1u32 << 31, 1)?;
         }
 
-        // ═══ BB reset ═══
-        self.set_reg_bb(0x0804, 0x2, 0)?;  // BB reset assert
-        thread::sleep(Duration::from_micros(1));
-        self.set_reg_bb(0x0804, 0x2, 1)?;  // BB reset deassert
+        // ═══ Step 6: BB reset cycle (halbb_bb_reset_8852a) ═══
+        // From halbb_8852a_api.c:30-40 — full 0xFF toggle on PHY0 reg 0x804
+        self.set_reg_bb(0x0804, 0xFF, 0xFF)?;
+        self.set_reg_bb(0x0804, 0xFF, 0x00)?;
+        self.set_reg_bb(0x0804, 0xFF, 0xFF)?;
 
-        // ═══ MAC-level channel config ═══
-        // WMAC_RFMOD: clear BW bits for 20MHz
-        let rfmod = self.read8(0xC67C)?;
-        self.write8(0xC67C, rfmod & !0x03)?;
+        // ═══ Step 7: hal_reset(disable) — resume radio ═══
+        // From hal_com_i.c:251-282
 
-        // TXRATE_CHK: enable CCK check for 5GHz
-        if !is_2g {
-            self.set_bits32(0xC680, 0x03)?; // CHECK_CCK_EN | RTS_LIMIT_IN_OFDM6
-        } else {
-            self.clear_bits32(0xC680, 0x03)?;
-        }
-
-        // TX sub-carrier value (0 for 20MHz)
-        self.write32(0xC684, 0x00000000)?;
+        // Re-enable ADC (BB reg 0x20FC bits [31:24] = 0x0)
+        self.set_reg_bb(0x20FC, 0xFF000000, 0x0)?;
+        // Re-enable DFS (BB reg 0x0 bit 31 = 1)
+        self.set_reg_bb(0x0, 1u32 << 31, 1)?;
+        // Re-enable TSSI continuous mode (both paths)
+        // enable = set bit 30 to 0
+        self.set_reg_bb(0x5818, 1 << 30, 0)?;
+        self.set_reg_bb(0x7818, 1 << 30, 0)?;
+        // BB reset enable = true (BB reg 0x704 bit 1 = 1)
+        self.set_reg_bb(0x0704, 0x2, 1)?;
 
         self.channel = ch;
         Ok(())
@@ -1549,7 +1812,6 @@ impl Rtl8852au {
 
         // Validate MAC
         if mac == [0x00; 6] || mac == [0xFF; 6] {
-            eprintln!("[RTL8852AU] Invalid MAC from 0x0036, trying MACID register...");
             // Try MACID register (C100)
             let mac_lo = self.read32(R_AX_MACID_REG)?;
             let mac_hi = self.read16(R_AX_MACID_REG + 4)?;
@@ -1565,7 +1827,6 @@ impl Rtl8852au {
             self.mac_addr = MacAddress::new(mac);
         }
 
-        eprintln!("[RTL8852AU] MAC address: {}", self.mac_addr);
         Ok(())
     }
 
@@ -1591,10 +1852,90 @@ impl Rtl8852au {
         Ok(())
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    //  H2C command framework — Host-to-Chip firmware commands
+    //
+    //  Packet layout (on-wire via EP7 bulk OUT):
+    //    [0:23]   WD Body (24 bytes) — DW0: CH_DMA=12, DW2: payload_len
+    //    [24:31]  FWCMD header (8 bytes) — DW0: cat|class|func|seq, DW1: total_len
+    //    [32:N]   Command payload (variable)
+    //
+    //  Reference: fwcmd_intf.h, fwcmd.c, trx_desc.c
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Build and send an H2C command to firmware via EP7.
+    ///
+    /// Constructs proper WD + FWCMD header with correct sequence number,
+    /// sends via EP7 bulk OUT, waits for firmware processing, and drains
+    /// C2H responses to prevent EP7 stall.
+    ///
+    /// This replaces raw pcap byte replay for H2C commands — the sequence
+    /// numbers, ACK flags, and flow control are handled correctly.
+    fn send_h2c(&mut self, cat: u32, class: u32, func: u32, payload: &[u8]) -> Result<()> {
+        let h2c_payload_len = FWCMD_HDR_LEN + payload.len();
+        let total_len = WD_BODY_LEN + h2c_payload_len;
+        let mut buf = vec![0u8; total_len];
+
+        // WD DW0: CH_DMA = MAC_AX_DMA_H2C (12)
+        let wd_dw0 = MAC_AX_DMA_H2C << AX_TXD_CH_DMA_SH;
+        buf[0..4].copy_from_slice(&wd_dw0.to_le_bytes());
+        // WD DW2: TXPKTSIZE = FWCMD header + payload
+        buf[8..12].copy_from_slice(&(h2c_payload_len as u32).to_le_bytes());
+
+        // FWCMD header DW0: cat[1:0] | class[7:2] | func[15:8] | del_type[19:16] | seq[31:24]
+        let seq = self.h2c_seq;
+        let h2c_dw0 = (FWCMD_TYPE_H2C << H2C_HDR_DEL_TYPE_SH)
+            | (cat << H2C_HDR_CAT_SH)
+            | (class << H2C_HDR_CLASS_SH)
+            | (func << H2C_HDR_FUNC_SH)
+            | ((seq as u32) << H2C_HDR_H2C_SEQ_SH);
+        // FWCMD header DW1: total_len[13:0] | REC_ACK every 4th command (matches Linux driver)
+        let rec_ack = if seq & 3 == 0 { 1u32 << 14 } else { 0 };
+        let h2c_dw1 = ((h2c_payload_len as u32) << H2C_HDR_TOTAL_LEN_SH) | rec_ack;
+        buf[WD_BODY_LEN..WD_BODY_LEN + 4].copy_from_slice(&h2c_dw0.to_le_bytes());
+        buf[WD_BODY_LEN + 4..WD_BODY_LEN + 8].copy_from_slice(&h2c_dw1.to_le_bytes());
+        self.h2c_seq = self.h2c_seq.wrapping_add(1);
+
+        // Copy command payload
+        if !payload.is_empty() {
+            buf[WD_BODY_LEN + FWCMD_HDR_LEN..].copy_from_slice(payload);
+        }
+
+        // Send via EP7 (H2C endpoint — BULKOUTID2 per vendor driver)
+        self.handle.write_bulk(self.ep_fw, &buf, Duration::from_secs(2))
+            .map_err(|e| Error::Usb(e))?;
+
+        // Brief wait for firmware to accept the command into its FIFO.
+        thread::sleep(Duration::from_millis(2));
+
+        Ok(())
+    }
+
+    /// Parse a raw pcap H2C bulk command and extract cat/class/func/payload.
+    /// Returns None if the data isn't an H2C command (e.g., FWDL or TX frame).
+    fn parse_h2c_from_pcap(data: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
+        if data.len() < WD_BODY_LEN + FWCMD_HDR_LEN { return None; }
+
+        // Check WD DW0: CH_DMA must be 12 (H2C), FWDL_EN must be 0
+        let wd_dw0 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let ch_dma = (wd_dw0 >> 16) & 0xF;
+        let fwdl_en = (wd_dw0 >> 20) & 0x1;
+        if ch_dma != 12 || fwdl_en != 0 { return None; }
+
+        // Parse FWCMD header at offset 24
+        let hdr_dw0 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        let cat = hdr_dw0 & 0x3;
+        let class = (hdr_dw0 >> 2) & 0x3F;
+        let func = (hdr_dw0 >> 8) & 0xFF;
+
+        // Payload is everything after WD + FWCMD header
+        let payload = &data[WD_BODY_LEN + FWCMD_HDR_LEN..];
+        Some((cat, class, func, payload))
+    }
+
     /// Generic replay of a PostBootOp sequence — used for all pcap phases
     fn replay_phase(&self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp]) -> Result<()> {
         use rtl8852a_post_boot::PostBootOp;
-        eprintln!("[RTL8852AU] {}: replaying {} ops...", name, seq.len());
 
         let mut read_ok = 0usize;
         let mut write_ok = 0usize;
@@ -1647,7 +1988,6 @@ impl Rtl8852au {
                     match self.handle.write_bulk(target_ep, data, Duration::from_millis(1000)) {
                         Ok(_) => {
                             bulk_ok += 1;
-                            eprintln!("[RTL8852AU]   H2C EP7 ({} bytes): OK", data.len());
                         }
                         Err(e) => {
                             eprintln!("[RTL8852AU]   H2C EP7 ({} bytes): FAILED: {}", data.len(), e);
@@ -1659,25 +1999,22 @@ impl Rtl8852au {
 
             let done = read_ok + write_ok + write_fail + bulk_ok + bulk_fail;
             if done % 3000 == 0 && done > 0 {
-                eprintln!("[RTL8852AU]   {}/{}: R={} W={} B={}/{}",
-                    done, total, read_ok, write_ok, bulk_ok, bulk_ok + bulk_fail);
             }
         }
 
-        eprintln!("[RTL8852AU] {} complete: R={} W={}/{} Bulk={}/{}",
-            name, read_ok, write_ok, write_ok + write_fail, bulk_ok, bulk_ok + bulk_fail);
         Ok(())
     }
 
-    /// COMPLETE replay — sends ALL operations including EP5 bulk.
+    /// COMPLETE replay — sends ALL operations including bulk commands.
     /// skip_fw_bulk: if true, skips the first 182 EP7 bulk commands (FW download chunks)
     /// that we already sent via load_firmware(). Not skipping a step — avoiding duplicate FW load.
-    fn replay_phase_complete(&self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
+    ///
+    /// H2C commands (CH_DMA=12 on EP7) are rebuilt via send_h2c() with correct
+    /// sequence numbers and proper C2H response handling. Raw pcap bytes are
+    /// only used for register reads/writes and TX probe frames (EP5).
+    fn replay_phase_complete(&mut self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
                               skip_fw_bulk: bool) -> Result<()> {
         use rtl8852a_post_boot::PostBootOp;
-        eprintln!("[RTL8852AU] {}: replaying {} ops{}...",
-            name, seq.len(),
-            if skip_fw_bulk { " (skip FW download bulk)" } else { "" });
 
         let mut read_ok = 0usize;
         let mut write_ok = 0usize;
@@ -1686,15 +2023,12 @@ impl Rtl8852au {
         let mut bulk_fail = 0usize;
         let mut bulk_skip = 0usize;
         let mut ep7_count = 0usize;
-        let total = seq.len();
-
         // FW download = first 182 EP7 bulk commands (128B header + 181 sections)
         const FW_DOWNLOAD_EP7_COUNT: usize = 182;
 
         for op in seq {
             match op {
                 PostBootOp::Read(full_addr, width) => {
-                    // Addresses > 0xFFFF have wIndex in upper 16 bits (BB/RF space)
                     let _ = if *full_addr > 0xFFFF {
                         self.read32_ext(*full_addr).map(|_| ())
                     } else {
@@ -1708,7 +2042,6 @@ impl Rtl8852au {
                     read_ok += 1;
                 }
                 PostBootOp::Write(full_addr, val, width) => {
-                    // Addresses > 0xFFFF have wIndex in upper 16 bits (BB/RF space)
                     let result = if *full_addr > 0xFFFF {
                         self.write32_ext(*full_addr, *val)
                     } else {
@@ -1739,22 +2072,49 @@ impl Rtl8852au {
                         }
                     }
 
-                    let target_ep = if *ep == 0x07 { self.ep_fw } else { self.ep_out };
-                    // Short timeout — H2C commands respond instantly or not at all
-                    let timeout = Duration::from_millis(200);
-                    match self.handle.write_bulk(target_ep, data, timeout) {
-                        Ok(_) => {
-                            bulk_ok += 1;
-                            if bulk_ok <= 10 || bulk_ok % 50 == 0 {
-                                eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): OK [#{}]",
-                                    ep, data.len(), bulk_ok);
+                    // Check if this is an H2C command (CH_DMA=12, not FWDL)
+                    if *ep == 0x07 {
+                        if let Some((cat, class, func, payload)) = Self::parse_h2c_from_pcap(data) {
+                            // Rebuild and send via proper H2C framework with correct
+                            // sequence numbers, ACK flags, and C2H response handling.
+                            match self.send_h2c(cat, class, func, payload) {
+                                Ok(_) => {
+                                    bulk_ok += 1;
+                                    eprintln!("[RTL8852AU]   H2C cat={} cls={} func={} ({} bytes): OK [seq={}]",
+                                        cat, class, func, data.len(), self.h2c_seq.wrapping_sub(1));
+                                }
+                                Err(e) => {
+                                    bulk_fail += 1;
+                                    eprintln!("[RTL8852AU]   H2C cat={} cls={} func={} ({} bytes): FAILED: {}",
+                                        cat, class, func, data.len(), e);
+                                    let _ = self.handle.clear_halt(self.ep_fw);
+                                }
+                            }
+                        } else {
+                            // Non-H2C EP7 command (FWDL type) — send raw
+                            let timeout = Duration::from_millis(if data.len() > 1024 { 2000 } else { 500 });
+                            match self.handle.write_bulk(self.ep_fw, data, timeout) {
+                                Ok(_) => { bulk_ok += 1; }
+                                Err(e) => {
+                                    bulk_fail += 1;
+                                    eprintln!("[RTL8852AU]   Bulk EP7 FWDL ({} bytes): FAILED: {}", data.len(), e);
+                                    let _ = self.handle.clear_halt(self.ep_fw);
+                                }
                             }
                         }
-                        Err(e) => {
-                            bulk_fail += 1;
-                            if bulk_fail <= 3 {
-                                eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): FAILED: {} [#{}]",
-                                    ep, data.len(), e, bulk_ok + bulk_fail);
+                    } else {
+                        // EP5 TX frames — send raw (these work fine)
+                        let timeout = Duration::from_millis(500);
+                        match self.handle.write_bulk(self.ep_out, data, timeout) {
+                            Ok(_) => {
+                                bulk_ok += 1;
+                                if bulk_ok <= 10 {
+                                    eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): OK", ep, data.len());
+                                }
+                            }
+                            Err(e) => {
+                                bulk_fail += 1;
+                                eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): FAILED: {}", ep, data.len(), e);
                             }
                         }
                     }
@@ -1763,15 +2123,9 @@ impl Rtl8852au {
 
             let done = read_ok + write_ok + write_fail + bulk_ok + bulk_fail + bulk_skip;
             if done % 5000 == 0 && done > 0 {
-                eprintln!("[RTL8852AU]   {}/{}: R={} W={}/{} B={}/{} skip={}",
-                    done, total, read_ok, write_ok, write_ok + write_fail,
-                    bulk_ok, bulk_ok + bulk_fail, bulk_skip);
             }
         }
 
-        eprintln!("[RTL8852AU] {} complete: R={} W={}/{} Bulk={}/{} skipped={}",
-            name, read_ok, write_ok, write_ok + write_fail,
-            bulk_ok, bulk_ok + bulk_fail, bulk_skip);
         Ok(())
     }
 
@@ -1811,7 +2165,6 @@ impl Rtl8852au {
 
         let post_fwdl = &seq[fwdl_end..];
         let total = post_fwdl.len();
-        eprintln!("[RTL8852AU] Post-FWDL pcap replay: {} ops (starting from op {})", total, fwdl_end);
 
         let mut read_ok = 0u32;
         let mut write_ok = 0u32;
@@ -1872,7 +2225,6 @@ impl Rtl8852au {
                         Ok(_) => {
                             bulk_ok += 1;
                             if bulk_ok <= 3 {
-                                eprintln!("[RTL8852AU]   H2C EP7 ({} bytes): OK [{}]", data.len(), bulk_ok);
                             }
                         }
                         Err(e) => {
@@ -1887,15 +2239,9 @@ impl Rtl8852au {
 
             let done = read_ok + write_ok + write_fail + bulk_ok + bulk_fail + skipped;
             if done % 5000 == 0 && done > 0 {
-                eprintln!("[RTL8852AU]   {}/{}: R={} W={}/{} B={}/{} skip={}",
-                    done, total, read_ok, write_ok, write_ok + write_fail,
-                    bulk_ok, bulk_ok + bulk_fail, skipped);
             }
         }
 
-        eprintln!("[RTL8852AU] Post-FWDL replay complete: R={} W={}/{} Bulk={}/{} skipped={}",
-            read_ok, write_ok, write_ok + write_fail,
-            bulk_ok, bulk_ok + bulk_fail, skipped);
         Ok(())
     }
 
@@ -1904,7 +2250,6 @@ impl Rtl8852au {
     fn pre_fwdl_init(&self) -> Result<()> {
         use rtl8852a_pre_fwdl::PreFwdlOp;
         let seq = rtl8852a_pre_fwdl::PRE_FWDL_SEQUENCE;
-        eprintln!("[RTL8852AU] Pre-FWDL init: {} ops from USB3 pcap...", seq.len());
 
         let mut r = 0usize;
         let mut w = 0usize;
@@ -1928,16 +2273,13 @@ impl Rtl8852au {
                 }
             }
         }
-        eprintln!("[RTL8852AU] Pre-FWDL replay done: {} reads, {} writes", r, w);
 
         // The pcap shows 17 poll reads of 0x01E0 getting 0x01 (FWDL_EN only).
         // H2C_PATH_RDY (bit 1) is set asynchronously by WCPU after WCPU_EN.
         // Poll until H2C path is ready — may need more time than the pcap's 17 reads.
-        eprintln!("[RTL8852AU] Polling for H2C path ready...");
         for i in 0..400_000u32 {
             let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
             if ctrl & B_AX_H2C_PATH_RDY != 0 {
-                eprintln!("[RTL8852AU]   H2C path ready: 0x{:02X} ({}us)", ctrl, i);
                 return Ok(());
             }
             thread::sleep(Duration::from_micros(1));
@@ -1948,7 +2290,6 @@ impl Rtl8852au {
     }
 
     fn dump_key_regs(&self, label: &str) {
-        eprintln!("[RTL8852AU] ── {} ──", label);
         let regs: &[(u16, &str)] = &[
             (0x8380, "HCI_FUNC_EN"),
             (0x8400, "DMAC_FUNC"),
@@ -1964,8 +2305,6 @@ impl Rtl8852au {
             (0xCE20, "RX_FLTR"),
         ];
         for (addr, name) in regs {
-            eprintln!("[RTL8852AU]   0x{:04X} ({:12}) = 0x{:08X}",
-                addr, name, self.read32(*addr).unwrap_or(0xDEAD));
         }
     }
 
@@ -1975,26 +2314,30 @@ impl Rtl8852au {
     ];
 
     fn chip_init(&mut self) -> Result<()> {
-        eprintln!("[RTL8852AU] ═══ RTL8852AU WiFi 6 Init (COMPLETE — no shortcuts) ═══");
 
         // Verify USB communication
-        let chip_id = self.read8(0x00FC)?;
-        let chip_cut = self.read8(0x00F1)?;
+        let _chip_id = self.read8(0x00FC)?;
+        let _chip_cut = self.read8(0x00F1)?;
         let usb_status = self.read32(0x11F0)?;
-        let is_usb3 = (usb_status & 0x02) != 0;
-        eprintln!("[RTL8852AU] Chip: 0x{:02X}, cut: 0x{:02X}, USB: {} (0x{:08X})",
-            chip_id, chip_cut, if is_usb3 { "3.0" } else { "2.0" }, usb_status);
-        eprintln!("[RTL8852AU] EP: tx=0x{:02X} rx=0x{:02X} fw=0x{:02X}",
-            self.ep_out, self.ep_in, self.ep_fw);
+        let _is_usb3 = (usb_status & 0x02) != 0;
+
+        // ── Phase -1: Clean up dirty firmware state ──
+        // If a previous session exited without clean shutdown, the WCPU may still
+        // be running with old FW (0x01E0 shows FWDL_STS=ONGOING or H2C_PATH_RDY).
+        // We must disable the CPU and reset before attempting a fresh FW download.
+        let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
+        if fw_ctrl != 0 {
+            self.disable_cpu()?;
+            self.power_off()?;
+            thread::sleep(Duration::from_millis(50));
+        }
 
         // ── Phase 0: Pre-FWDL (our proven read-modify-write code) ──
         self.power_on()?;
         self.dmac_pre_init_and_enable_cpu()?;
 
-        // ── Phase 1: Firmware download (our proven code, gets INIT_RDY) ──
+        // ── Phase 1: Firmware download ──
         self.load_firmware()?;
-
-        self.dump_key_regs("After FW boot");
 
         // ── Reset USB endpoints after FW boot ──
         let _ = self.handle.release_interface(0);
@@ -2009,7 +2352,22 @@ impl Rtl8852au {
         for ep in [self.ep_out, self.ep_in, self.ep_fw] {
             let _ = self.handle.clear_halt(ep);
         }
-        eprintln!("[RTL8852AU] USB endpoints re-synced");
+
+        // ── Background RX drain thread ──
+        // On Linux, an RX thread runs continuously during init, consuming C2H
+        // responses and WiFi frames. Without this, the firmware's C2H TX buffer
+        // fills up after processing H2C commands, causing EP7 backpressure stall.
+        // This thread mimics that behavior during our init phase.
+        let drain_handle = Arc::clone(&self.handle);
+        let drain_ep = self.ep_in;
+        let drain_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let drain_flag = Arc::clone(&drain_running);
+        let drain_thread = thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            while drain_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(50));
+            }
+        });
 
         // ── Phase 2: Post-FWDL — COMPLETE replay (skip FW download bulk, keep EVERYTHING else) ──
         self.replay_phase_complete("Post-FWDL",
@@ -2022,6 +2380,11 @@ impl Rtl8852au {
         // ── Phase 4: Default channel (ch1 2.4GHz) ──
         self.replay_phase_complete("Channel 1",
             super::rtl8852a_phase_ch1::CH1_SEQUENCE, false)?;
+
+        // ── Stop background drain ──
+        drain_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = drain_thread.join();
+
         self.channel = 1;
 
         self.dump_key_regs("After complete init");
@@ -2029,7 +2392,6 @@ impl Rtl8852au {
         // ── Read MAC address ──
         self.read_mac_address()?;
 
-        eprintln!("[RTL8852AU] ═══ Init complete (ALL phases replayed, nothing skipped) ═══");
         Ok(())
     }
 
@@ -2037,16 +2399,28 @@ impl Rtl8852au {
     //  RX frame parsing — MAC AX descriptor format
     // ══════════════════════════════════════════════════════════════════════════
 
-    pub(crate) fn parse_rx_packet(buf: &[u8], channel: u8) -> (usize, Option<RxFrame>) {
+    /// Parse one RX packet from the USB bulk transfer buffer.
+    ///
+    /// Handles all rpkt_type values from rxdesc.h:
+    ///   0 = WiFi frame → returned as RxFrame with PHY info from PPDU correlation
+    ///   1 = PPDU status → parsed and stored in cache for correlation
+    ///   2-14 = other (CH_INFO, TXRPT, C2H, etc.) → consumed and skipped
+    ///
+    /// DW1 fields parsed for WiFi frames: ppdu_type, ppdu_cnt, rx_datarate, rx_gi_ltf, bw.
+    /// DW3 fields parsed: crc32, ampdu, amsdu.
+    pub(crate) fn parse_rx_packet(
+        buf: &[u8],
+        channel: u8,
+        ppdu_cache: &mut PpduStatusCache,
+    ) -> (usize, Option<RxFrame>) {
         if buf.len() < RX_DESC_SHORT {
             return (0, None);
         }
 
-        // DW0
+        // ── DW0 ──
         let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let pkt_len = (dw0 & 0x3FFF) as usize;
         let shift = ((dw0 >> 14) & 0x3) as usize * 2;
-        let _hdr_iv_len = ((dw0 >> 16) & 0x3F) as usize;
         let mac_info_vld = (dw0 >> 23) & 1 != 0;
         let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
         let drv_info_size = ((dw0 >> 28) & 0x7) as usize * 8;
@@ -2054,26 +2428,65 @@ impl Rtl8852au {
 
         let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
 
-        // Only process WiFi packets
+        // ── Non-WiFi packets ──
         if rpkt_type != RPKT_TYPE_WIFI {
-            // Skip non-WiFi packets (C2H, PPDU status, etc.)
-            let mac_info_extra = if mac_info_vld && rpkt_type != 1 { 4 } else { 0 };
+            // PPDU status packets need special handling for mac_info_extra:
+            // rpkt_type=1 never has mac_info_extra regardless of mac_info_vld
+            let mac_info_extra = if mac_info_vld && rpkt_type != RPKT_TYPE_PPDU { 4 } else { 0 };
             let total = desc_len + shift + drv_info_size + mac_info_extra + pkt_len;
             let consumed = if total > 0 { (total + 7) & !7 } else { desc_len };
             if consumed > buf.len() { return (0, None); }
+
+            // Parse PPDU status packets — this is where RSSI/SNR/LDPC/STBC live
+            if rpkt_type == RPKT_TYPE_PPDU && buf.len() >= desc_len + 4 {
+                // DW1 for ppdu_cnt
+                let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let ppdu_cnt = ((dw1 >> 4) & 0x7) as u8;
+
+                // The PHY status (physts) is after the descriptor.
+                // For short desc: at offset 16 + shift. For long desc: at offset 32 + shift.
+                // drv_info (if any) comes first, then pkt_len bytes of PPDU payload.
+                let physts_off = desc_len + shift;
+                let physts_len = drv_info_size + pkt_len;
+
+                if physts_len >= 8 && buf.len() >= physts_off + physts_len {
+                    if let Some(phy) = parse_ppdu_payload(
+                        &buf[physts_off..physts_off + physts_len],
+                        mac_info_vld,
+                    ) {
+                        // store_ppdu may return a completed frame if a pending WiFi frame matches
+                        if let Some(completed) = ppdu_cache.store_ppdu(ppdu_cnt, phy) {
+                            return (consumed, Some(completed));
+                        }
+                    }
+                }
+            }
+
             return (consumed, None);
         }
+
+        // ── WiFi packet (rpkt_type=0) ──
 
         if buf.len() < desc_len {
             return (0, None);
         }
 
-        // DW3 — check CRC error
+        // ── DW1 — rate/type/bandwidth (free data, just read it) ──
+        let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let ppdu_type_raw = (dw1 & 0xF) as u8;
+        let ppdu_cnt = ((dw1 >> 4) & 0x7) as u8;
+        let data_rate = ((dw1 >> 16) & 0x1FF) as u16;
+        let gi_ltf_raw = ((dw1 >> 25) & 0x7) as u8;
+        let bw_raw = ((dw1 >> 30) & 0x3) as u8;
+
+        // ── DW2 — freerun counter (timestamp) ──
+        let tsfl = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+        // ── DW3 — CRC, AMPDU, AMSDU ──
         let dw3 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         let crc_err = (dw3 >> 9) & 1 != 0;
-
-        // DW2 — timestamp
-        let tsfl = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let is_ampdu = (dw3 >> 3) & 1 != 0;
+        let is_amsdu = (dw3 >> 5) & 1 != 0;
 
         // Calculate payload offset
         let mac_info_extra = if mac_info_vld { 4 } else { 0 };
@@ -2084,7 +2497,6 @@ impl Rtl8852au {
             return (0, None);
         }
 
-        // Round up to 8-byte boundary
         let consumed = (total + 7) & !7;
 
         // Strip FCS (4 bytes)
@@ -2096,26 +2508,64 @@ impl Rtl8852au {
 
         let data = buf[data_off..data_off + frame_len].to_vec();
 
-        // RSSI: not in RX descriptor for MAC AX (comes from PPDU status)
-        // Use a default until we implement PPDU status parsing
-        let rssi = -50i8;
-
-        let frame = RxFrame {
+        // ── Build WiFi frame with DW1 fields populated ──
+        let drv_info_off = desc_len + shift;
+        let mut frame = RxFrame {
             data,
-            rssi,
+            rssi: 0, // will be filled by PPDU correlation
             channel,
             band: if channel <= 14 { 0 } else { 1 },
             timestamp: Duration::from_micros(tsfl as u64),
+            data_rate,
+            ppdu_type: PpduType::from_raw(ppdu_type_raw),
+            bandwidth: RxBandwidth::from_raw(bw_raw),
+            gi_ltf: GuardInterval::from_raw(gi_ltf_raw),
+            is_ampdu,
+            is_amsdu,
+            ..Default::default()
         };
 
-        (consumed, Some(frame))
+        // Some WiFi frames carry inline physts in drv_info (when drv_info_size > 0)
+        if drv_info_size >= 8 && buf.len() >= drv_info_off + drv_info_size {
+            if let Some(phy) = parse_physts_header(&buf[drv_info_off..drv_info_off + drv_info_size]) {
+                PpduStatusCache::apply_phy_to_frame(&mut frame, &phy);
+            }
+        }
+
+        // If we have inline RSSI, return immediately — no need for PPDU correlation
+        if frame.rssi != 0 {
+            // A WiFi frame with inline PHY info might also release a pending frame
+            let old = ppdu_cache.store_pending(ppdu_cnt, frame);
+            // Actually, this frame has RSSI, so just flush and return it
+            let completed = ppdu_cache.flush_pending();
+            // Return old pending frame first (if any), then the current one gets returned
+            // on next iteration. But we can only return one frame — return completed.
+            if let Some(f) = completed {
+                return (consumed, Some(f));
+            }
+            return (consumed, old);
+        }
+
+        // No inline RSSI — check if pre-stored PPDU status exists for this ppdu_cnt
+        if let Some(phy) = ppdu_cache.lookup(ppdu_cnt) {
+            PpduStatusCache::apply_phy_to_frame(&mut frame, phy);
+            // Clear the slot
+            let idx = (ppdu_cnt & 0x7) as usize;
+            ppdu_cache.slots[idx].valid = false;
+            return (consumed, Some(frame));
+        }
+
+        // No RSSI available yet — store as pending, wait for PPDU status
+        // If there was a previous pending frame, return it now (it missed its PPDU)
+        let old_pending = ppdu_cache.store_pending(ppdu_cnt, frame);
+        (consumed, old_pending)
     }
 
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
         // Try parsing from existing buffer
         while self.rx_pos < self.rx_len {
             let remaining = &self.rx_buf[self.rx_pos..self.rx_len];
-            let (consumed, frame) = Self::parse_rx_packet(remaining, self.channel);
+            let (consumed, frame) = Self::parse_rx_packet(remaining, self.channel, &mut self.ppdu_cache);
             if consumed == 0 {
                 self.rx_pos = self.rx_len;
                 break;
@@ -2124,6 +2574,11 @@ impl Rtl8852au {
             if let Some(f) = frame {
                 return Ok(Some(f));
             }
+        }
+
+        // Before fetching new USB data, flush any pending frame from the last buffer
+        if let Some(f) = self.ppdu_cache.flush_pending() {
+            return Ok(Some(f));
         }
 
         // New USB bulk transfer
@@ -2137,18 +2592,23 @@ impl Rtl8852au {
         self.rx_len = actual;
         self.rx_pos = 0;
 
-        // Parse first packet from new transfer
+        // Parse packets from new transfer
         while self.rx_pos < self.rx_len {
             let remaining = &self.rx_buf[self.rx_pos..self.rx_len];
-            let (consumed, frame) = Self::parse_rx_packet(remaining, self.channel);
+            let (consumed, frame) = Self::parse_rx_packet(remaining, self.channel, &mut self.ppdu_cache);
             if consumed == 0 {
                 self.rx_pos = self.rx_len;
-                return Ok(None);
+                break;
             }
             self.rx_pos += consumed;
             if let Some(f) = frame {
                 return Ok(Some(f));
             }
+        }
+
+        // Flush any remaining pending frame at end of this buffer
+        if let Some(f) = self.ppdu_cache.flush_pending() {
+            return Ok(Some(f));
         }
 
         Ok(None)
@@ -2251,7 +2711,6 @@ impl ChipDriver for Rtl8852au {
         // Do NOT call set_monitor_internal() — it overwrites pcap-configured
         // RX filter values (0x031644BF) with hand-coded values that break RX.
         let fltr = self.read32(R_AX_RX_FLTR_OPT)?;
-        eprintln!("[RTL8852AU] Monitor mode (pcap-configured): RX_FLTR=0x{:08X}", fltr);
         Ok(())
     }
 
@@ -2337,16 +2796,16 @@ mod tests {
         // DW0: pkt_len=8, rpkt_type=0xA (C2H), long_rxd=0
         let dw0: u32 = 8 | (0x0A << 24);
         buf[0..4].copy_from_slice(&dw0.to_le_bytes());
-        // Add some payload
         buf.extend_from_slice(&[0u8; 8]);
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6);
+        let mut cache = PpduStatusCache::new();
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6, &mut cache);
         assert!(consumed > 0);
         assert!(frame.is_none()); // C2H should be skipped
     }
 
     #[test]
-    fn test_rx_descriptor_parsing_wifi() {
-        // Long RX descriptor (32 bytes) for a WiFi packet
+    fn test_rx_descriptor_parsing_wifi_no_drv_info() {
+        // Long RX descriptor (32 bytes) for a WiFi packet, no drv_info
         let frame_data = [
             0x80, 0x00, // beacon frame control
             0x00, 0x00, // duration
@@ -2358,20 +2817,152 @@ mod tests {
         let pkt_len = frame_data.len() + 4; // +4 for FCS
 
         let mut buf = vec![0u8; 32 + pkt_len];
-        // DW0: pkt_len, rpkt_type=0 (WiFi), long_rxd=1
+        // DW0: pkt_len, rpkt_type=0 (WiFi), drv_info_size=0, long_rxd=1
         let dw0: u32 = (pkt_len as u32) | (1 << 31);
         buf[0..4].copy_from_slice(&dw0.to_le_bytes());
-        // DW3: no CRC error
         buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        // Copy frame + FCS
         buf[32..32 + frame_data.len()].copy_from_slice(&frame_data);
 
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6);
+        let mut cache = PpduStatusCache::new();
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6, &mut cache);
         assert!(consumed > 0);
-        assert!(frame.is_some());
-        let f = frame.unwrap();
+        // WiFi frame with no RSSI goes to pending, not returned immediately
+        assert!(frame.is_none());
+        // Flush the pending frame
+        let f = cache.flush_pending().unwrap();
         assert_eq!(f.data.len(), frame_data.len());
         assert_eq!(f.channel, 6);
+        assert_eq!(f.rssi, 0); // no drv_info and no PPDU correlation → 0 (not populated)
+    }
+
+    #[test]
+    fn test_rx_rssi_from_physts_header() {
+        // Long RX descriptor (32 bytes) + 8 bytes drv_info (physts header) + WiFi frame
+        // Simulates -30 dBm: rssi_avg_td = (-30 + 110) * 2 = 160 (0xA0)
+        let frame_data = [
+            0x80, 0x00, 0x00, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x00,
+        ];
+        let pkt_len = frame_data.len() + 4;
+
+        // drv_info_size field = 1 (1 * 8 = 8 bytes of drv_info)
+        let mut buf = vec![0u8; 32 + 8 + pkt_len];
+        let dw0: u32 = (pkt_len as u32) | (1 << 28) | (1 << 31); // drv_info_size=1, long_rxd=1
+        buf[0..4].copy_from_slice(&dw0.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+
+        // physts_hdr_info at offset 32 (right after long RX desc):
+        //   byte 0: is_valid=1 (bit 7) → 0x80
+        //   byte 1: total_length = 1 (8 bytes)
+        //   byte 2: rsvd
+        //   byte 3: rssi_avg_td = 160 (0xA0) → (160 >> 1) - 110 = -30 dBm
+        buf[32] = 0x80; // is_valid = 1
+        buf[33] = 0x01; // total_length = 1 (8 bytes)
+        buf[34] = 0x00; // rsvd
+        buf[35] = 160;  // rssi_avg_td = 160 → -30 dBm
+
+        // Frame data at offset 32 + 8 = 40
+        buf[40..40 + frame_data.len()].copy_from_slice(&frame_data);
+
+        let mut cache = PpduStatusCache::new();
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 36, &mut cache);
+        assert!(consumed > 0);
+        let f = frame.unwrap();
+        assert_eq!(f.rssi, -30);
+        assert_eq!(f.channel, 36);
+    }
+
+    #[test]
+    fn test_rx_rssi_weak_signal() {
+        // Test with weak signal: -85 dBm → rssi_avg_td = (-85 + 110) * 2 = 50
+        let frame_data = [0x80, 0x00, 0x00, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x00];
+        let pkt_len = frame_data.len() + 4;
+
+        let mut buf = vec![0u8; 32 + 8 + pkt_len];
+        let dw0: u32 = (pkt_len as u32) | (1 << 28) | (1 << 31);
+        buf[0..4].copy_from_slice(&dw0.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        buf[32] = 0x80; // is_valid
+        buf[35] = 50;   // rssi_avg_td = 50 → (50 >> 1) - 110 = -85 dBm
+
+        buf[40..40 + frame_data.len()].copy_from_slice(&frame_data);
+
+        let mut cache = PpduStatusCache::new();
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 1, &mut cache);
+        let f = frame.unwrap();
+        assert_eq!(f.rssi, -85);
+    }
+
+    #[test]
+    fn test_ppdu_correlation() {
+        // Test the full PPDU correlation flow:
+        // 1. Feed a PPDU status packet with ppdu_cnt=3 and RSSI=-45 dBm
+        // 2. Feed a WiFi frame with ppdu_cnt=3 in DW1
+        // 3. Verify the WiFi frame picks up the RSSI from the PPDU status
+
+        let mut cache = PpduStatusCache::new();
+
+        // ── Step 1: Build PPDU status packet (rpkt_type=1) ──
+        // PPDU status: long_rxd, rpkt_type=1, drv_info_size=1 (8 bytes physts)
+        let ppdu_pkt_len: u32 = 0; // PPDU status may have pkt_len=0 payload beyond drv_info
+        let ppdu_dw0: u32 = ppdu_pkt_len | (RPKT_TYPE_PPDU as u32) << 24 | (1 << 28) | (1 << 31);
+        // DW1: ppdu_cnt=3 in bits [6:4]
+        let ppdu_dw1: u32 = 3 << 4;
+
+        let mut ppdu_buf = vec![0u8; 32 + 8]; // desc + 8 bytes drv_info
+        ppdu_buf[0..4].copy_from_slice(&ppdu_dw0.to_le_bytes());
+        ppdu_buf[4..8].copy_from_slice(&ppdu_dw1.to_le_bytes());
+        // physts_hdr_info at offset 32:
+        //   byte 0: is_valid=1 (0x80)
+        //   byte 1: total_length=1 (8 bytes)
+        //   byte 3: rssi_avg_td for -45 dBm = (-45+110)*2 = 130
+        ppdu_buf[32] = 0x80; // is_valid
+        ppdu_buf[33] = 0x01; // total_length
+        ppdu_buf[35] = 130;  // rssi_avg_td → (130>>1)-110 = -45 dBm
+        // Per-path RSSI
+        ppdu_buf[36] = 128;  // path A: (128>>1)-110 = -46 dBm
+        ppdu_buf[37] = 132;  // path B: (132>>1)-110 = -44 dBm
+
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(&ppdu_buf, 6, &mut cache);
+        assert!(consumed > 0);
+        assert!(frame.is_none()); // PPDU status doesn't produce a frame
+
+        // ── Step 2: Build WiFi frame with ppdu_cnt=3 in DW1 ──
+        let frame_data = [
+            0x80, 0x00, 0x00, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x00,
+        ];
+        let wifi_pkt_len = frame_data.len() + 4;
+        let mut wifi_buf = vec![0u8; 32 + wifi_pkt_len];
+        // DW0: rpkt_type=0 (WiFi), no drv_info, long_rxd=1
+        let wifi_dw0: u32 = (wifi_pkt_len as u32) | (1 << 31);
+        // DW1: ppdu_cnt=3, ppdu_type=5 (HE-SU), data_rate=0x80 (HT MCS0), bw=2 (80MHz)
+        let wifi_dw1: u32 = 5 | (3 << 4) | (0x80 << 16) | (2 << 30);
+        wifi_buf[0..4].copy_from_slice(&wifi_dw0.to_le_bytes());
+        wifi_buf[4..8].copy_from_slice(&wifi_dw1.to_le_bytes());
+        wifi_buf[32..32 + frame_data.len()].copy_from_slice(&frame_data);
+
+        let (consumed, frame) = Rtl8852au::parse_rx_packet(&wifi_buf, 6, &mut cache);
+        assert!(consumed > 0);
+        let f = frame.unwrap();
+
+        // ── Step 3: Verify correlation ──
+        assert_eq!(f.rssi, -45);
+        assert_eq!(f.rssi_path[0], -46);
+        assert_eq!(f.rssi_path[1], -44);
+        assert_eq!(f.ppdu_type, PpduType::HeSu);
+        assert_eq!(f.data_rate, 0x80);
+        assert_eq!(f.bandwidth, RxBandwidth::Bw80);
     }
 
     #[test]
