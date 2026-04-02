@@ -17,8 +17,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::core::MacAddress;
-use crate::core::channel::{Band, Bandwidth};
-use crate::cli::views::spectrum::{SpectrumData, SpectrumDisplayMode};
 use crate::scanner::Scanner;
 use crate::store::{
     Ap, ChannelStats, FrameStore, ProbeReq, ScanEvent, ScanStats, Station, WpsState,
@@ -37,7 +35,6 @@ pub enum ScanView {
     Channels,
     Events,
     Handshakes,
-    Spectrum,
 }
 
 impl ScanView {
@@ -48,7 +45,6 @@ impl ScanView {
         ScanView::Channels,
         ScanView::Events,
         ScanView::Handshakes,
-        ScanView::Spectrum,
     ];
 
     pub fn next(self) -> Self {
@@ -58,20 +54,18 @@ impl ScanView {
             Self::Probes => Self::Channels,
             Self::Channels => Self::Events,
             Self::Events => Self::Handshakes,
-            Self::Handshakes => Self::Spectrum,
-            Self::Spectrum => Self::Aps,
+            Self::Handshakes => Self::Aps,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Aps => Self::Spectrum,
+            Self::Aps => Self::Handshakes,
             Self::Clients => Self::Aps,
             Self::Probes => Self::Clients,
             Self::Channels => Self::Probes,
             Self::Events => Self::Channels,
             Self::Handshakes => Self::Events,
-            Self::Spectrum => Self::Handshakes,
         }
     }
 
@@ -83,7 +77,6 @@ impl ScanView {
             Self::Channels => "Channels",
             Self::Events => "Events",
             Self::Handshakes => "Handshakes",
-            Self::Spectrum => "Spectrum",
         }
     }
 }
@@ -320,9 +313,6 @@ pub struct ScannerModule {
     /// matches the real viewport, regardless of terminal size or status bar height.
     visible_data_rows: usize,
 
-    // Spectrum analyzer state
-    pub spectrum_data: SpectrumData,
-    pub spectrum_scroll: usize,
 }
 
 impl ScannerModule {
@@ -348,8 +338,6 @@ impl ScannerModule {
             filter_menu_cursor: 0,
             channel_filter: None,
             visible_data_rows: 0,
-            spectrum_data: SpectrumData::new(&[]),
-            spectrum_scroll: 0,
         }
     }
 
@@ -370,13 +358,8 @@ impl ScannerModule {
         let channel_stats_map = self.store.get_channel_stats();
         let channel_stats: Vec<ChannelStats> = channel_stats_map.into_values().collect();
 
-        let aps: Vec<Ap> = self.store.get_aps().into_values().collect();
-
-        // ── Update spectrum data from APs + channel stats ──
-        self.update_spectrum_data(&aps, &channel_stats);
-
         self.cached_snapshot = Some(ScanSnapshot {
-            aps,
+            aps: self.store.get_aps().into_values().collect(),
             stations: self.store.get_stations().into_values().collect(),
             probes: self.store.get_probes(),
             handshakes,
@@ -385,83 +368,6 @@ impl ScannerModule {
             stats: self.store.stats(),
             channel: self.store.current_channel(),
         });
-    }
-
-    /// Build/update spectrum data from APs and channel stats.
-    ///
-    /// Collects all unique channels from APs, then feeds per-channel RSSI
-    /// (strongest AP as representative) and AP counts into SpectrumData.
-    /// Called once per render cycle from refresh_snapshot().
-    fn update_spectrum_data(&mut self, aps: &[Ap], channel_stats: &[ChannelStats]) {
-        use std::collections::BTreeMap;
-        use crate::core::Channel;
-
-        // Collect unique channels from APs + channel_stats, sorted by (band, number)
-        let mut channels_map: BTreeMap<(u8, u8), Channel> = BTreeMap::new();
-
-        for ap in aps {
-            let ch = Channel::new(ap.channel);
-            let band_ord = match ch.band {
-                Band::Band2g => 0,
-                Band::Band5g => 1,
-                Band::Band6g => 2,
-            };
-            channels_map.entry((band_ord, ch.number)).or_insert(ch);
-        }
-        for cs in channel_stats {
-            let ch = Channel::new(cs.channel);
-            let band_ord = match ch.band {
-                Band::Band2g => 0,
-                Band::Band5g => 1,
-                Band::Band6g => 2,
-            };
-            channels_map.entry((band_ord, ch.number)).or_insert(ch);
-        }
-
-        let channels: Vec<Channel> = channels_map.into_values().collect();
-
-        // Rebuild spectrum data if channel set changed
-        if self.spectrum_data.measurements.len() != channels.len()
-            || self.spectrum_data.measurements.iter().zip(channels.iter())
-                .any(|(m, c)| m.channel.number != c.number)
-        {
-            let mode = self.spectrum_data.display_mode;
-            self.spectrum_data = SpectrumData::new(&channels);
-            self.spectrum_data.display_mode = mode;
-        }
-
-        // Feed AP RSSI — use strongest AP per channel as representative
-        let mut strongest_per_ch: BTreeMap<u8, i16> = BTreeMap::new();
-        let mut ap_count_per_ch: BTreeMap<u8, u16> = BTreeMap::new();
-        for ap in aps {
-            let rssi = ap.rssi as i16;
-            let entry = strongest_per_ch.entry(ap.channel).or_insert(-100);
-            if rssi > *entry {
-                *entry = rssi;
-            }
-            *ap_count_per_ch.entry(ap.channel).or_insert(0) += 1;
-        }
-
-        for (&ch, &rssi) in &strongest_per_ch {
-            self.spectrum_data.update_rssi(ch, rssi);
-        }
-        for (&ch, &count) in &ap_count_per_ch {
-            self.spectrum_data.update_ap_count(ch, count);
-        }
-
-        // Feed noise floor + MIB survey data from channel stats
-        for cs in channel_stats {
-            if let Some(m) = self.spectrum_data.measurements.iter_mut()
-                .find(|m| m.channel.number == cs.channel)
-            {
-                m.noise_floor = cs.noise_floor as i16;
-                m.busy_us = cs.busy_us;
-                m.tx_us = cs.tx_us;
-                m.rx_us = cs.rx_us;
-                m.obss_us = cs.obss_us;
-                m.utilization_pct = cs.utilization_pct;
-            }
-        }
     }
 
     /// Get the cached snapshot, refreshing if not yet cached this cycle.
@@ -503,7 +409,6 @@ impl ScannerModule {
                 ScanView::Handshakes => snap.handshakes.iter()
                     .filter(|hs| hs.quality != crate::protocol::eapol::HandshakeQuality::None)
                     .count(),
-                ScanView::Spectrum => 0, // spectrum uses its own scroll via spectrum_scroll
             },
             _ => 0, // detail views don't use row selection
         }
@@ -597,14 +502,6 @@ impl ScannerModule {
                     ScanView::Handshakes => {
                         let capacity = views::render_handshakes(&snap, width, self.selected, self.scroll_offset, content_rows, &mut lines);
                         self.visible_data_rows = capacity.max(1);
-                    }
-                    ScanView::Spectrum => {
-                        use crate::cli::views::spectrum;
-                        let panel_lines = spectrum::render_spectrum_panel(
-                            &self.spectrum_data, &snap, width, content_rows as u16,
-                            self.spectrum_scroll,
-                        );
-                        lines.extend(panel_lines);
                     }
                 }
             }
@@ -865,27 +762,6 @@ impl ScannerModule {
         // This adapts to any terminal size and status bar height automatically.
         let visible_rows = self.visible_data_rows;
 
-        // Spectrum view has its own key handling (m=mode, j/k=scroll AP table)
-        if self.view == ScanView::Spectrum {
-            return match key.key.as_str() {
-                "m" => { self.spectrum_data.cycle_mode(); true }
-                "p" => { self.spectrum_data.display_mode = SpectrumDisplayMode::Peak; true }
-                "a" => { self.spectrum_data.display_mode = SpectrumDisplayMode::Average; true }
-                "c" => { self.spectrum_data.display_mode = SpectrumDisplayMode::Current; true }
-                "j" | "down" => { self.spectrum_scroll = self.spectrum_scroll.saturating_add(1); true }
-                "k" | "up" => { self.spectrum_scroll = self.spectrum_scroll.saturating_sub(1); true }
-                "g" => { self.spectrum_scroll = 0; true }
-                "G" => { self.spectrum_scroll = usize::MAX; true }
-                "tab" => {
-                    self.view = self.view.next();
-                    self.selected = 0;
-                    self.scroll_offset = 0;
-                    true
-                }
-                _ => false,
-            };
-        }
-
         // Events view has stream-style scrolling (k=older, j=newer, g=oldest, G=newest)
         if self.view == ScanView::Events {
             return match key.key.as_str() {
@@ -997,7 +873,6 @@ impl ScannerModule {
                         }
                     }
                     ScanView::Events => {}
-                    ScanView::Spectrum => {} // no drill-in for spectrum
                 }
                 true
             }

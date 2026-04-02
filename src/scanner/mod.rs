@@ -246,30 +246,13 @@ impl Scanner {
 
                 // End dwell on previous channel (if any) before switching.
                 // This calculates per-channel FPS for the channel we're leaving.
-                // Also reads MIB survey data (busy/tx/rx/obss airtime) if supported.
                 {
                     let prev_ch = self.current_channel.load(Ordering::SeqCst);
                     if prev_ch != 0 {
-                        // Read MIB survey counters for the channel we're leaving.
-                        // These accumulated during the dwell on this channel.
-                        let survey = shared.survey_read(prev_band_idx).ok();
-
                         let prev_key = crate::store::stats::channel_key(prev_ch, prev_band_idx);
                         store.with_channel_stats_mut(|stats| {
                             if let Some(cs) = stats.get_mut(&prev_key) {
                                 cs.end_dwell();
-                                // Store survey data if available
-                                if let Some(ref s) = survey {
-                                    cs.busy_us = s.busy_us;
-                                    cs.tx_us = s.tx_us;
-                                    cs.rx_us = s.rx_us;
-                                    cs.obss_us = s.obss_us;
-                                    // Calculate utilization: busy_us / dwell_us * 100
-                                    let dwell_us = cs.dwell_start.elapsed().as_micros() as f32;
-                                    if dwell_us > 0.0 {
-                                        cs.utilization_pct = (s.busy_us as f32 / dwell_us) * 100.0;
-                                    }
-                                }
                             }
                         });
                     }
@@ -294,9 +277,6 @@ impl Scanner {
                         .or_insert_with(|| crate::store::stats::ChannelStats::new(ch.number, band_idx))
                         .start_dwell();
                 });
-
-                // Reset MIB survey counters for fresh measurement on this channel.
-                let _ = shared.survey_reset(band_idx);
 
                 // Wait for PHY to stabilize after channel switch.
                 // Settle time comes from the chipset — each adapter knows its PLL retune time.

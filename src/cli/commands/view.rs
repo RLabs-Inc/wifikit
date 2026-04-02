@@ -46,15 +46,8 @@ pub fn run(ctx: &mut Ctx, args: &str) {
                     module.selected = 0;
                     None
                 }
-                "spectrum" | "spec" => {
-                    module.view = crate::cli::scanner::ScanView::Spectrum;
-                    module.detail = crate::cli::scanner::DetailState::None;
-                    module.selected = 0;
-                    module.spectrum_scroll = 0;
-                    None
-                }
                 _ => {
-                    Some(format!("  {} Unknown view: {}. Options: aps, clients, probes, channels, events, handshakes, spectrum",
+                    Some(format!("  {} Unknown view: {}. Options: aps, clients, probes, channels, events, handshakes",
                         prism::s().red().paint("!"), view_name))
                 }
             }
