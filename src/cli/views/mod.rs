@@ -8,3 +8,4 @@ pub mod krack;
 pub mod frag;
 pub mod fuzz;
 pub mod wpa3;
+pub mod spectrum;

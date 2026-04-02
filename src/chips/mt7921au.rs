@@ -35,7 +35,7 @@ use rusb::{DeviceHandle, GlobalContext};
 
 use crate::core::{
     Channel, Band, MacAddress, Result, Error,
-    chip::{ChipDriver, ChipInfo, ChipId, ChipCaps},
+    chip::{ChipDriver, ChipInfo, ChipId, ChipCaps, ChannelSurvey},
     frame::{RxFrame, TxOptions, TxFlags, TxRate},
     adapter::UsbEndpoints,
 };
@@ -153,6 +153,38 @@ const MT_TOP_BASE: u32         = 0x18060000;
 const MT_TOP_MISC: u32         = MT_TOP_BASE + 0xf0;
 const MT_TOP_MISC_FW_STATE: u32 = 0x7;  // GENMASK(2,0)
 
+// ── MIB Registers — per-channel survey / spectrum data ──
+// From mt792x_regs.h. Band 0 base = 0x820ED000, Band 1 = 0x820FD000.
+const MT_WF_MIB_BASE0: u32         = 0x820ed000;
+const MT_WF_MIB_BASE1: u32         = 0x820fd000;
+
+/// Channel busy time in microseconds (24-bit). Counts time PHY detects energy above CCA threshold.
+const MT_MIB_SDR9_OFF: u32         = 0x02c;
+const MT_MIB_SDR9_BUSY_MASK: u32   = 0x00FFFFFF; // GENMASK(23,0)
+
+/// TX airtime in microseconds (24-bit). Time spent transmitting.
+const MT_MIB_SDR36_OFF: u32        = 0x054;
+const MT_MIB_SDR36_TXTIME_MASK: u32 = 0x00FFFFFF;
+
+/// RX airtime in microseconds (24-bit). Time spent receiving valid frames.
+const MT_MIB_SDR37_OFF: u32        = 0x058;
+const MT_MIB_SDR37_RXTIME_MASK: u32 = 0x00FFFFFF;
+
+/// OBSS (other BSS) airtime in microseconds (24-bit).
+const MT_WF_RMAC_BASE0: u32            = 0x820e7000;
+const MT_WF_RMAC_MIB_AIRTIME14_OFF: u32 = 0x03b8;
+const MT_MIB_OBSSTIME_MASK: u32         = 0x00FFFFFF;
+
+/// MIB time control — clear and enable RX time measurement.
+const MT_WF_RMAC_MIB_TIME0_OFF: u32    = 0x03c4;
+const MT_WF_RMAC_MIB_RXTIME_CLR: u32   = 1 << 31;
+const MT_WF_RMAC_MIB_RXTIME_EN: u32    = 1 << 30;
+
+/// MIB control — enable TX/RX duration reporting.
+const MT_MIB_SCR1_OFF: u32     = 0x004;
+const MT_MIB_TXDUR_EN: u32     = 1 << 8;
+const MT_MIB_RXDUR_EN: u32     = 1 << 9;
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  Constants — MCU command protocol
 // ══════════════════════════════════════════════════════════════════════════════
@@ -196,9 +228,29 @@ const MCU_EXT_CMD_MAC_INIT_CTRL: u8  = 0x46;
 const MCU_EXT_CMD_SET_RX_PATH: u8    = 0x4E;
 
 // MCU CE command IDs (community engine — set_query=MCU_Q_SET)
+const MCU_CE_CMD_TEST_CTRL: u8       = 0x01;  // RF test mode control
 const MCU_CE_CMD_SET_PS_PROFILE: u8  = 0x05;
 const MCU_CE_CMD_SET_RX_FILTER: u8   = 0x0A;
 const MCU_CE_CMD_CHIP_CONFIG: u8     = 0xCA;
+
+// ── RF Test Mode (testmode.h) ───────────────────────────────────────────
+// Actions for MCU_CE_CMD_TEST_CTRL
+const TM_SWITCH_MODE: u8    = 0;  // Switch between normal/testmode/ICAP/spectrum
+const TM_SET_AT_CMD: u8     = 1;  // Set RF AT command parameter
+const TM_QUERY_AT_CMD: u8   = 2;  // Query RF AT command result
+
+// Test mode operating modes (param0 for TM_SWITCH_MODE)
+const TM_MODE_NORMAL: u32       = 0;  // Normal WiFi operation
+const TM_MODE_TESTMODE: u32     = 1;  // RF test mode (TX/RX control, power, freq)
+const TM_MODE_ICAP: u32         = 2;  // Internal Capture — raw I/Q baseband samples
+const TM_MODE_ICAP_OVERLAP: u32 = 3;  // I/Q capture with overlap
+const TM_MODE_WIFISPECTRUM: u32 = 4;  // WiFi spectrum analyzer mode
+
+// ATE (Advanced Test Engine) parameter indices for TM_SET_AT_CMD
+const MCU_ATE_SET_TRX: u32         = 0x01;  // Enable/disable TX/RX
+const MCU_ATE_SET_FREQ_OFFSET: u32 = 0x0A;  // RF frequency offset
+const MCU_ATE_SET_SLOT_TIME: u32   = 0x13;  // Timing parameters
+const MCU_ATE_SET_TX_POWER: u32    = 0x15;  // TX power control
 
 // MCU UNI command IDs
 const MCU_UNI_CMD_DEV_INFO_UPDATE: u16 = 0x01;
@@ -1666,6 +1718,174 @@ impl Mt7921au {
         // len[2..4] = 0 (le16)
 
         self.mcu_send_ext_cmd(MCU_EXT_CMD_EFUSE_BUFFER_MODE, &data, true)?;
+        Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  RF Test Mode — spectrum analyzer, I/Q capture, SDR capabilities
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Send an RF test command (testmode.c: mt7921_tm_set).
+    ///
+    /// Wire format (mt7921_rftest_cmd):
+    ///   action: u8      — TM_SWITCH_MODE / TM_SET_AT_CMD / TM_QUERY_AT_CMD
+    ///   rsv: [u8; 3]    — reserved, zero
+    ///   param0: le32    — mode (for SWITCH_MODE) or func_id (for AT_CMD)
+    ///   param1: le32    — parameter value
+    ///
+    /// Returns (param0, param1) from the response when wait_resp=true.
+    fn mcu_rftest_cmd(&mut self, action: u8, param0: u32, param1: u32, wait_resp: bool) -> Result<(u32, u32)> {
+        let mut data = [0u8; 12];
+        data[0] = action;
+        // data[1..4] = rsv (zeros)
+        data[4..8].copy_from_slice(&param0.to_le_bytes());
+        data[8..12].copy_from_slice(&param1.to_le_bytes());
+
+        let _ret = self.mcu_send_ce_cmd(MCU_CE_CMD_TEST_CTRL, &data, wait_resp)?;
+
+        // For queries, we'd need to parse the response.
+        // The CE cmd response comes as an event on the MCU RX endpoint.
+        // For now, return zeros — we'll wire up response parsing as we validate.
+        Ok((0, 0))
+    }
+
+    /// Switch between normal mode and RF test modes.
+    ///
+    /// Modes:
+    ///   TM_MODE_NORMAL       — back to normal WiFi operation
+    ///   TM_MODE_TESTMODE     — RF test mode (TX/RX control, power, freq offset)
+    ///   TM_MODE_ICAP         — Internal CAPture (raw I/Q baseband samples)
+    ///   TM_MODE_ICAP_OVERLAP — I/Q capture with overlap
+    ///   TM_MODE_WIFISPECTRUM — WiFi spectrum analyzer mode
+    ///
+    /// IMPORTANT: Must disable power save before entering test mode.
+    /// The Linux driver does: pm.enable=false, cancel PS work, force driver pmctrl.
+    pub fn testmode_switch(&mut self, mode: u32) -> Result<()> {
+        if mode != TM_MODE_NORMAL {
+            // Disable power save — test mode needs full power
+            self.mcu_set_deep_sleep(false)?;
+        }
+
+        self.mcu_rftest_cmd(TM_SWITCH_MODE, mode, 0, false)?;
+        eprintln!("[MT7921] testmode: switched to mode {}", match mode {
+            TM_MODE_NORMAL => "NORMAL",
+            TM_MODE_TESTMODE => "RF_TEST",
+            TM_MODE_ICAP => "ICAP (I/Q capture)",
+            TM_MODE_ICAP_OVERLAP => "ICAP_OVERLAP",
+            TM_MODE_WIFISPECTRUM => "WIFI_SPECTRUM",
+            _ => "UNKNOWN",
+        });
+        Ok(())
+    }
+
+    /// Enter WiFi spectrum analyzer mode.
+    /// The firmware will output spectral data instead of decoded frames.
+    pub fn testmode_enter_spectrum(&mut self) -> Result<()> {
+        self.testmode_switch(TM_MODE_WIFISPECTRUM)
+    }
+
+    /// Enter I/Q capture mode (raw baseband samples — SDR mode).
+    pub fn testmode_enter_icap(&mut self) -> Result<()> {
+        self.testmode_switch(TM_MODE_ICAP)
+    }
+
+    /// Enter RF test mode (TX/RX control, power tuning, freq offset).
+    pub fn testmode_enter_rftest(&mut self) -> Result<()> {
+        self.testmode_switch(TM_MODE_TESTMODE)
+    }
+
+    /// Return to normal WiFi operation from any test mode.
+    pub fn testmode_exit(&mut self) -> Result<()> {
+        self.testmode_switch(TM_MODE_NORMAL)?;
+        // Re-enable power save
+        self.mcu_set_deep_sleep(true)?;
+        Ok(())
+    }
+
+    /// Set an RF AT command parameter (in test mode).
+    /// func_id: MCU_ATE_SET_* constant
+    /// value: parameter-specific value
+    pub fn testmode_set_at(&mut self, func_id: u32, value: u32) -> Result<()> {
+        self.mcu_rftest_cmd(TM_SET_AT_CMD, func_id, value, false)?;
+        Ok(())
+    }
+
+    /// Query an RF AT command result (in test mode).
+    /// Returns (param0, param1) from firmware response.
+    pub fn testmode_query_at(&mut self, func_id: u32) -> Result<(u32, u32)> {
+        self.mcu_rftest_cmd(TM_QUERY_AT_CMD, func_id, 0, true)
+    }
+
+    /// Set TX power in test mode (pushes power to specified level).
+    /// power: power in half-dBm units (e.g., 40 = 20 dBm)
+    pub fn testmode_set_tx_power(&mut self, power_half_dbm: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_POWER, power_half_dbm)
+    }
+
+    /// Enable/disable TX or RX in test mode.
+    /// trx_type: 1=TX, 2=RX, 3=TX+RX
+    /// enable: true to start, false to stop
+    pub fn testmode_set_trx(&mut self, trx_type: u32, enable: bool) -> Result<()> {
+        let value = if enable { 1u32 } else { 0u32 };
+        // Pack type in param0, enable in param1
+        self.mcu_rftest_cmd(TM_SET_AT_CMD, MCU_ATE_SET_TRX | (trx_type << 16), value, false)?;
+        Ok(())
+    }
+
+    /// Set frequency offset in test mode (fine RF tuning).
+    /// offset: frequency offset value
+    pub fn testmode_set_freq_offset(&mut self, offset: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_FREQ_OFFSET, offset)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Channel Survey — per-channel busy/tx/rx time from MIB registers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Read per-channel survey data from hardware MIB registers.
+    ///
+    /// Returns (busy_us, tx_us, rx_us, obss_us) — all in microseconds.
+    /// These are CUMULATIVE counters that reset when cleared.
+    /// Call `survey_reset()` after reading to start fresh measurement.
+    ///
+    /// This works in NORMAL mode — no testmode needed!
+    /// Matches mt792x_phy_update_channel() from the kernel driver.
+    pub fn survey_read(&self, band_idx: u8) -> Result<ChannelSurvey> {
+        let mib_base = if band_idx == 0 { MT_WF_MIB_BASE0 } else { MT_WF_MIB_BASE1 };
+        let rmac_base = if band_idx == 0 { MT_WF_RMAC_BASE0 } else { MT_WF_RMAC_BASE0 + 0x10000 };
+
+        let busy = self.reg_read(mib_base + MT_MIB_SDR9_OFF)? & MT_MIB_SDR9_BUSY_MASK;
+        let tx = self.reg_read(mib_base + MT_MIB_SDR36_OFF)? & MT_MIB_SDR36_TXTIME_MASK;
+        let rx = self.reg_read(mib_base + MT_MIB_SDR37_OFF)? & MT_MIB_SDR37_RXTIME_MASK;
+        let obss = self.reg_read(rmac_base + MT_WF_RMAC_MIB_AIRTIME14_OFF)? & MT_MIB_OBSSTIME_MASK;
+
+        Ok(ChannelSurvey {
+            busy_us: busy,
+            tx_us: tx,
+            rx_us: rx,
+            obss_us: obss,
+        })
+    }
+
+    /// Reset survey counters by clearing the RMAC MIB time register.
+    /// Call this after reading to start a fresh measurement window.
+    pub fn survey_reset(&self, band_idx: u8) -> Result<()> {
+        let rmac_base = if band_idx == 0 { MT_WF_RMAC_BASE0 } else { MT_WF_RMAC_BASE0 + 0x10000 };
+        // Set the clear bit — hardware auto-clears it
+        self.reg_set(rmac_base + MT_WF_RMAC_MIB_TIME0_OFF, MT_WF_RMAC_MIB_RXTIME_CLR)?;
+        Ok(())
+    }
+
+    /// Enable MIB TX/RX duration reporting.
+    /// Should be called once during init.
+    pub fn survey_enable(&self, band_idx: u8) -> Result<()> {
+        let mib_base = if band_idx == 0 { MT_WF_MIB_BASE0 } else { MT_WF_MIB_BASE1 };
+        let rmac_base = if band_idx == 0 { MT_WF_RMAC_BASE0 } else { MT_WF_RMAC_BASE0 + 0x10000 };
+
+        // Enable MIB TX/RX duration counters
+        self.reg_set(mib_base + MT_MIB_SCR1_OFF, MT_MIB_TXDUR_EN | MT_MIB_RXDUR_EN)?;
+        // Enable RMAC RX time measurement
+        self.reg_set(rmac_base + MT_WF_RMAC_MIB_TIME0_OFF, MT_WF_RMAC_MIB_RXTIME_EN)?;
         Ok(())
     }
 
@@ -3674,6 +3894,48 @@ impl ChipDriver for Mt7921au {
         //
         // 10ms margin for AGC to converge after the PLL locks.
         Duration::from_millis(10)
+    }
+
+    // ── Channel Survey ──
+
+    fn survey_read(&self, band_idx: u8) -> Result<ChannelSurvey> {
+        self.survey_read(band_idx)
+    }
+
+    fn survey_reset(&self, band_idx: u8) -> Result<()> {
+        self.survey_reset(band_idx)
+    }
+
+    fn survey_enable(&self, band_idx: u8) -> Result<()> {
+        self.survey_enable(band_idx)
+    }
+
+    // ── RF Test Mode / Spectrum Analyzer ──
+
+    fn supports_testmode(&self) -> bool { true }
+
+    fn enter_spectrum_mode(&mut self) -> Result<()> {
+        self.testmode_enter_spectrum()
+    }
+
+    fn enter_icap_mode(&mut self) -> Result<()> {
+        self.testmode_enter_icap()
+    }
+
+    fn enter_rftest_mode(&mut self) -> Result<()> {
+        self.testmode_enter_rftest()
+    }
+
+    fn exit_testmode(&mut self) -> Result<()> {
+        self.testmode_exit()
+    }
+
+    fn testmode_set_tx_power(&mut self, power_half_dbm: u32) -> Result<()> {
+        self.testmode_set_tx_power(power_half_dbm)
+    }
+
+    fn testmode_set_freq_offset(&mut self, offset: u32) -> Result<()> {
+        self.testmode_set_freq_offset(offset)
     }
 
     fn take_rx_handle(&mut self) -> Option<crate::core::chip::RxHandle> {

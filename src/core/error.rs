@@ -199,6 +199,11 @@ pub enum Error {
     RegisterReadFailed { addr: u16 },
 
     // === Attack ===
+    // === Capability ===
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
+    // === Attack ===
     #[error("attack already running: {name}")]
     AttackAlreadyRunning { name: &'static str },
 

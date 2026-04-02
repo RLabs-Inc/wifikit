@@ -175,6 +175,36 @@ pub fn find_adapter_name(vid: u16, pid: u16) -> Option<&'static str> {
         .map(|a| a.name)
 }
 
+// ── ChannelSurvey — per-channel utilization data from MIB registers ──
+
+/// Per-channel survey data read from hardware MIB registers.
+/// All values are cumulative microseconds since last reset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChannelSurvey {
+    /// Total time PHY detected energy above CCA threshold (channel busy).
+    pub busy_us: u32,
+    /// Time spent transmitting frames.
+    pub tx_us: u32,
+    /// Time spent receiving valid frames from our BSS.
+    pub rx_us: u32,
+    /// Time spent receiving frames from other BSSes (OBSS).
+    pub obss_us: u32,
+}
+
+impl ChannelSurvey {
+    /// Channel utilization as percentage (0.0 - 100.0).
+    /// Based on busy_us relative to a known dwell time.
+    pub fn utilization_pct(&self, dwell_us: u32) -> f32 {
+        if dwell_us == 0 { return 0.0; }
+        (self.busy_us as f32 / dwell_us as f32 * 100.0).min(100.0)
+    }
+
+    /// Noise estimate: busy time that's neither TX nor RX (interference + noise).
+    pub fn noise_us(&self) -> u32 {
+        self.busy_us.saturating_sub(self.tx_us + self.rx_us)
+    }
+}
+
 // ── ChipInfo — Runtime info from a live driver ──
 
 pub struct ChipInfo {
@@ -243,6 +273,60 @@ pub trait ChipDriver: Send {
             }
         }
         bands
+    }
+
+    // ── Channel Survey — per-channel utilization from MIB registers ──
+
+    /// Read per-channel survey data (busy/tx/rx/obss time in microseconds).
+    /// Works in normal mode — no testmode needed.
+    fn survey_read(&self, _band_idx: u8) -> Result<ChannelSurvey> {
+        Err(crate::core::Error::NotSupported("survey not supported by this chip".into()))
+    }
+
+    /// Reset survey counters to start fresh measurement.
+    fn survey_reset(&self, _band_idx: u8) -> Result<()> {
+        Err(crate::core::Error::NotSupported("survey not supported by this chip".into()))
+    }
+
+    /// Enable MIB duration reporting. Call once during init.
+    fn survey_enable(&self, _band_idx: u8) -> Result<()> {
+        Err(crate::core::Error::NotSupported("survey not supported by this chip".into()))
+    }
+
+    // ── RF Test Mode / Spectrum Analyzer ──
+
+    /// Whether this adapter supports RF test mode (spectrum analyzer, I/Q capture).
+    /// Only MediaTek ConnAC 2.0+ chips (MT7921, MT7925) support this.
+    fn supports_testmode(&self) -> bool { false }
+
+    /// Enter WiFi spectrum analyzer mode. Firmware outputs spectral data.
+    fn enter_spectrum_mode(&mut self) -> Result<()> {
+        Err(crate::core::Error::NotSupported("spectrum mode not supported by this chip".into()))
+    }
+
+    /// Enter I/Q capture mode (raw baseband samples — SDR mode).
+    fn enter_icap_mode(&mut self) -> Result<()> {
+        Err(crate::core::Error::NotSupported("ICAP mode not supported by this chip".into()))
+    }
+
+    /// Enter RF test mode (TX/RX control, power tuning, frequency offset).
+    fn enter_rftest_mode(&mut self) -> Result<()> {
+        Err(crate::core::Error::NotSupported("RF test mode not supported by this chip".into()))
+    }
+
+    /// Exit any test mode and return to normal WiFi operation.
+    fn exit_testmode(&mut self) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode not supported by this chip".into()))
+    }
+
+    /// Set TX power in test mode. power_half_dbm = power in 0.5 dBm units.
+    fn testmode_set_tx_power(&mut self, _power_half_dbm: u32) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode power control not supported".into()))
+    }
+
+    /// Set frequency offset in test mode (fine RF tuning).
+    fn testmode_set_freq_offset(&mut self, _offset: u32) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode freq offset not supported".into()))
     }
 
     // ── RX split support (pipeline architecture) ──
