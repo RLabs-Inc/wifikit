@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 use wifikit::core::chip::ChipDriver;
-use wifikit::core::{Channel, TxOptions, TxFlags};
+use wifikit::core::{Channel, MacAddress, TxOptions, TxFlags};
 use wifikit::core::frame::TxRate;
 
 fn main() {
@@ -83,7 +83,13 @@ fn main() {
     // Set channel
     let ch = Channel::new(channel);
     eprint!("  Channel {}... ", channel);
-    driver.set_channel(ch).expect("channel failed");
+    match driver.set_channel(ch) {
+        Ok(()) => eprintln!("OK"),
+        Err(e) => {
+            eprintln!("FAILED: {} — try replugging the adapter", e);
+            std::process::exit(1);
+        }
+    }
     eprintln!("OK");
 
     // Generate a BSSID from our MAC (or use a random one)
@@ -155,32 +161,60 @@ fn main() {
                     let to_us = (frame.data.len() >= 10 && frame.data[4..10] == bssid)
                         || (frame.data.len() >= 22 && frame.data[16..22] == bssid);
 
+                    let ack_opts = TxOptions {
+                        rate: TxRate::Ofdm6m,
+                        flags: TxFlags::WANT_ACK,
+                        retries: 3,
+                        ..Default::default()
+                    };
+
                     match subtype {
                         4 => { // Probe Request
                             probe_reqs += 1;
-                            if to_us || (frame.data.len() >= 10 && frame.data[4..10] == [0xFF; 6]) {
-                                // Parse SSID from probe
+                            let is_broadcast = frame.data.len() >= 10 && frame.data[4..10] == [0xFF; 6];
+                            if to_us || is_broadcast {
                                 let ssid_str = if frame.data.len() > 26 {
                                     parse_ssid(&frame.data[24..])
                                 } else {
                                     "<empty>".to_string()
                                 };
-                                let sa = &frame.data[10..16];
-                                eprintln!("  ← Probe Request from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} SSID=\"{}\" rssi={}",
+                                let mut sa = [0u8; 6];
+                                sa.copy_from_slice(&frame.data[10..16]);
+                                eprintln!("  ← Probe Req from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} SSID=\"{}\" rssi={}",
                                     sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], ssid_str, frame.rssi);
+
+                                // Reply with probe response if directed to us or broadcast
+                                if ssid_str == ssid || ssid_str == "<broadcast>" {
+                                    let resp = build_probe_response(&bssid, &sa, &ssid, channel, 100);
+                                    let _ = driver.tx_frame(&resp, &ack_opts);
+                                    eprintln!("    → Probe Response sent!");
+                                }
                             }
                         }
                         11 if to_us => { // Authentication
                             auth_reqs += 1;
-                            let sa = &frame.data[10..16];
+                            let mut sa = [0u8; 6];
+                            sa.copy_from_slice(&frame.data[10..16]);
                             eprintln!("  ★ AUTH from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} rssi={}",
                                 sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], frame.rssi);
+
+                            // Send AUTH response (Open System: algo=0, seq=2, status=0)
+                            let resp = build_auth_response(&bssid, &sa);
+                            let _ = driver.tx_frame(&resp, &ack_opts);
+                            eprintln!("    → AUTH Response sent (Open System, status=SUCCESS)");
                         }
                         0 if to_us => { // Association Request
                             assoc_reqs += 1;
-                            let sa = &frame.data[10..16];
-                            eprintln!("  ★★ ASSOC from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} rssi={}",
+                            let mut sa = [0u8; 6];
+                            sa.copy_from_slice(&frame.data[10..16]);
+                            eprintln!("  ★★ ASSOC REQ from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} rssi={}",
                                 sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], frame.rssi);
+
+                            // Send ASSOC response (status=0, AID=1)
+                            let resp = build_assoc_response(&bssid, &sa, channel);
+                            let _ = driver.tx_frame(&resp, &ack_opts);
+                            eprintln!("    → ASSOC Response sent (AID=1, status=SUCCESS)");
+                            eprintln!("    ★★★ CLIENT CONNECTED! ★★★");
                         }
                         _ => {}
                     }
@@ -223,4 +257,112 @@ fn parse_ssid(tagged_params: &[u8]) -> String {
         i += 2 + len;
     }
     "<none>".to_string()
+}
+
+/// Build an 802.11 Authentication Response (Open System, seq=2, status=success)
+fn build_auth_response(bssid: &[u8; 6], client: &[u8; 6]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(30);
+    // FC: type=0(mgmt), subtype=11(auth)
+    f.push(0xB0); f.push(0x00);
+    // Duration
+    f.push(0x00); f.push(0x00);
+    // addr1 (DA) = client
+    f.extend_from_slice(client);
+    // addr2 (SA) = our BSSID
+    f.extend_from_slice(bssid);
+    // addr3 (BSSID) = our BSSID
+    f.extend_from_slice(bssid);
+    // Seq ctrl
+    f.push(0x00); f.push(0x00);
+    // Auth fixed params:
+    // Auth algo = 0 (Open System)
+    f.push(0x00); f.push(0x00);
+    // Auth seq = 2 (response)
+    f.push(0x02); f.push(0x00);
+    // Status = 0 (success)
+    f.push(0x00); f.push(0x00);
+    f
+}
+
+/// Build an 802.11 Probe Response
+fn build_probe_response(bssid: &[u8; 6], client: &[u8; 6], ssid: &str, channel: u8, beacon_interval: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(256);
+    // FC: type=0(mgmt), subtype=5(probe response)
+    f.push(0x50); f.push(0x00);
+    // Duration
+    f.push(0x00); f.push(0x00);
+    // addr1 (DA) = requesting client
+    f.extend_from_slice(client);
+    // addr2 (SA) = our BSSID
+    f.extend_from_slice(bssid);
+    // addr3 (BSSID) = our BSSID
+    f.extend_from_slice(bssid);
+    // Seq ctrl
+    f.push(0x00); f.push(0x00);
+
+    // Fixed params (same as beacon)
+    // Timestamp (8 bytes)
+    f.extend_from_slice(&[0u8; 8]);
+    // Beacon interval
+    f.extend_from_slice(&beacon_interval.to_le_bytes());
+    // Capability: ESS + short preamble
+    f.extend_from_slice(&[0x21, 0x00]);
+
+    // Tagged parameters
+    // SSID
+    f.push(0x00);
+    f.push(ssid.len().min(32) as u8);
+    f.extend_from_slice(&ssid.as_bytes()[..ssid.len().min(32)]);
+
+    // Supported Rates
+    let rates: &[u8] = if channel > 14 {
+        &[0x0C, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6C]
+    } else {
+        &[0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24]
+    };
+    f.push(0x01);
+    f.push(rates.len() as u8);
+    f.extend_from_slice(rates);
+
+    // DS Parameter
+    f.push(0x03); f.push(0x01); f.push(channel);
+
+    f
+}
+
+/// Build an 802.11 Association Response (status=success, AID=1)
+fn build_assoc_response(bssid: &[u8; 6], client: &[u8; 6], channel: u8) -> Vec<u8> {
+    let mut f = Vec::with_capacity(128);
+    // FC: type=0(mgmt), subtype=1(assoc response)
+    f.push(0x10); f.push(0x00);
+    // Duration
+    f.push(0x00); f.push(0x00);
+    // addr1 (DA) = client
+    f.extend_from_slice(client);
+    // addr2 (SA) = our BSSID
+    f.extend_from_slice(bssid);
+    // addr3 (BSSID) = our BSSID
+    f.extend_from_slice(bssid);
+    // Seq ctrl
+    f.push(0x00); f.push(0x00);
+
+    // Fixed params:
+    // Capability: ESS + short preamble
+    f.extend_from_slice(&[0x21, 0x00]);
+    // Status = 0 (success)
+    f.push(0x00); f.push(0x00);
+    // AID = 1 (bit 14-15 must be set per spec: 0xC001)
+    f.push(0x01); f.push(0xC0);
+
+    // Supported Rates
+    let rates: &[u8] = if channel > 14 {
+        &[0x0C, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6C]
+    } else {
+        &[0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24]
+    };
+    f.push(0x01);
+    f.push(rates.len() as u8);
+    f.extend_from_slice(rates);
+
+    f
 }
