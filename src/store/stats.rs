@@ -26,6 +26,16 @@ pub struct ChannelStats {
     pub last_update: Instant,
     pub(crate) frame_count_at_dwell_start: u64,
     pub(crate) dwell_start: Instant,
+    /// MIB survey: channel busy time in microseconds (last dwell).
+    pub busy_us: u32,
+    /// MIB survey: TX airtime in microseconds (last dwell).
+    pub tx_us: u32,
+    /// MIB survey: RX airtime in microseconds (last dwell).
+    pub rx_us: u32,
+    /// MIB survey: OBSS (other BSS) airtime in microseconds (last dwell).
+    pub obss_us: u32,
+    /// Channel utilization percentage (busy_us / dwell_time_us * 100).
+    pub utilization_pct: f32,
 }
 
 /// Encode (channel, band) into a u16 key for HashMap lookups.
@@ -52,6 +62,11 @@ impl ChannelStats {
             last_update: now,
             frame_count_at_dwell_start: 0,
             dwell_start: now,
+            busy_us: 0,
+            tx_us: 0,
+            rx_us: 0,
+            obss_us: 0,
+            utilization_pct: 0.0,
         }
     }
 

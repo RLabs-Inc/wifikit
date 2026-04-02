@@ -373,6 +373,25 @@ impl SharedAdapter {
         adapter.driver.supported_bands()
     }
 
+    /// Read per-channel survey data (busy/tx/rx/obss time in microseconds).
+    /// Works in normal mode — no testmode needed.
+    pub fn survey_read(&self, band_idx: u8) -> Result<crate::core::chip::ChannelSurvey> {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Ok(crate::core::chip::ChannelSurvey::default());
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.driver.survey_read(band_idx)
+    }
+
+    /// Reset survey counters to start fresh measurement.
+    pub fn survey_reset(&self, band_idx: u8) -> Result<()> {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.driver.survey_reset(band_idx)
+    }
+
     // ── RX thread lifecycle ──
     //
     // The RX thread can be stopped and restarted without affecting the adapter.
