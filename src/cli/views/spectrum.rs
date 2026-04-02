@@ -689,6 +689,326 @@ pub fn render_spectrum_mini(data: &SpectrumData, width: usize) -> String {
     result
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SpectrumModule — Module trait implementation for spectrum analyzer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::adapter::SharedAdapter;
+use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyle};
+
+/// SpectrumModule runs the spectrum analyzer as an independent module
+/// on its own adapter (MT7921AU with testmode support).
+///
+/// Background thread hops channels, reads MIB survey registers per channel,
+/// captures frames for RSSI data, and feeds SpectrumData via Arc<Mutex>.
+/// The UI thread reads the snapshot for rendering.
+pub struct SpectrumModule {
+    /// Shared spectrum data — written by background thread, read by UI.
+    data: Arc<Mutex<SpectrumData>>,
+    /// Background thread running flag.
+    running: Arc<AtomicBool>,
+    /// Background thread done flag.
+    done: Arc<AtomicBool>,
+    /// Start time for elapsed display.
+    start_time: Instant,
+    /// Scroll offset for the AP table.
+    scroll_offset: usize,
+    /// Round counter.
+    round: Arc<std::sync::atomic::AtomicU32>,
+    /// Channel count for status display.
+    channel_count: usize,
+}
+
+impl SpectrumModule {
+    pub fn new() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(SpectrumData::new(&[]))),
+            running: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+            start_time: Instant::now(),
+            scroll_offset: 0,
+            round: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            channel_count: 0,
+        }
+    }
+}
+
+impl Module for SpectrumModule {
+    fn name(&self) -> &str { "spectrum" }
+    fn description(&self) -> &str { "RF spectrum analyzer — MIB survey + braille display" }
+    fn module_type(&self) -> ModuleType { ModuleType::Attack } // uses Attack lifecycle (auto-pop on done)
+
+    fn start(&mut self, shared: SharedAdapter) {
+        self.start_time = Instant::now();
+        self.running.store(true, Ordering::SeqCst);
+        self.done.store(false, Ordering::SeqCst);
+        self.round.store(0, Ordering::SeqCst);
+
+        let data = Arc::clone(&self.data);
+        let running = Arc::clone(&self.running);
+        let done = Arc::clone(&self.done);
+        let round = Arc::clone(&self.round);
+
+        std::thread::Builder::new()
+            .name("spectrum".into())
+            .spawn(move || {
+                spectrum_thread(shared, data, running, done, round);
+            })
+            .expect("failed to spawn spectrum thread");
+    }
+
+    fn signal_stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
+    }
+
+    fn views(&self) -> &[ViewDef] {
+        &[] // single view, no tabs
+    }
+
+    fn render(&mut self, _view: usize, width: u16, height: u16) -> Vec<String> {
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.channel_count = data.measurements.len();
+
+        // Build a minimal ScanSnapshot for the panel renderer (no APs — spectrum has its own data)
+        let snap = ScanSnapshot {
+            stats: crate::store::ScanStats {
+                frames_per_sec: 0,
+                round: self.round.load(Ordering::SeqCst),
+                elapsed: self.start_time.elapsed(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        render_spectrum_panel(&data, &snap, width, height, self.scroll_offset)
+    }
+
+    fn handle_key(&mut self, key: &prism::KeyEvent, _view: usize) -> bool {
+        if key.ctrl || key.meta { return false; }
+        match key.key.as_str() {
+            "m" => {
+                let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+                data.cycle_mode();
+                true
+            }
+            "p" => {
+                let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+                data.display_mode = SpectrumDisplayMode::Peak;
+                true
+            }
+            "a" => {
+                let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+                data.display_mode = SpectrumDisplayMode::Average;
+                true
+            }
+            "c" => {
+                let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+                data.display_mode = SpectrumDisplayMode::Current;
+                true
+            }
+            "j" | "down" => { self.scroll_offset = self.scroll_offset.saturating_add(1); true }
+            "k" | "up" => { self.scroll_offset = self.scroll_offset.saturating_sub(1); true }
+            "g" => { self.scroll_offset = 0; true }
+            "G" => { self.scroll_offset = usize::MAX; true }
+            _ => false,
+        }
+    }
+
+    fn status_segments(&self) -> Vec<StatusSegment> {
+        if !self.running.load(Ordering::SeqCst) && self.done.load(Ordering::SeqCst) {
+            return vec![];
+        }
+
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let total_frames: u32 = data.measurements.iter().map(|m| m.frame_count).sum();
+        let round = self.round.load(Ordering::SeqCst);
+        let mode = data.mode_label();
+        let elapsed = self.start_time.elapsed();
+
+        let mut segs = vec![
+            StatusSegment::new("spectrum", SegmentStyle::CyanBold),
+            StatusSegment::new(
+                format!("{} ch", data.measurements.len()),
+                SegmentStyle::Bold,
+            ),
+        ];
+        if round > 0 {
+            segs.push(StatusSegment::new(format!("r:{}", round), SegmentStyle::Dim));
+        }
+        if total_frames > 0 {
+            segs.push(StatusSegment::new(
+                format!("{} frames", prism::format_number(total_frames as u64)),
+                SegmentStyle::Yellow,
+            ));
+        }
+        segs.push(StatusSegment::new(format!("[{}]", mode), SegmentStyle::Bold));
+        segs.push(StatusSegment::new(
+            format!("{:.0}s", elapsed.as_secs_f64()),
+            SegmentStyle::Dim,
+        ));
+        segs
+    }
+
+    fn freeze_summary(&self, width: u16) -> Vec<String> {
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let total_frames: u32 = data.measurements.iter().map(|m| m.frame_count).sum();
+        let round = self.round.load(Ordering::SeqCst);
+        let elapsed = self.start_time.elapsed();
+
+        // Find busiest channel
+        let busiest = data.measurements.iter()
+            .filter(|m| m.busy_us > 0)
+            .max_by(|a, b| a.utilization_pct.partial_cmp(&b.utilization_pct).unwrap_or(std::cmp::Ordering::Equal));
+        let busiest_str = if let Some(m) = busiest {
+            format!("ch{} ({:.1}% util, {}us busy)", m.channel.number, m.utilization_pct, m.busy_us)
+        } else {
+            "none".to_string()
+        };
+
+        let content = format!(
+            "Channels: {}\nRounds: {}\nFrames: {}\nDuration: {:.1}s\nBusiest: {}",
+            data.measurements.len(),
+            round,
+            prism::format_number(total_frames as u64),
+            elapsed.as_secs_f64(),
+            busiest_str,
+        );
+
+        let frame_width = (width as usize).saturating_sub(4);
+        let framed = prism::frame(&content, &prism::FrameOptions {
+            border: prism::BorderStyle::Rounded,
+            title: Some("Spectrum Analyzer Complete".into()),
+            width: Some(frame_width),
+            ..Default::default()
+        });
+
+        let mut lines = Vec::new();
+        lines.push(String::new());
+        for line in framed.lines() {
+            lines.push(format!("  {}", line));
+        }
+        lines.push(String::new());
+        lines
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Spectrum background thread
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Background thread: hops channels, reads MIB survey + captures frames.
+fn spectrum_thread(
+    shared: SharedAdapter,
+    data: Arc<Mutex<SpectrumData>>,
+    running: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    round: Arc<std::sync::atomic::AtomicU32>,
+) {
+    let channels = shared.supported_channels();
+    if channels.is_empty() {
+        done.store(true, Ordering::SeqCst);
+        running.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // Initialize SpectrumData with all supported channels
+    {
+        let mut d = data.lock().unwrap_or_else(|e| e.into_inner());
+        *d = SpectrumData::new(&channels);
+    }
+
+    let settle_time = shared.channel_settle_time();
+    let dwell_time = Duration::from_millis(300); // shorter dwell for spectrum — we want responsiveness
+
+    // Main sweep loop
+    while running.load(Ordering::SeqCst) {
+        let mut prev_band_idx: u8 = 0;
+
+        for ch in &channels {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let band_idx = match ch.band {
+                Band::Band2g => 0u8,
+                Band::Band5g => 1,
+                Band::Band6g => 2,
+            };
+
+            // Reset MIB counters before dwelling on this channel
+            let _ = shared.survey_reset(band_idx);
+
+            // Switch channel
+            if shared.set_channel_full(*ch).is_err() {
+                continue;
+            }
+
+            // Wait for PHY settle + dwell
+            // Survey counters accumulate RF energy during this dwell period
+            let total_wait = settle_time + dwell_time;
+            let slice = Duration::from_millis(50);
+            let dwell_start = Instant::now();
+            while dwell_start.elapsed() < total_wait && running.load(Ordering::SeqCst) {
+                std::thread::sleep(slice.min(total_wait.saturating_sub(dwell_start.elapsed())));
+            }
+
+            // Read MIB survey after dwell — this is the real spectrum data
+            let survey = shared.survey_read(band_idx).ok();
+            let dwell_us = dwell_start.elapsed().as_micros() as f32;
+
+            // Update SpectrumData with survey results
+            {
+                let mut d = data.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref s) = survey {
+                    if let Some(m) = d.measurements.iter_mut()
+                        .find(|m| m.channel.number == ch.number)
+                    {
+                        m.busy_us = s.busy_us;
+                        m.tx_us = s.tx_us;
+                        m.rx_us = s.rx_us;
+                        m.obss_us = s.obss_us;
+                        m.frame_count += 1; // count survey reads as "frames"
+
+                        if dwell_us > 0.0 {
+                            m.utilization_pct = (s.busy_us as f32 / dwell_us) * 100.0;
+                        }
+
+                        // Convert busy_us to a pseudo-RSSI for the braille graph
+                        // More busy = stronger signal presence on this channel
+                        // Scale: 0us=-100dBm, 300000us(full dwell)=-20dBm
+                        let busy_ratio = (s.busy_us as f32 / dwell_us).min(1.0);
+                        let pseudo_rssi = -100.0 + (busy_ratio * 80.0); // -100 to -20
+                        d.update_rssi(ch.number, pseudo_rssi as i16);
+                    }
+                }
+            }
+
+            prev_band_idx = band_idx;
+        }
+
+        // Completed one round
+        round.fetch_add(1, Ordering::SeqCst);
+    }
+
+    running.store(false, Ordering::SeqCst);
+    done.store(true, Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,6 +17,7 @@ pub mod wpa3;
 pub mod ap;
 pub mod frag;
 pub mod export;
+pub mod spectrum;
 pub mod help;
 
 use std::sync::{Arc, Mutex};
