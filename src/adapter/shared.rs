@@ -355,6 +355,16 @@ impl SharedAdapter {
         adapter.driver.channel_settle_time()
     }
 
+    /// Recommended dwell time per channel for scanning.
+    /// Chipset drivers override this based on their channel switch speed.
+    pub fn scan_dwell_time(&self) -> Duration {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Duration::from_millis(500);
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.driver.scan_dwell_time()
+    }
+
     /// Get supported channels from the chipset driver.
     pub fn supported_channels(&self) -> Vec<Channel> {
         if self.inner.shut_down.load(Ordering::SeqCst) {
@@ -625,6 +635,14 @@ fn start_rx_thread(
                             // MCU responses go directly to driver — no parsing needed
                             if let Some(ref tx) = rx_handle.driver_msg_tx {
                                 let _ = tx.send(msg);
+                            }
+                        }
+                        crate::core::chip::ParsedPacket::TxStatus(txs) => {
+                            // TX status report — ACK feedback for injected frames.
+                            // Route through driver message channel for now; the driver
+                            // can distinguish TXS from MCU responses by pkt_type in DW0.
+                            if let Some(ref tx) = rx_handle.driver_msg_tx {
+                                let _ = tx.send(txs);
                             }
                         }
                         crate::core::chip::ParsedPacket::Skip => {}

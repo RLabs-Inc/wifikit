@@ -263,6 +263,17 @@ pub trait ChipDriver: Send {
         Duration::from_millis(10)
     }
 
+    /// Recommended dwell time per channel during scanning.
+    ///
+    /// Fast-switching adapters (register-based PLL, <5ms switch) use 500ms.
+    /// Slow-switching adapters (MCU firmware command, 140-500ms switch) use longer
+    /// dwell to amortize the expensive switch cost and capture more STA traffic.
+    ///
+    /// Default: 500ms. Override for slow-switching chipsets.
+    fn scan_dwell_time(&self) -> Duration {
+        Duration::from_millis(500)
+    }
+
     /// Which bands this adapter supports. Derived from supported_channels().
     /// Used by the scanner to auto-enable band scanning.
     fn supported_bands(&self) -> Vec<Band> {
@@ -329,6 +340,39 @@ pub trait ChipDriver: Send {
         Err(crate::core::Error::NotSupported("test mode freq offset not supported".into()))
     }
 
+    /// Set TX antenna mask in test mode. mask: 0x1=ant0, 0x2=ant1, 0x3=both
+    fn testmode_set_tx_antenna(&mut self, _mask: u32) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode antenna control not supported".into()))
+    }
+
+    /// Set system bandwidth in test mode. bw: 0=20, 1=40, 2=80
+    fn testmode_set_system_bw(&mut self, _bw: u32) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode BW control not supported".into()))
+    }
+
+    /// Configure and start burst TX in test mode.
+    fn testmode_burst_tx(&mut self,
+        _channel: u32, _bw: u32, _rate_mode: u32, _nss: u32,
+        _power_half_dbm: u32, _pkt_count: u32, _ipg_us: u32,
+    ) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode burst TX not supported".into()))
+    }
+
+    /// Enable/disable continuous TX (CW tone — no gaps).
+    fn testmode_set_tx_continuous(&mut self, _enable: bool) -> Result<()> {
+        Err(crate::core::Error::NotSupported("test mode continuous TX not supported".into()))
+    }
+
+    /// Query chip temperature from firmware thermal sensor.
+    fn testmode_get_temperature(&mut self) -> Result<(u32, u32)> {
+        Err(crate::core::Error::NotSupported("test mode temperature query not supported".into()))
+    }
+
+    /// Query RX statistics (packet count, FCS error count).
+    fn testmode_get_rx_stats(&mut self) -> Result<(u32, u32)> {
+        Err(crate::core::Error::NotSupported("test mode RX stats not supported".into()))
+    }
+
     // ── RX split support (pipeline architecture) ──
 
     /// Extract the USB device handle for dedicated RX thread use.
@@ -350,7 +394,7 @@ pub trait ChipDriver: Send {
 ///
 /// Adapters return different variants depending on what the packet contains:
 /// - Register-based chips (RTL): only Frame and Skip
-/// - MCU-based chips (MediaTek): Frame, DriverMessage, and Skip
+/// - MCU-based chips (MediaTek): Frame, DriverMessage, TxStatus, and Skip
 pub enum ParsedPacket {
     /// A valid 802.11 frame — feed to the FramePipeline.
     Frame(RxFrame),
@@ -358,7 +402,11 @@ pub enum ParsedPacket {
     /// The RX thread forwards this to the driver via `driver_msg_tx`.
     /// Only MCU-based adapters produce this variant.
     DriverMessage(Vec<u8>),
-    /// Uninteresting packet (TX status, TX/RX vector, etc.) — drop silently.
+    /// TX status report — tells whether an injected frame was ACKed.
+    /// Firmware reports this for every transmitted frame when REPORTS_TX_ACK_STATUS is set.
+    /// Contains the raw TXS packet for driver-specific parsing.
+    TxStatus(Vec<u8>),
+    /// Uninteresting packet (TX/RX vector, timer report, etc.) — drop silently.
     Skip,
 }
 

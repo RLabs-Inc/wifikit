@@ -60,7 +60,8 @@ pub struct ScanConfig {
     /// Scan 6 GHz channels (WiFi 6E, requires capable adapter). Default: false.
     pub scan_6ghz: bool,
 
-    /// Active scan — send probe requests on each channel. Default: false (passive).
+    /// Active scan — send probe requests on each channel. Default: true.
+    /// Use --passive for stealth mode (no TX, receive only).
     pub active: bool,
 
     /// Override default channel list. None = use defaults for enabled bands.
@@ -79,7 +80,7 @@ impl Default for ScanConfig {
             scan_2ghz: true,
             scan_5ghz: true,
             scan_6ghz: false,
-            active: false,
+            active: true,
             custom_channels: None,
             channel_settle: Duration::from_millis(5),
         }
@@ -284,16 +285,26 @@ impl Scanner {
                     std::thread::sleep(settle_time);
                 }
 
-                // Active scan: send broadcast probe request.
+                // Dwell on this channel.
+                // Active scan probe is sent AFTER dwell — see below.
+                self.dwell();
+
+                // Active scan: send broadcast probe request at END of dwell.
+                // Why end, not beginning? The probe triggers every AP on the channel
+                // to respond with a full probe response frame. Sending at the start
+                // floods the USB RX buffer with probe responses, displacing STA data
+                // frames. By sending at the end, we get clean STA capture during the
+                // dwell, and the probe responses arrive on the NEXT channel visit
+                // (or are captured by the tail of this dwell if any time remains).
                 if self.config.active {
                     if let Some(probe) = frames::build_probe_request(&mac, "", &[]) {
-                        let opts = TxOptions::default();
+                        let opts = TxOptions {
+                            retries: 1,
+                            ..Default::default()
+                        };
                         let _ = shared.tx_frame(&probe, &opts);
                     }
                 }
-
-                // Dwell on this channel.
-                self.dwell();
             }
 
             // Completed one full round through all channels.
@@ -371,7 +382,7 @@ mod tests {
         assert!(cfg.scan_2ghz);
         assert!(cfg.scan_5ghz);
         assert!(!cfg.scan_6ghz);
-        assert!(!cfg.active);
+        assert!(cfg.active);
         assert!(cfg.custom_channels.is_none());
         assert_eq!(cfg.channel_settle, Duration::from_millis(5)); // still in config for backward compat
     }

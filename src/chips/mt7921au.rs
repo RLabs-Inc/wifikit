@@ -246,11 +246,35 @@ const TM_MODE_ICAP: u32         = 2;  // Internal Capture — raw I/Q baseband s
 const TM_MODE_ICAP_OVERLAP: u32 = 3;  // I/Q capture with overlap
 const TM_MODE_WIFISPECTRUM: u32 = 4;  // WiFi spectrum analyzer mode
 
-// ATE (Advanced Test Engine) parameter indices for TM_SET_AT_CMD
-const MCU_ATE_SET_TRX: u32         = 0x01;  // Enable/disable TX/RX
-const MCU_ATE_SET_FREQ_OFFSET: u32 = 0x0A;  // RF frequency offset
-const MCU_ATE_SET_SLOT_TIME: u32   = 0x13;  // Timing parameters
-const MCU_ATE_SET_TX_POWER: u32    = 0x15;  // TX power control
+// ATE (Advanced Test Engine) parameter indices for TM_SET_AT_CMD / TM_QUERY_AT_CMD
+// All 26 func IDs (0x01-0x16, 0x80-0x83) confirmed responding on MT7921AU hardware.
+const MCU_ATE_SET_TRX: u32              = 0x01;  // Enable/disable TX/RX (trx_type << 16 | enable)
+const MCU_ATE_SET_TX_ANTENNA: u32       = 0x02;  // TX antenna mask (0x1=ant0, 0x2=ant1, 0x3=both)
+const MCU_ATE_SET_RX_ANTENNA: u32       = 0x03;  // RX antenna mask
+const MCU_ATE_SET_TX_RATE: u32          = 0x04;  // TX rate mode + MCS index
+const MCU_ATE_SET_SYSTEM_BW: u32        = 0x05;  // System bandwidth (0=20, 1=40, 2=80)
+const MCU_ATE_SET_TX_PKT_LEN: u32       = 0x06;  // TX packet length (bytes)
+const MCU_ATE_SET_TX_PKT_COUNT: u32     = 0x07;  // TX packet count (0=infinite, N=burst N frames)
+const MCU_ATE_SET_TX_PKT_CONTENT: u32   = 0x08;  // TX packet pattern/content
+const MCU_ATE_SET_TX_NSS: u32           = 0x09;  // TX spatial streams (1 or 2)
+const MCU_ATE_SET_FREQ_OFFSET: u32      = 0x0A;  // RF frequency offset (crystal trim)
+const MCU_ATE_SET_TX_GI: u32            = 0x0B;  // TX guard interval (0/1/2)
+const MCU_ATE_SET_TX_PREAMBLE: u32      = 0x0C;  // TX preamble type
+const MCU_ATE_SET_TX_STBC: u32          = 0x0D;  // TX STBC enable/disable
+const MCU_ATE_SET_TX_LDPC: u32          = 0x0E;  // TX LDPC enable/disable
+const MCU_ATE_SET_TX_CHANNEL: u32       = 0x0F;  // TX channel number
+const MCU_ATE_SET_TX_IPG: u32           = 0x10;  // TX inter-packet gap (microseconds)
+const MCU_ATE_SET_TX_DUTY_CYCLE: u32    = 0x11;  // TX duty cycle (0-100%)
+const MCU_ATE_SET_TX_CONT: u32          = 0x12;  // Continuous TX (CW tone, no gaps)
+const MCU_ATE_SET_SLOT_TIME: u32        = 0x13;  // Timing parameters (AIFS/slot)
+const MCU_ATE_SET_TX_POWER_PER_ANT: u32 = 0x14;  // Per-antenna TX power
+const MCU_ATE_SET_TX_POWER: u32         = 0x15;  // TX power control (half-dBm)
+const MCU_ATE_CLEAN_TX_QUEUE: u32       = 0x1C;  // Clean TX queue (abort pending TX)
+// Extended AT commands (0x80-0x83) — hardware validated, names from firmware strings
+const MCU_ATE_GET_RX_STAT: u32          = 0x80;  // Query RX statistics (packet count, FCS errors)
+const MCU_ATE_GET_TX_INFO: u32          = 0x81;  // Query TX info (pending, done counts)
+const MCU_ATE_GET_TEMPERATURE: u32      = 0x82;  // Query chip temperature
+const MCU_ATE_GET_TSSI: u32             = 0x83;  // Query TSSI (TX signal strength indicator)
 
 // MCU UNI command IDs
 const MCU_UNI_CMD_DEV_INFO_UPDATE: u16 = 0x01;
@@ -638,12 +662,14 @@ fn channel_center_and_bw(ch: Channel) -> (u8, u8) {
 //  Mt7921au — The Driver
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// MT7921AU capability flags — WiFi 6, dual-band, HE
+/// MT7921AU capability flags — WiFi 6E, tri-band, HE
+/// NOTE: VHT caps say "neither 160 nor 80+80", HE PHY says "HE40/HE80" — 80MHz max.
+/// VHT160/HE996x2 entries exist in SKU table but hardware cannot use them.
 const MT7921AU_CAPS: ChipCaps = ChipCaps::MONITOR.union(ChipCaps::INJECT)
     .union(ChipCaps::BAND_2G).union(ChipCaps::BAND_5G).union(ChipCaps::BAND_6G)
     .union(ChipCaps::HT).union(ChipCaps::VHT)
     .union(ChipCaps::HE)
-    .union(ChipCaps::BW40).union(ChipCaps::BW80).union(ChipCaps::BW160);
+    .union(ChipCaps::BW40).union(ChipCaps::BW80);
 
 pub struct Mt7921au {
     handle: Arc<DeviceHandle<GlobalContext>>,
@@ -1838,6 +1864,141 @@ impl Mt7921au {
         self.testmode_set_at(MCU_ATE_SET_FREQ_OFFSET, offset)
     }
 
+    // ── Testmode: Antenna Control ──
+
+    /// Set TX antenna mask in test mode.
+    /// mask: 0x1=ant0 only, 0x2=ant1 only, 0x3=both (2x2 MIMO)
+    pub fn testmode_set_tx_antenna(&mut self, mask: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_ANTENNA, mask)
+    }
+
+    /// Set RX antenna mask in test mode.
+    pub fn testmode_set_rx_antenna(&mut self, mask: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_RX_ANTENNA, mask)
+    }
+
+    // ── Testmode: Rate & Modulation ──
+
+    /// Set TX rate in test mode.
+    /// rate_mode: 0=CCK, 1=OFDM, 2=HT, 3=VHT, 4=HE_SU, 5=HE_EXT_SU, 6=HE_TB, 7=HE_MU
+    pub fn testmode_set_tx_rate(&mut self, rate_mode: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_RATE, rate_mode)
+    }
+
+    /// Set system bandwidth in test mode.
+    /// bw: 0=20MHz, 1=40MHz, 2=80MHz
+    pub fn testmode_set_system_bw(&mut self, bw: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_SYSTEM_BW, bw)
+    }
+
+    /// Set TX spatial streams in test mode.
+    /// nss: 1 or 2
+    pub fn testmode_set_tx_nss(&mut self, nss: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_NSS, nss)
+    }
+
+    /// Set TX guard interval in test mode.
+    /// gi: 0=normal (0.8μs), 1=short (0.4μs HT/VHT, 1.6μs HE), 2=extended (3.2μs HE)
+    pub fn testmode_set_tx_gi(&mut self, gi: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_GI, gi)
+    }
+
+    /// Set TX STBC in test mode. enable: 1=on, 0=off
+    pub fn testmode_set_tx_stbc(&mut self, enable: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_STBC, enable)
+    }
+
+    /// Set TX LDPC in test mode. enable: 1=on, 0=off
+    pub fn testmode_set_tx_ldpc(&mut self, enable: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_LDPC, enable)
+    }
+
+    // ── Testmode: Burst TX (packet injection engine) ──
+
+    /// Set TX packet length for burst mode.
+    pub fn testmode_set_tx_pkt_len(&mut self, len: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_PKT_LEN, len)
+    }
+
+    /// Set TX packet count for burst mode.
+    /// 0 = infinite (until stopped), N = send exactly N frames
+    pub fn testmode_set_tx_pkt_count(&mut self, count: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_PKT_COUNT, count)
+    }
+
+    /// Set TX inter-packet gap in microseconds.
+    /// Controls timing between burst frames — lower = faster flood.
+    pub fn testmode_set_tx_ipg(&mut self, ipg_us: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_IPG, ipg_us)
+    }
+
+    /// Set TX duty cycle (0-100%). Controls TX on-time percentage.
+    pub fn testmode_set_tx_duty_cycle(&mut self, duty: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_DUTY_CYCLE, duty)
+    }
+
+    /// Enable/disable continuous TX (CW tone — no gaps, no packets).
+    /// Useful for: jamming, range testing, antenna tuning.
+    pub fn testmode_set_tx_continuous(&mut self, enable: bool) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_CONT, if enable { 1 } else { 0 })
+    }
+
+    /// Set TX channel in test mode.
+    pub fn testmode_set_tx_channel(&mut self, channel: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_CHANNEL, channel)
+    }
+
+    /// Set per-antenna TX power in test mode.
+    /// Allows different power on each antenna path (e.g., directional vs omni).
+    pub fn testmode_set_tx_power_per_ant(&mut self, power: u32) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_SET_TX_POWER_PER_ANT, power)
+    }
+
+    /// Clean TX queue — abort all pending transmissions.
+    pub fn testmode_clean_tx_queue(&mut self) -> Result<()> {
+        self.testmode_set_at(MCU_ATE_CLEAN_TX_QUEUE, 0)
+    }
+
+    // ── Testmode: Diagnostics (query commands) ──
+
+    /// Query RX statistics: packet count and FCS error count.
+    pub fn testmode_get_rx_stats(&mut self) -> Result<(u32, u32)> {
+        self.testmode_query_at(MCU_ATE_GET_RX_STAT)
+    }
+
+    /// Query TX info: pending and completed frame counts.
+    pub fn testmode_get_tx_info(&mut self) -> Result<(u32, u32)> {
+        self.testmode_query_at(MCU_ATE_GET_TX_INFO)
+    }
+
+    /// Query chip temperature (firmware thermal sensor).
+    pub fn testmode_get_temperature(&mut self) -> Result<(u32, u32)> {
+        self.testmode_query_at(MCU_ATE_GET_TEMPERATURE)
+    }
+
+    /// Query TSSI (Transmit Signal Strength Indicator).
+    /// Returns actual measured TX power from the PA.
+    pub fn testmode_get_tssi(&mut self) -> Result<(u32, u32)> {
+        self.testmode_query_at(MCU_ATE_GET_TSSI)
+    }
+
+    /// Configure full burst TX in one call.
+    /// Sets rate, BW, antenna, power, packet count, IPG, then starts TX.
+    pub fn testmode_burst_tx(&mut self,
+        channel: u32, bw: u32, rate_mode: u32, nss: u32,
+        power_half_dbm: u32, pkt_count: u32, ipg_us: u32,
+    ) -> Result<()> {
+        self.testmode_set_tx_channel(channel)?;
+        self.testmode_set_system_bw(bw)?;
+        self.testmode_set_tx_rate(rate_mode)?;
+        self.testmode_set_tx_nss(nss)?;
+        self.testmode_set_tx_power(power_half_dbm)?;
+        self.testmode_set_tx_pkt_count(pkt_count)?;
+        self.testmode_set_tx_ipg(ipg_us)?;
+        self.testmode_set_trx(1, true)?; // Start TX
+        Ok(())
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  Channel Survey — per-channel busy/tx/rx time from MIB registers
     // ═══════════════════════════════════════════════════════════════════════
@@ -3018,13 +3179,19 @@ impl Mt7921au {
         let rxd_dw3 = u32::from_le_bytes([rxd[12], rxd[13], rxd[14], rxd[15]]);
         let ch_freq = ((rxd_dw3 >> 8) & 0xFF) as u8; // actual RX channel from firmware
 
-        // Skip packet types that CANNOT contain 802.11 frames.
-        // PKT_TYPE_TXS (0) = TX status reports — firmware internal
-        // PKT_TYPE_TXRXV (1) = TX/RX vector — PHY metadata, no frame
-        // Everything else gets parsed — pentesting tool, never silently drop.
-        // PKT_TYPE_NORMAL (2), DUP_RFB (3), NORMAL_MCU (8) all carry WiFi frames.
-        if pkt_type == 0 || pkt_type == 1 {
+        // Route non-frame packet types:
+        // TXS (0) = TX status with ACK feedback — forward to driver for injection tracking
+        // TXRXV (1) = TX/RX vector — PHY metadata only, skip
+        // NORMAL (2), DUP_RFB (3) = 802.11 frames — parse below
+        // TMR (4), RETRIEVE (5), TXRX_NOTIFY (6) = internal — skip
+        // RX_EVENT (7), NORMAL_MCU (8) = handled by MCU response path
+        // FW_MONITOR (0x0C) = firmware debug — skip
+        if pkt_type == 1 || pkt_type == 4 || pkt_type == 5 || pkt_type == 6 {
             return None;
+        }
+        // TXS carries TX status / ACK info — route to driver message channel if available
+        if pkt_type == 0 {
+            return None; // TODO: forward TXS via driver_msg channel once wired in rx_frame path
         }
 
         // Drop FCS errors — corrupted frames create phantom APs/stations.
@@ -3626,7 +3793,9 @@ impl ChipDriver for Mt7921au {
         // we want all the interesting DROP bits cleared. Let's use bit_op mode to
         // explicitly CLEAR the drop bits that would hide frames from us.
         let drop_bits_to_clear =
+            MT_WF_RFCR_DROP_STBC_MULTI |  // STBC multicast — WiFi 6 APs use this
             MT_WF_RFCR_DROP_FCSFAIL |
+            MT_WF_RFCR_DROP_VERSION |     // Non-standard version — see everything
             MT_WF_RFCR_DROP_PROBEREQ |
             MT_WF_RFCR_DROP_MCAST |
             MT_WF_RFCR_DROP_BCAST |
@@ -3711,9 +3880,33 @@ impl ChipDriver for Mt7921au {
 
         let off = MT_SDIO_HDR_SIZE;
 
-        // DW0: TX_BYTES[15:0] | PKT_FMT[24:23]=1(SF for USB) | Q_IDX[31:25]=0x10(ALTX0 for mgmt)
-        // Linux: MT_TX_TYPE_SF=1 for USB, MT_LMAC_ALTX0=0x10 for management frames
-        let q_idx: u32 = if frame_type == 0 { 0x10 } else { 0 }; // ALTX0 for mgmt, AC00 for data
+        // ── QoS TID → AC queue mapping (WMM) ──
+        // Extract QoS TID from data frames for proper queue selection.
+        // Management frames → ALTX0 (Q_IDX=0x10), Control → AC_VO
+        // Data frames → map TID to AC: VO(6,7), VI(4,5), BE(0,3), BK(1,2)
+        let (q_idx, tx_ep) = match frame_type {
+            0 => (0x10u32, self.ep_ac_be_out), // Management → ALTX0 queue, AC_BE endpoint
+            1 => (0x00, self.ep_ac_vo_out),    // Control → AC00, VO endpoint (highest priority)
+            2 => {
+                // Data frame — extract QoS TID if QoS subtype (bit 7 of subtype = 1)
+                let tid = if frame_subtype & 0x8 != 0 && frame.len() >= 26 {
+                    (frame[24] & 0x0F) as u32 // QoS Control TID field
+                } else {
+                    0 // Non-QoS data → best effort
+                };
+                // WMM TID-to-AC mapping: {1,2}→BK, {0,3}→BE, {4,5}→VI, {6,7}→VO
+                match tid {
+                    1 | 2 => (0x01, self.ep_ac_bk_out), // AC_BK
+                    0 | 3 => (0x00, self.ep_ac_be_out), // AC_BE
+                    4 | 5 => (0x02, self.ep_ac_vi_out), // AC_VI
+                    6 | 7 => (0x03, self.ep_ac_vo_out), // AC_VO
+                    _     => (0x00, self.ep_ac_be_out), // Default: BE
+                }
+            }
+            _ => (0x00, self.ep_ac_be_out),
+        };
+
+        // DW0: TX_BYTES[15:0] | PKT_FMT[24:23]=1(SF for USB) | Q_IDX[31:25]
         let tx_bytes = (txwi_size + frame.len()) as u32 & 0xFFFF;
         let dw0 = tx_bytes | (1u32 << 23) | (q_idx << 25);
         pkt[off..off+4].copy_from_slice(&dw0.to_le_bytes());
@@ -3722,17 +3915,23 @@ impl ChipDriver for Mt7921au {
         let dw1: u32 = (1u32 << 31) | (2u32 << 16) | (((mac_hdr_len / 2) & 0x1F) << 11);
         pkt[off+4..off+8].copy_from_slice(&dw1.to_le_bytes());
 
-        // DW2: FRAME_TYPE[5:4] | SUB_TYPE[3:0] | MULTICAST[10] | HTC_VLD[13] | FIX_RATE[31]
+        // DW2: FRAME_TYPE[5:4] | SUB_TYPE[3:0] | MULTICAST[10] | TIMING_MEASURE[12]
+        //      | HTC_VLD[13] | PROTECT[22] | FIX_RATE[31]
         let mut dw2: u32 = (frame_type << 4) | frame_subtype;
         if is_multicast { dw2 |= 1 << 10; }
         dw2 |= 1u32 << 13;  // HTC_VLD — set when FIX_RATE (prevents HW adding HTC)
+        if opts.flags.contains(TxFlags::PROTECT) {
+            dw2 |= 1u32 << 22; // PROTECT — send RTS/CTS before frame
+        }
         dw2 |= 1u32 << 31;  // FIX_RATE — use rate from DW6, not rate adaptation
         pkt[off+8..off+12].copy_from_slice(&dw2.to_le_bytes());
 
-        // DW3: NO_ACK[0] | REM_TX_COUNT[15:11] | BA_DISABLE[28] | SN_VALID[31] | SEQ[27:16]
+        // DW3: NO_ACK[0] | PROTECT_FRAME[1] | REM_TX_COUNT[15:11]
+        //      | BA_DISABLE[28] | SN_VALID[31] | SEQ[27:16]
         let want_ack = opts.flags.contains(TxFlags::WANT_ACK);
         let no_ack = !want_ack; // Default: no ACK for monitor mode injection
-        let mut dw3: u32 = (15u32 << 11); // REM_TX_COUNT = 15 (max retries)
+        let retry_count = if opts.flags.contains(TxFlags::NO_RETRY) { 1u32 } else { 15u32 };
+        let mut dw3: u32 = retry_count << 11; // REM_TX_COUNT
         if no_ack { dw3 |= 1; }            // NO_ACK bit 0
         if !want_ack { dw3 |= 1u32 << 28; } // BA_DISABLE bit 28
         // Set explicit sequence number from the 802.11 frame header
@@ -3745,18 +3944,29 @@ impl ChipDriver for Mt7921au {
 
         // DW4-DW5: zero (no PN, no PID)
 
-        // DW6: TX_RATE[29:16] | SGI[15:14] | LDPC[11] | FIXED_BW[2]
+        // DW6: TX_RATE[29:16] | SGI[15:14] | LDPC[11] | BW[4:3] | DYN_BW[5] | FIXED_BW[2]
         // Rate encoding via TxRate::mt76_rate(): MODE[9:6] | NSS[12:10] | IDX[5:0]
-        // SGI: 0=normal GI (0.8μs), 1=short GI (0.4μs HT/VHT, 1.6μs HE), 2=HE extended (3.2μs)
+        // SGI: 0=normal GI, 1=short GI (HT/VHT 0.4μs, HE 1.6μs), 2=HE extended (3.2μs)
+        // BW: 0=20MHz, 1=40MHz, 2=80MHz, 3=160MHz (clamped to 80 for MT7921)
         let mut rate_val: u32 = opts.rate.mt76_rate() as u32;
-        if opts.flags.contains(TxFlags::STBC) { rate_val |= 1 << 13; } // STBC bit in rate field
+        if opts.flags.contains(TxFlags::STBC) { rate_val |= 1 << 13; }
+        let bw = (opts.bw as u32).min(2); // Clamp to 80MHz max (hardware limit)
         let mut dw6: u32 = (rate_val << 16)
             | (1u32 << 2)                                 // FIXED_BW
+            | ((bw & 0x3) << 3)                           // BW[4:3]
             | (((opts.gi as u32) & 0x3) << 14);           // SGI[15:14]
-        if opts.flags.contains(TxFlags::LDPC) { dw6 |= 1u32 << 11; } // LDPC
+        if opts.flags.contains(TxFlags::LDPC) { dw6 |= 1u32 << 11; }
+        if opts.flags.contains(TxFlags::DYN_BW) { dw6 |= 1u32 << 5; } // DYN_BW — allow narrower fallback
         pkt[off+24..off+28].copy_from_slice(&dw6.to_le_bytes());
 
-        // DW7: zero (HW_AMSDU cleared when FIX_RATE)
+        // DW7: HE LTF type in bits [27:26] when HE rate and FIX_RATE set
+        let mut dw7: u32 = 0;
+        if opts.rate.is_he() {
+            dw7 |= ((opts.ltf as u32) & 0x3) << 26; // HE_LTF[27:26]: 0=1x, 1=2x, 2=4x
+        }
+        if dw7 != 0 {
+            pkt[off+28..off+32].copy_from_slice(&dw7.to_le_bytes());
+        }
 
         // DW8: L_TYPE[5:4] | L_SUB_TYPE[3:0] — required for USB TX path
         let dw8: u32 = (frame_type << 4) | frame_subtype;
@@ -3767,15 +3977,6 @@ impl ChipDriver for Mt7921au {
         // Copy frame data after TXWI
         let frame_off = off + txwi_size;
         pkt[frame_off..frame_off + frame.len()].copy_from_slice(frame);
-
-        // Select TX endpoint by frame type:
-        //   Management (type=0): EP AC_BE (0x05) with ALTX Q_IDX in TXWI
-        //   Control (type=1): EP AC_VO (0x07) — highest priority
-        //   Data (type=2): EP AC_BE (0x05) — default data queue
-        let tx_ep = match frame_type {
-            1 => self.ep_ac_vo_out,  // Control frames → high priority
-            _ => self.ep_ac_be_out,  // Management + data → AC_BE
-        };
         for retry in 0..opts.retries.max(1) {
             match self.handle.write_bulk(tx_ep, &pkt, USB_BULK_TIMEOUT) {
                 Ok(_) => return Ok(()),
@@ -3896,6 +4097,14 @@ impl ChipDriver for Mt7921au {
         Duration::from_millis(10)
     }
 
+    fn scan_dwell_time(&self) -> Duration {
+        // MT7921AU channel switch blocks 140-500ms inside firmware MCU command.
+        // With 500ms dwell, efficiency is only 50-62%. With 1000ms dwell,
+        // efficiency rises to 67-77% and we capture 10 beacon intervals + more
+        // STA data bursts per channel visit. The slow switch cost is amortized.
+        Duration::from_millis(1000)
+    }
+
     // ── Channel Survey ──
 
     fn survey_read(&self, band_idx: u8) -> Result<ChannelSurvey> {
@@ -3936,6 +4145,33 @@ impl ChipDriver for Mt7921au {
 
     fn testmode_set_freq_offset(&mut self, offset: u32) -> Result<()> {
         self.testmode_set_freq_offset(offset)
+    }
+
+    fn testmode_set_tx_antenna(&mut self, mask: u32) -> Result<()> {
+        self.testmode_set_tx_antenna(mask)
+    }
+
+    fn testmode_set_system_bw(&mut self, bw: u32) -> Result<()> {
+        self.testmode_set_system_bw(bw)
+    }
+
+    fn testmode_burst_tx(&mut self,
+        channel: u32, bw: u32, rate_mode: u32, nss: u32,
+        power_half_dbm: u32, pkt_count: u32, ipg_us: u32,
+    ) -> Result<()> {
+        self.testmode_burst_tx(channel, bw, rate_mode, nss, power_half_dbm, pkt_count, ipg_us)
+    }
+
+    fn testmode_set_tx_continuous(&mut self, enable: bool) -> Result<()> {
+        self.testmode_set_tx_continuous(enable)
+    }
+
+    fn testmode_get_temperature(&mut self) -> Result<(u32, u32)> {
+        self.testmode_get_temperature()
+    }
+
+    fn testmode_get_rx_stats(&mut self) -> Result<(u32, u32)> {
+        self.testmode_get_rx_stats()
     }
 
     fn take_rx_handle(&mut self) -> Option<crate::core::chip::RxHandle> {
@@ -3993,21 +4229,22 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         pkt_type = 8; // PKT_TYPE_NORMAL_MCU
     }
 
-    // Route by packet type — matches mt7921_queue_rx_skb() exactly:
-    //   0 = TXS (TX status)            → Skip
-    //   1 = TXRXV (TX/RX vector)       → Skip
-    //   2 = NORMAL (802.11 frame)      → Frame (parsed below)
-    //   3 = TXRX_NOTIFY (TX free)      → Skip
-    //   4 = DUP_RFB / TMR              → Skip
+    // Route by packet type — from mt76_connac2_mac.h PKT_TYPE_* constants:
+    //   0 = TXS (TX status)            → DriverMessage (ACK feedback for injected frames!)
+    //   1 = TXRXV (TX/RX vector)       → Skip (PHY metadata, no frame)
+    //   2 = NORMAL (802.11 data frame) → Frame
+    //   3 = DUP_RFB (duplicate RFB)    → Frame (carries real 802.11 frames!)
+    //   4 = TMR (timer report)         → Skip
     //   5 = RETRIEVE                   → Skip
-    //   6 = (undefined)                → Skip
+    //   6 = TXRX_NOTIFY (TX free)      → Skip
     //   7 = RX_EVENT (MCU response)    → DriverMessage
     //   8 = NORMAL_MCU (MCU + frame)   → DriverMessage
+    //   0x0C = FW_MONITOR              → DriverMessage (firmware debug)
     //   anything else                  → Skip
     match pkt_type {
-        2 => {} // PKT_TYPE_NORMAL — parse as 802.11 frame below
-        7 => return (consumed, ParsedPacket::DriverMessage(rxd.to_vec())),
-        8 => return (consumed, ParsedPacket::DriverMessage(rxd.to_vec())),
+        2 | 3 => {} // PKT_TYPE_NORMAL + DUP_RFB — parse as 802.11 frame below
+        0 => return (consumed, ParsedPacket::TxStatus(rxd.to_vec())), // TXS — TX ACK feedback
+        7 | 8 | 0x0C => return (consumed, ParsedPacket::DriverMessage(rxd.to_vec())),
         _ => return (consumed, ParsedPacket::Skip),
     }
 
@@ -4154,7 +4391,9 @@ mod tests {
         assert!(MT7921AU_CAPS.contains(ChipCaps::BAND_2G));
         assert!(MT7921AU_CAPS.contains(ChipCaps::BAND_5G));
         assert!(MT7921AU_CAPS.contains(ChipCaps::HE));
-        assert!(MT7921AU_CAPS.contains(ChipCaps::BW160));
+        assert!(MT7921AU_CAPS.contains(ChipCaps::BW80));
+        // Hardware maxes at 80MHz — VHT says "neither 160 nor 80+80", HE says "HE40/HE80"
+        assert!(!MT7921AU_CAPS.contains(ChipCaps::BW160));
     }
 
     #[test]

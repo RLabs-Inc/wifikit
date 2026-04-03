@@ -248,6 +248,13 @@ pub struct TxOptions {
     pub gi: u8,
     /// Bandwidth for TX: 0=20MHz, 1=40MHz, 2=80MHz, 3=160MHz
     pub bw: u8,
+    /// HE LTF type: 0=1x LTF (0.8μs), 1=2x LTF (1.6μs), 2=4x LTF (3.2μs)
+    pub ltf: u8,
+    /// TX antenna mask: 0=default (all), 0x1=ant0, 0x2=ant1, 0x3=both
+    pub antenna_mask: u8,
+    /// Per-frame TX power in 0.5 dBm units. 0 = use adapter default.
+    /// Example: 40 = 20 dBm, 10 = 5 dBm (stealth), 60 = 30 dBm (max range)
+    pub tx_power_half_dbm: u8,
 }
 
 impl Default for TxOptions {
@@ -258,6 +265,9 @@ impl Default for TxOptions {
             flags: TxFlags::empty(),
             gi: 0,
             bw: 0,
+            ltf: 0,
+            antenna_mask: 0,
+            tx_power_half_dbm: 0,
         }
     }
 }
@@ -282,6 +292,12 @@ pub enum TxRate {
     VhtMcs { mcs: u8, nss: u8 },
     // HE rates (802.11ax / WiFi 6) — MCS 0-11, NSS 1-2
     HeMcs { mcs: u8, nss: u8 },
+    // HE Extended SU — extended range, better for long-distance injection
+    HeExtSuMcs { mcs: u8, nss: u8 },
+    // HE Trigger-Based — uplink OFDMA (for trigger frame responses)
+    HeTbMcs { mcs: u8, nss: u8 },
+    // HE Multi-User — MU-MIMO injection
+    HeMuMcs { mcs: u8, nss: u8 },
 }
 
 impl TxRate {
@@ -303,7 +319,8 @@ impl TxRate {
             Self::Ofdm54m => 0x6C,
             Self::HtMcs(mcs) => *mcs,
             Self::VhtMcs { mcs, .. } => *mcs,
-            Self::HeMcs { mcs, .. } => *mcs,
+            Self::HeMcs { mcs, .. } | Self::HeExtSuMcs { mcs, .. }
+            | Self::HeTbMcs { mcs, .. } | Self::HeMuMcs { mcs, .. } => *mcs,
         }
     }
 
@@ -320,11 +337,12 @@ impl TxRate {
     }
 
     pub fn is_he(&self) -> bool {
-        matches!(self, Self::HeMcs { .. })
+        matches!(self, Self::HeMcs { .. } | Self::HeExtSuMcs { .. }
+            | Self::HeTbMcs { .. } | Self::HeMuMcs { .. })
     }
 
     /// MT76 rate encoding: MODE[9:6] | NSS[12:10] | IDX[5:0]
-    /// MODE: 0=CCK, 1=OFDM, 2=HT, 3=VHT, 4=HE_SU
+    /// MODE: 0=CCK, 1=OFDM, 2=HT, 3=VHT, 4=HE_SU, 5=HE_EXT_SU, 6=HE_TB, 7=HE_MU
     pub fn mt76_rate(&self) -> u16 {
         match self {
             Self::Cck1m   => (0 << 6) | 0,
@@ -350,22 +368,38 @@ impl TxRate {
             Self::VhtMcs { mcs, nss } => {
                 (3 << 6) | (((*nss - 1) as u16) << 10) | (*mcs as u16)
             }
-            // HE_SU: MODE=4, explicit NSS
+            // HE_SU: MODE=4 — standard single-user HE
             Self::HeMcs { mcs, nss } => {
                 (4 << 6) | (((*nss - 1) as u16) << 10) | (*mcs as u16)
+            }
+            // HE_EXT_SU: MODE=5 — extended range SU (better for long-distance attacks)
+            Self::HeExtSuMcs { mcs, nss } => {
+                (5 << 6) | (((*nss - 1) as u16) << 10) | (*mcs as u16)
+            }
+            // HE_TB: MODE=6 — trigger-based (uplink OFDMA response)
+            Self::HeTbMcs { mcs, nss } => {
+                (6 << 6) | (((*nss - 1) as u16) << 10) | (*mcs as u16)
+            }
+            // HE_MU: MODE=7 — multi-user MIMO
+            Self::HeMuMcs { mcs, nss } => {
+                (7 << 6) | (((*nss - 1) as u16) << 10) | (*mcs as u16)
             }
         }
     }
 }
 
 bitflags_manual! {
-    TxFlags: u8 {
-        NO_ACK    = 0x01,
-        NO_RETRY  = 0x02,
-        HW_SEQ    = 0x04,
-        WANT_ACK  = 0x08,  // Request ACK (clears NO_ACK and BA_DISABLE in TXWI)
-        LDPC      = 0x10,  // Enable LDPC coding
-        STBC      = 0x20,  // Enable Space-Time Block Coding
+    TxFlags: u16 {
+        NO_ACK       = 0x0001,
+        NO_RETRY     = 0x0002,
+        HW_SEQ       = 0x0004,
+        WANT_ACK     = 0x0008,  // Request ACK (clears NO_ACK and BA_DISABLE in TXWI)
+        LDPC         = 0x0010,  // Enable LDPC coding
+        STBC         = 0x0020,  // Enable Space-Time Block Coding (2x2 diversity)
+        SHORT_PRE    = 0x0040,  // Short preamble (CCK only)
+        PROTECT      = 0x0080,  // RTS/CTS protection before frame
+        DYN_BW       = 0x0100,  // Dynamic bandwidth — allow fallback to narrower BW
+        FORCE_TX_STATUS = 0x0200, // Force TX status report for this frame
     }
 }
 

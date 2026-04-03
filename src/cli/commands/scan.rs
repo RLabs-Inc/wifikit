@@ -92,15 +92,31 @@ fn start(ctx: &mut Ctx, args: &str) {
         ctx.layout.print(&format!("  {} {w}", prism::s().yellow().paint("warning:")));
     }
 
-    // Auto-enable 6GHz if adapter supports it (unless user passed --no-6ghz explicitly).
-    // The flag --6ghz sets it to true; if user didn't pass --no-6ghz, we auto-detect.
-    let user_explicitly_disabled_6ghz = args.contains("--no-6ghz");
-    if !user_explicitly_disabled_6ghz && !config.scan_6ghz {
+    // 6GHz: opt-IN only (pass --6ghz to enable).
+    // Auto-enabling killed MT7921 scan performance: 59 channels x 300ms switch time
+    // = 18 seconds of dead air per cycle. Most regions have zero 6GHz APs anyway.
+    // The adapter still SUPPORTS 6GHz — user just needs to ask for it explicitly.
+    if config.scan_6ghz {
         let bands = shared.supported_bands();
-        if bands.contains(&crate::core::channel::Band::Band6g) {
-            config.scan_6ghz = true;
-            ctx.layout.print(&format!("  {} 6GHz auto-enabled (adapter supports WiFi 6E)",
-                prism::s().cyan().paint("\u{25c6}")));
+        if !bands.contains(&crate::core::channel::Band::Band6g) {
+            config.scan_6ghz = false;
+            ctx.layout.print(&format!("  {} 6GHz requested but adapter doesn't support it",
+                prism::s().yellow().paint("warning:")));
+        }
+    }
+
+    // Use adapter's recommended dwell time unless user explicitly set --dwell.
+    // Each chipset driver knows its channel switch cost and recommends accordingly:
+    //   Fast-switch (RTL, register PLL): 500ms (default)
+    //   Slow-switch (MT7921, MCU firmware): 1000ms (amortize 140-500ms switch cost)
+    let user_set_dwell = args.contains("--dwell");
+    if !user_set_dwell {
+        let adapter_dwell = shared.scan_dwell_time();
+        if adapter_dwell != config.dwell_time {
+            config.dwell_time = adapter_dwell;
+            ctx.layout.print(&format!("  {} Dwell: {}ms (adapter recommended)",
+                prism::s().cyan().paint("\u{25c6}"),
+                adapter_dwell.as_millis()));
         }
     }
 
@@ -153,7 +169,8 @@ fn start(ctx: &mut Ctx, args: &str) {
 /// Parse `/scan` flags into a ScanConfig. Returns config + any warnings.
 ///
 /// Supported flags:
-///   --passive           Passive-only scan (no probe injection)
+///   --passive           Passive/stealth scan — no TX, receive only
+///   --active            Active scan — send probe requests (default)
 ///   --channels 1,6,11   Override channel list
 ///   --dwell N           Dwell time per channel in ms
 ///   --rounds N          Number of scan rounds (0 = infinite)
@@ -167,6 +184,7 @@ pub fn parse_scan_flags(args: &str) -> (ScanConfig, Vec<String>) {
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i] {
+            "--active" => { config.active = true; }
             "--passive" => { config.active = false; }
             "--channels" => {
                 i += 1;
