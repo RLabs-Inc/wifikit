@@ -1,15 +1,58 @@
 //! RTL8812BU / RTL8822BU chip driver
 //!
-//! USB register access via vendor control transfers:
-//!   Read:  bmRequestType=0xC0, bRequest=0x05, wValue=addr, wIndex=0
-//!   Write: bmRequestType=0x40, bRequest=0x05, wValue=addr, wIndex=0
-#![allow(dead_code)]
-#![allow(unused_imports)]
+//! # Hardware
 //!
-//! Power-on sequence: CARDDIS → CARDEMU → ACT
-//!   From: hal/halmac/halmac_88xx/halmac_8822b/halmac_pwr_seq_8822b.c
+//! Realtek RTL8822BU — 802.11ac dual-band (2.4GHz + 5GHz), 2T2R MIMO, USB 3.0.
+//! Used in: TP-Link Archer T4U V3, ASUS USB-AC53 Nano, Netgear A6100, and others.
+//! This is the project's golden reference driver — most complete, most tested.
 //!
-//! Reference: morrownr/88x2bu-20210702 (Linux out-of-tree driver)
+//! Key hardware traits:
+//!   - Register-based: direct USB control transfers to MMIO registers (no firmware MCU)
+//!   - 8051 firmware: uploaded at init, handles H2C commands but not channel switching
+//!   - EFUSE: per-device calibration (TX power, RFE type, MAC address)
+//!   - PLL channel switching: ~1-2ms retune via RF register 0x18
+//!
+//! # Init Flow (9 steps in `chip_init()`)
+//!
+//!   1. Power on (CARDDIS → CARDEMU → ACT via USB-specific power sequence)
+//!   2. Firmware download (IDDMA DMA engine, DMEM + IMEM sections)
+//!   3. TRX queue/buffer configuration (page allocation, Auto LLT, DMA mapping)
+//!   4. USB RX DMA setup (aggregation disabled at init, enabled in monitor mode)
+//!   5. H2C firmware info commands (general_info, phydm_info, general_info_reg)
+//!   6. EDCA/WMAC timing (SIFS, slot time, beacon)
+//!   7. PHY/BB/RF init from tables + IQK calibration + DPK calibration
+//!   8. EFUSE read (TX power calibration + RFE type + MAC address)
+//!   9. Apply calibrated TX power + LC calibration
+//!
+//! # USB Protocol
+//!
+//!   Register I/O: vendor control transfers (bRequest=0x05)
+//!     Read:  bmRequestType=0xC0, wValue=addr, wIndex=0
+//!     Write: bmRequestType=0x40, wValue=addr, wIndex=0
+//!   Data TX: bulk OUT with 48-byte TX descriptor (XOR checksum of first 32 bytes)
+//!   Data RX: bulk IN with 24-byte RX descriptor, 8-byte aligned aggregation
+//!   H2C: two paths — bulk (QSEL=0x13) and message box (4 rotating register pairs)
+//!
+//! # Architecture Decisions
+//!
+//!   - All timing uses named `const Duration` values — no raw `sleep(millis)` calls
+//!   - TX power is EFUSE-calibrated per-path, per-band, per-rate-group
+//!   - RX parser is a static `pub(crate)` method for use by both direct and RxHandle paths
+//!   - Lazy MACID/MACTXEN init: deferred to first TX to avoid init-order issues
+//!   - Firmware failure is non-fatal: monitor mode RX works without firmware
+//!   - Every swallowed error has an "Error safe to ignore" comment explaining why
+//!
+//! # What's NOT Implemented
+//!
+//!   - 40/80 MHz bandwidth (all channel switching hardcoded to 20MHz)
+//!   - firmware_version extraction from FW header
+//!   - Per-rate RSSI (uses single-byte PHY status, not per-path)
+//!
+//! # Reference
+//!
+//!   Linux driver: morrownr/88x2bu-20210702 (out-of-tree)
+//!   Power sequence: hal/halmac/halmac_88xx/halmac_8822b/halmac_pwr_seq_8822b.c
+//!   PHY/RF tables: hal/phydm/rtl8822b/ (extracted to rtl8822b_tables.rs)
 
 use std::time::Duration;
 use std::thread;
@@ -176,7 +219,8 @@ const RF18_VERIFY_RETRY_DELAY_US: u64 = 1000;
 // Channel switch settle (after all registers written)
 const CHANNEL_SETTLE_DELAY: Duration = Duration::from_micros(200);
 
-// TX power register write retry delay
+// TX power register write retry delay (used in set_tx_power_regs via trait dispatch)
+#[allow(dead_code)]
 const TXAGC_WRITE_RETRY_DELAY: Duration = Duration::from_micros(500);
 
 // First TX DMA error check delay
@@ -248,8 +292,11 @@ fn tx_rate_to_hw(rate: &TxRate, channel: u8) -> u8 {
 //  Rtl8812bu — The Driver
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Per-chip EFUSE TX power calibration values
+/// Per-chip EFUSE TX power calibration values.
+/// Currently only OFDM and 5GHz group values are used in `set_tx_power_calibrated()`.
+/// The per-rate CCK/HT fields are read from EFUSE for future per-rate TXAGC support.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // per-rate fields read from EFUSE, used when per-rate TXAGC is implemented
 struct EfuseTxPower {
     // 2.4GHz per-rate base power
     a_cck_2g: u8,
@@ -278,6 +325,9 @@ impl Default for EfuseTxPower {
     }
 }
 
+// Fields and methods below are accessed via `dyn ChipDriver` trait dispatch,
+// which the compiler cannot trace — targeted `allow(dead_code)` on those items.
+#[allow(dead_code)] // fields used via ChipDriver trait dispatch (rx_buf, rx_pos, rx_len, tx_power_idx)
 pub struct Rtl8812bu {
     handle: Arc<DeviceHandle<GlobalContext>>,
     ep_out: u8,
@@ -1901,6 +1951,7 @@ impl Rtl8812bu {
     //  TX power (TXAGC registers)
     // ══════════════════════════════════════════════════════════════════════════
 
+    #[allow(dead_code)] // called via ChipDriver::set_tx_power() trait dispatch
     fn set_tx_power_regs(&self, power_idx: u8) -> Result<()> {
         let idx = power_idx.min(TXAGC_MAX);
         let pw4 = (idx as u32) * 0x01010101;
@@ -1993,6 +2044,7 @@ impl Rtl8812bu {
         (consumed, Some(frame))
     }
 
+    #[allow(dead_code)] // called via ChipDriver::rx_frame() trait dispatch
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
         // Try to parse next packet from existing buffer
         while self.rx_pos < self.rx_len {
