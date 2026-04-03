@@ -567,8 +567,18 @@ impl Rtl8852au {
         let endpoints = crate::core::adapter::discover_endpoints(&device)?;
         let ep_out = endpoints.bulk_out;
         let ep_in = endpoints.bulk_in;
-        // EP7 = firmware download endpoint (3rd bulk OUT: EP5=TX, EP6=?, EP7=FWDL)
-        let ep_fw = endpoints.bulk_out_all.get(2).copied().unwrap_or(0x07);
+        // EP7 = firmware/H2C endpoint (3rd bulk OUT: EP5=TX, EP6=?, EP7=FWDL/H2C)
+        let ep_fw = endpoints.bulk_out_all.get(2).copied().ok_or_else(|| {
+            Error::ChipInitFailed {
+                chip: "RTL8852AU".into(),
+                stage: crate::core::error::InitStage::UsbEnumeration,
+                reason: format!("need 3 bulk OUT endpoints, found {}: {:?}",
+                    endpoints.bulk_out_all.len(),
+                    endpoints.bulk_out_all),
+            }
+        })?;
+        eprintln!("[RTL8852AU] Endpoints: OUT=0x{:02X} IN=0x{:02X} FW=0x{:02X} (all OUT: {:?})",
+            ep_out, ep_in, ep_fw, endpoints.bulk_out_all);
 
         let driver = Self {
             handle: Arc::new(handle),
@@ -1905,7 +1915,7 @@ impl Rtl8852au {
         self.handle.write_bulk(self.ep_fw, &buf, Duration::from_secs(2))
             .map_err(|e| Error::Usb(e))?;
 
-        // Brief wait for firmware to accept the command into its FIFO.
+        // Brief wait for firmware to accept the command
         thread::sleep(Duration::from_millis(2));
 
         Ok(())
@@ -2005,14 +2015,11 @@ impl Rtl8852au {
         Ok(())
     }
 
-    /// COMPLETE replay — sends ALL operations including bulk commands.
-    /// skip_fw_bulk: if true, skips the first 182 EP7 bulk commands (FW download chunks)
-    /// that we already sent via load_firmware(). Not skipping a step — avoiding duplicate FW load.
-    ///
-    /// H2C commands (CH_DMA=12 on EP7) are rebuilt via send_h2c() with correct
-    /// sequence numbers and proper C2H response handling. Raw pcap bytes are
-    /// only used for register reads/writes and TX probe frames (EP5).
-    fn replay_phase_complete(&mut self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
+    /// VERBATIM replay — sends ALL operations exactly as captured in usbmon.
+    /// No header rebuilding, no sequence tracking — raw pcap bytes only.
+    /// skip_fw_bulk: if true, skips the first 182 EP7 bulk commands (FW download)
+    /// that we already sent via load_firmware().
+    fn replay_phase_complete(&self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
                               skip_fw_bulk: bool) -> Result<()> {
         use rtl8852a_post_boot::PostBootOp;
 
@@ -2023,12 +2030,15 @@ impl Rtl8852au {
         let mut bulk_fail = 0usize;
         let mut bulk_skip = 0usize;
         let mut ep7_count = 0usize;
+        let mut reg_ops_since_last_bulk = 0usize;
+        let mut h2c_sent = 0usize; // total H2C commands sent (not skipped)
         // FW download = first 182 EP7 bulk commands (128B header + 181 sections)
         const FW_DOWNLOAD_EP7_COUNT: usize = 182;
 
         for op in seq {
             match op {
                 PostBootOp::Read(full_addr, width) => {
+                    reg_ops_since_last_bulk += 1;
                     let _ = if *full_addr > 0xFFFF {
                         self.read32_ext(*full_addr).map(|_| ())
                     } else {
@@ -2042,6 +2052,7 @@ impl Rtl8852au {
                     read_ok += 1;
                 }
                 PostBootOp::Write(full_addr, val, width) => {
+                    reg_ops_since_last_bulk += 1;
                     let result = if *full_addr > 0xFFFF {
                         self.write32_ext(*full_addr, *val)
                     } else {
@@ -2063,6 +2074,17 @@ impl Rtl8852au {
                     }
                 }
                 PostBootOp::BulkOut(ep, data) => {
+                    // When transitioning from register ops back to H2C bulk commands,
+                    // pause to let the drain thread consume any pending PPDU/C2H data.
+                    // Register ops (especially MAC/RX config) can enable the RX path,
+                    // causing a burst of incoming data that must be drained before
+                    // the firmware will accept new H2C commands.
+                    if *ep == 0x07 && reg_ops_since_last_bulk > 50 && h2c_sent > 0 {
+                        eprintln!("[RTL8852AU]   Drain pause: {} reg ops since last H2C, waiting 500ms...",
+                            reg_ops_since_last_bulk);
+                        thread::sleep(Duration::from_millis(500));
+                    }
+
                     // Skip FW download EP7 bulk commands (already loaded via load_firmware)
                     if skip_fw_bulk && *ep == 0x07 {
                         ep7_count += 1;
@@ -2072,59 +2094,44 @@ impl Rtl8852au {
                         }
                     }
 
-                    // Check if this is an H2C command (CH_DMA=12, not FWDL)
-                    if *ep == 0x07 {
-                        if let Some((cat, class, func, payload)) = Self::parse_h2c_from_pcap(data) {
-                            // Rebuild and send via proper H2C framework with correct
-                            // sequence numbers, ACK flags, and C2H response handling.
-                            match self.send_h2c(cat, class, func, payload) {
-                                Ok(_) => {
-                                    bulk_ok += 1;
-                                    eprintln!("[RTL8852AU]   H2C cat={} cls={} func={} ({} bytes): OK [seq={}]",
-                                        cat, class, func, data.len(), self.h2c_seq.wrapping_sub(1));
-                                }
-                                Err(e) => {
-                                    bulk_fail += 1;
-                                    eprintln!("[RTL8852AU]   H2C cat={} cls={} func={} ({} bytes): FAILED: {}",
-                                        cat, class, func, data.len(), e);
-                                    let _ = self.handle.clear_halt(self.ep_fw);
-                                }
-                            }
-                        } else {
-                            // Non-H2C EP7 command (FWDL type) — send raw
-                            let timeout = Duration::from_millis(if data.len() > 1024 { 2000 } else { 500 });
-                            match self.handle.write_bulk(self.ep_fw, data, timeout) {
-                                Ok(_) => { bulk_ok += 1; }
-                                Err(e) => {
-                                    bulk_fail += 1;
-                                    eprintln!("[RTL8852AU]   Bulk EP7 FWDL ({} bytes): FAILED: {}", data.len(), e);
-                                    let _ = self.handle.clear_halt(self.ep_fw);
+                    // Send raw pcap bytes verbatim — no header rebuilding
+                    let target_ep = if *ep == 0x07 { self.ep_fw } else { self.ep_out };
+                    let timeout = Duration::from_millis(if data.len() > 1024 { 2000 } else { 500 });
+                    match self.handle.write_bulk(target_ep, data, timeout) {
+                        Ok(_) => {
+                            bulk_ok += 1;
+                            if *ep == 0x07 {
+                                h2c_sent += 1;
+                                reg_ops_since_last_bulk = 0;
+                                if let Some((cat, class, func, _)) = Self::parse_h2c_from_pcap(data) {
+                                    eprintln!("[RTL8852AU]   H2C RAW cat={} cls={} func={} ({} bytes): OK [#{}]",
+                                        cat, class, func, data.len(), h2c_sent);
+                                } else {
+                                    eprintln!("[RTL8852AU]   Bulk EP7 raw ({} bytes): OK", data.len());
                                 }
                             }
                         }
-                    } else {
-                        // EP5 TX frames — send raw (these work fine)
-                        let timeout = Duration::from_millis(500);
-                        match self.handle.write_bulk(self.ep_out, data, timeout) {
-                            Ok(_) => {
-                                bulk_ok += 1;
-                                if bulk_ok <= 10 {
-                                    eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): OK", ep, data.len());
+                        Err(e) => {
+                            bulk_fail += 1;
+                            if *ep == 0x07 {
+                                if let Some((cat, class, func, _)) = Self::parse_h2c_from_pcap(data) {
+                                    eprintln!("[RTL8852AU]   H2C RAW cat={} cls={} func={} ({} bytes): FAILED: {}",
+                                        cat, class, func, data.len(), e);
+                                } else {
+                                    eprintln!("[RTL8852AU]   Bulk EP7 raw ({} bytes): FAILED: {}", data.len(), e);
                                 }
-                            }
-                            Err(e) => {
-                                bulk_fail += 1;
+                            } else {
                                 eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): FAILED: {}", ep, data.len(), e);
                             }
+                            let _ = self.handle.clear_halt(target_ep);
                         }
                     }
                 }
             }
-
-            let done = read_ok + write_ok + write_fail + bulk_ok + bulk_fail + bulk_skip;
-            if done % 5000 == 0 && done > 0 {
-            }
         }
+
+        eprintln!("[RTL8852AU] {} complete: R={} W={}/{} B={}/{} skip={}",
+            name, read_ok, write_ok, write_fail, bulk_ok, bulk_fail, bulk_skip);
 
         Ok(())
     }
@@ -2332,6 +2339,42 @@ impl Rtl8852au {
             thread::sleep(Duration::from_millis(50));
         }
 
+        // ── PURE PCAP REPLAY — no custom init code ──
+        // The POST_FWDL_SEQUENCE contains EVERYTHING: pre-FWDL register config,
+        // FWDL header + sections (BULK_0-181), and post-FWDL H2C + register ops.
+        // We replay it ALL verbatim — no power_on(), no load_firmware(), no
+        // interface release/re-claim. Exactly what Linux did, byte for byte.
+
+        // ── Background RX drain thread ──
+        let drain_handle = Arc::clone(&self.handle);
+        let drain_ep = self.ep_in;
+        let drain_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let drain_flag = Arc::clone(&drain_running);
+        let drain_thread = thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            let mut total_bytes = 0usize;
+            let mut total_reads = 0usize;
+            while drain_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                match drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(1)) {
+                    Ok(n) if n > 0 => {
+                        total_reads += 1;
+                        total_bytes += n;
+                        if n >= 4 {
+                            let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                            let pkt_len = dw0 & 0x3FFF;
+                            let rpkt_type = (dw0 >> 24) & 0xF;
+                            eprintln!("[RTL8852AU] drain: {} bytes, rpkt_type={}, pkt_len={} (total: {}B in {} reads)",
+                                n, rpkt_type, pkt_len, total_bytes, total_reads);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if total_bytes > 0 {
+                eprintln!("[RTL8852AU] drain thread: {}B total in {} reads", total_bytes, total_reads);
+            }
+        });
+
         // ── Phase 0: Pre-FWDL (our proven read-modify-write code) ──
         self.power_on()?;
         self.dmac_pre_init_and_enable_cpu()?;
@@ -2339,39 +2382,14 @@ impl Rtl8852au {
         // ── Phase 1: Firmware download ──
         self.load_firmware()?;
 
-        // ── Reset USB endpoints after FW boot ──
-        let _ = self.handle.release_interface(0);
-        thread::sleep(Duration::from_millis(100));
-        self.handle.claim_interface(0).map_err(|e| {
-            Error::ChipInitFailed {
-                chip: "RTL8852AU".into(),
-                stage: crate::core::error::InitStage::UsbEnumeration,
-                reason: format!("re-claim after FW boot: {}", e),
-            }
-        })?;
-        for ep in [self.ep_out, self.ep_in, self.ep_fw] {
-            let _ = self.handle.clear_halt(ep);
-        }
-
-        // ── Background RX drain thread ──
-        // On Linux, an RX thread runs continuously during init, consuming C2H
-        // responses and WiFi frames. Without this, the firmware's C2H TX buffer
-        // fills up after processing H2C commands, causing EP7 backpressure stall.
-        // This thread mimics that behavior during our init phase.
-        let drain_handle = Arc::clone(&self.handle);
-        let drain_ep = self.ep_in;
-        let drain_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let drain_flag = Arc::clone(&drain_running);
-        let drain_thread = thread::spawn(move || {
-            let mut buf = vec![0u8; 4096];
-            while drain_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(50));
-            }
-        });
-
-        // ── Phase 2: Post-FWDL — COMPLETE replay (skip FW download bulk, keep EVERYTHING else) ──
+        // ── Phase 2: Post-FWDL — register ops + OUTSRC cal H2C ONLY ──
+        // Skip FWDL zone (325 ops). Then replay register ops + only the 6 OUTSRC
+        // calibration H2C commands (cls=8 BB cal + cls=9 RF cal). Skip all other
+        // H2C commands (ADDR_CAM, MEDIA_RPT, etc.) to avoid MAC filtering.
+        const FWDL_ZONE_OPS: usize = 325;
+        let post_fwdl_only = &super::rtl8852a_phase_post_fwdl::POST_FWDL_SEQUENCE[FWDL_ZONE_OPS..];
         self.replay_phase_complete("Post-FWDL",
-            super::rtl8852a_phase_post_fwdl::POST_FWDL_SEQUENCE, true)?;
+            post_fwdl_only, false)?;
 
         // ── Phase 3: Monitor mode ──
         self.replay_phase_complete("Monitor",
