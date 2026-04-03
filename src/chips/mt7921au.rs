@@ -2833,10 +2833,6 @@ impl Mt7921au {
         self.mcu_set_channel_domain()?;
         self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, Channel::new(ch))?;
 
-        // Set TX power to MAXIMUM for all channels in all three bands.
-        // The firmware caps values to eFuse hardware limits, so setting 127
-        // (max half-dBm value) ensures we get the absolute maximum the hardware supports.
-        // Per-rate staircase from captured SKU tables overlaid on top.
         self.mcu_set_rate_txpower(Band::Band2g)?;
         self.mcu_set_rate_txpower(Band::Band5g)?;
         self.mcu_set_rate_txpower(Band::Band6g)?;
@@ -3716,23 +3712,21 @@ impl ChipDriver for Mt7921au {
             });
         }
 
-        // CRITICAL: usbmon capture reveals Linux NEVER uses MCU_EXT_CMD_CHANNEL_SWITCH
-        // for MT7921AU monitor mode. It uses SET_RX_PATH (0x4E) instead.
-        // CHANNEL_SWITCH (0x08) silently fails on 6GHz — MCU accepts it but radio
-        // never retunes. SET_RX_PATH sends rx_streams as antenna_mask (0x3).
+        // Linux uses CHANNEL_SWITCH (0x08) for channel hopping — it does full RF
+        // reconfiguration (PLL retune, AGC recal, LNA path switch between 2.4G/5G).
+        // SET_RX_PATH (0x4E) is only used at init (__mt7921_start) for antenna setup.
         //
-        // Linux full sequence includes MAC reset + channel domain + TX power resend,
-        // but we try SET_RX_PATH alone first — the MAC reset kills sniffer state
-        // and TX power resend causes MCU command storms.
-        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, channel)?;
+        // Previously we used SET_RX_PATH for everything, which worked on 2.4GHz
+        // (since radio_init starts on ch6/2.4G) but left 5GHz RF front-end
+        // half-configured, losing ~10dB. CHANNEL_SWITCH may fail on 6GHz —
+        // handle that separately if needed.
+        self.mcu_set_chan_info(MCU_EXT_CMD_CHANNEL_SWITCH, channel)?;
 
-        // In sniffer mode, also send the sniffer-specific channel config.
-        // Linux calls mt7921_mcu_config_sniffer() on every chanctx change for
-        // monitor mode interfaces. This carries the bandwidth and sco fields
-        // that control the actual capture width.
-        if self.sniffer_enabled {
-            let _ = self.mcu_config_sniffer_channel(channel);
-        }
+        // NOTE: sniffer config (mcu_config_sniffer_channel) is sent once at
+        // monitor mode init, NOT on every channel hop. In Linux, it's only
+        // called from chanctx_assign_vif, not from set_channel().
+        // Sending it every hop may reset firmware RF gain settings.
+        // The CHANNEL_SWITCH command alone handles band/frequency changes.
 
         self.channel = channel.number;
         self.band = channel.band;

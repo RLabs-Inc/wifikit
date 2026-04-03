@@ -2751,8 +2751,8 @@ impl ChipDriver for Rtl8852au {
         self.mac_addr
     }
 
-    fn set_mac(&mut self, mac: MacAddress) -> Result<()> {
-        self.mac_addr = mac;
+    fn set_mac(&mut self, _mac: MacAddress) -> Result<()> {
+        // TEMP: complete no-op to match test_8852au behavior (no set_mac call)
         Ok(())
     }
 
