@@ -1117,7 +1117,7 @@ impl Mt7921au {
         // Pre-drain: clear any stale data on event + data endpoints.
         // Linux has URBs pre-submitted that catch unsolicited events.
         // We must manually drain to prevent USB buffer backup / stalls.
-        self.drain_all_rx("pre-power-on");
+        self.drain_rx();
 
         // Send power-on vendor request
         let result = self.handle.write_control(
@@ -1143,7 +1143,7 @@ impl Mt7921au {
         // Drain any response/event the MCU sends back after power on.
         // Without this, the response fills the USB buffer and stalls everything.
         thread::sleep(Duration::from_millis(20));
-        self.drain_all_rx("post-power-on");
+        self.drain_rx();
 
         // Wait for firmware power-on confirmation
         if !self.poll_reg(MT_CONN_ON_MISC, MT_TOP_MISC2_FW_PWR_ON,
@@ -1158,15 +1158,14 @@ impl Mt7921au {
         Ok(())
     }
 
-    /// Drain all pending data from both RX endpoints.
-    /// This prevents USB buffer backup that can stall vendor requests.
-    /// Linux handles this with pre-submitted URBs; we must drain manually.
-    fn drain_all_rx(&self, _label: &str) {
+    /// Drain all pending data from both USB bulk IN endpoints.
+    /// Prevents USB buffer backup that can stall vendor requests / WFDMA.
+    /// Linux pre-submits URBs continuously; we must drain manually.
+    fn drain_rx(&self) {
         let mut buf = [0u8; 4096];
-        let endpoints = [self.ep_data_in, self.ep_event_in];
-        for &ep in &endpoints {
-            for _ in 0..10 {
-                match self.handle.read_bulk(ep, &mut buf, Duration::from_millis(50)) {
+        for &ep in &[self.ep_data_in, self.ep_event_in] {
+            loop {
+                match self.handle.read_bulk(ep, &mut buf, Duration::from_millis(20)) {
                     Ok(n) if n > 0 => {}
                     _ => break,
                 }
@@ -2423,12 +2422,12 @@ impl Mt7921au {
             // Periodic drain: simulate Linux's background RX thread.
             // Drain every 10 chunks to prevent IN endpoint backlog.
             if chunk_num % 10 == 0 {
-                self.drain_all_rx("fw-scatter-periodic");
+                self.drain_rx();
             }
         }
         // Final drain after all data sent
         thread::sleep(Duration::from_millis(20));
-        self.drain_all_rx("fw-scatter-done");
+        self.drain_rx();
         Ok(())
     }
 
@@ -2593,7 +2592,7 @@ impl Mt7921au {
             // Thorough drain before each init_download — ensure no stale data
             // on IN endpoints that could block the MCU from sending its response.
             // Linux has background RX threads that consume this continuously.
-            self.drain_all_rx("pre-init-download");
+            self.drain_rx();
 
             self.mcu_init_download(addr, len as u32, mode)?;
 
@@ -2611,7 +2610,7 @@ impl Mt7921au {
 
             // Give MCU time to process, drain events, and verify it's alive
             thread::sleep(Duration::from_millis(100));
-            self.drain_all_rx("post-region");
+            self.drain_rx();
 
             // Check if MCU is still responding
             match self.reg_read(MT_CONN_ON_MISC) {
@@ -3002,26 +3001,6 @@ impl Mt7921au {
         Ok(())
     }
 
-    /// Remove the virtual interface from the firmware.
-    /// Matches mt76_connac_mcu_uni_add_dev() with enable=false.
-    /// Drain all pending data from both USB bulk IN endpoints.
-    /// Linux pre-submits URBs during init so firmware events are consumed
-    /// continuously. We read on-demand, so events accumulate. This drains
-    /// them to prevent USB buffer stalls that block the WFDMA.
-    fn drain_usb_endpoints(&self) -> Result<()> {
-        let mut buf = [0u8; 4096];
-        let endpoints = [self.ep_data_in, self.ep_event_in];
-        for &ep in &endpoints {
-            loop {
-                match self.handle.read_bulk(ep, &mut buf, Duration::from_millis(20)) {
-                    Ok(n) if n > 0 => {}
-                    _ => break,
-                }
-            }
-        }
-        Ok(())
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     //  Monitor / Sniffer Mode
     // ══════════════════════════════════════════════════════════════════════════
@@ -3121,172 +3100,6 @@ impl Mt7921au {
     /// DW0[15:0] contains the total packet length including the RXD itself.
     ///
     /// The RXD (receive descriptor) is a connac2 format with:
-    ///   - DW0[15:0]  = total length (including RXD)
-    ///   - DW0[31:27] = packet type (2=data, 7=event, etc.)
-    ///   - DW1[11-15] = group presence flags (groups 1-5 add extra DWORDs before frame)
-    ///   - DW1[27]    = FCS error
-    ///   - DW2[12:8]  = MAC header length (in 2-byte units)
-    ///   - DW2[13]    = header translation done
-    fn parse_rx_packet(&mut self) -> Option<RxFrame> {
-        let remaining = self.rx_len - self.rx_pos;
-        if remaining < 24 {
-            self.rx_pos = self.rx_len;
-            return None;
-        }
-
-        let dw0_bytes = &self.rx_buf[self.rx_pos..self.rx_pos + 4];
-        let rxd_dw0 = u32::from_le_bytes([dw0_bytes[0], dw0_bytes[1], dw0_bytes[2], dw0_bytes[3]]);
-        let pkt_len = (rxd_dw0 & 0xFFFF) as usize;
-
-        if pkt_len == 0 || pkt_len < 24 || self.rx_pos + pkt_len > self.rx_len {
-            self.rx_pos = self.rx_len;
-            return None;
-        }
-
-        let pkt_start = self.rx_pos; // RXD starts here — no header to skip
-        let pkt_end = pkt_start + pkt_len;
-
-        // Advance position past this packet (aligned to 4 bytes)
-        self.rx_pos = (pkt_end + 3) & !3;
-
-        let rxd = &self.rx_buf[pkt_start..pkt_end];
-
-        // RXD DW0 already parsed above for pkt_len
-        let rx_byte_cnt = pkt_len;
-        let pkt_type = ((rxd_dw0 >> 27) & 0x1F) as u8;
-
-        // Parse RXD DW1 — group flags and error bits
-        let rxd_dw1 = u32::from_le_bytes([rxd[4], rxd[5], rxd[6], rxd[7]]);
-        let has_group1 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_1) != 0;
-        let has_group2 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_2) != 0;
-        let has_group3 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_3) != 0;
-        let has_group4 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_4) != 0;
-        let has_group5 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_5) != 0;
-        let fcs_err = (rxd_dw1 & MT_RXD1_NORMAL_FCS_ERR) != 0;
-
-        // Parse RXD DW2 — MAC header length, header translation, header offset
-        let rxd_dw2 = u32::from_le_bytes([rxd[8], rxd[9], rxd[10], rxd[11]]);
-        let mac_hdr_len = (((rxd_dw2 & MT_RXD2_NORMAL_MAC_HDR_LEN_MASK) >> 8) * 2) as usize;
-        let hdr_trans = (rxd_dw2 & MT_RXD2_NORMAL_HDR_TRANS) != 0;
-        let hdr_offset = ((rxd_dw2 >> 14) & 0x3) as usize * 2; // DW2 bits 15:14, in 2-byte units
-
-        // Parse RXD DW3 — RX channel frequency
-        let rxd_dw3 = u32::from_le_bytes([rxd[12], rxd[13], rxd[14], rxd[15]]);
-        let ch_freq = ((rxd_dw3 >> 8) & 0xFF) as u8; // actual RX channel from firmware
-
-        // Route non-frame packet types:
-        // TXS (0) = TX status with ACK feedback — forward to driver for injection tracking
-        // TXRXV (1) = TX/RX vector — PHY metadata only, skip
-        // NORMAL (2), DUP_RFB (3) = 802.11 frames — parse below
-        // TMR (4), RETRIEVE (5), TXRX_NOTIFY (6) = internal — skip
-        // RX_EVENT (7), NORMAL_MCU (8) = handled by MCU response path
-        // FW_MONITOR (0x0C) = firmware debug — skip
-        if pkt_type == 1 || pkt_type == 4 || pkt_type == 5 || pkt_type == 6 {
-            return None;
-        }
-        // TXS carries TX status / ACK info — route to driver message channel if available
-        if pkt_type == 0 {
-            return None; // TODO: forward TXS via driver_msg channel once wired in rx_frame path
-        }
-
-        // Drop FCS errors — corrupted frames create phantom APs/stations.
-        // DW1 bit 27 = FCS_ERR (from MT7921 RXD specification).
-        if fcs_err {
-            return None;
-        }
-
-        // Calculate RXD size: base (24 bytes = 6 DWORDs) + optional groups
-        // From Linux mt7921/mac.c, groups are walked in order with these sizes:
-        //   Group 4: 4 DW (16 bytes) — frame control, TA, seq, QoS, HTC
-        //   Group 1: 4 DW (16 bytes) — timestamps, security IV
-        //   Group 2: 2 DW (8 bytes)  — timestamp, AMPDU ref
-        //   Group 3: 2 DW (8 bytes)  — P-RXV (rate info + RCPI/RSSI!)
-        //   Group 5: 18 DW (72 bytes) — C-RXV (only present inside Group 3)
-        let base_rxd = 24;
-        let mut extra = 0usize;
-        if has_group4 { extra += 16; }
-        if has_group1 { extra += 16; }
-        if has_group2 { extra += 8; }
-        if has_group3 {
-            extra += 8;  // P-RXV: 2 DWORDs
-            if has_group5 {
-                extra += 72; // C-RXV: 6 + 12 = 18 DWORDs (nested inside Group 3)
-            }
-        }
-        let rxd_total = base_rxd + extra;
-
-        // Extract RSSI from Group 3 (P-RXV) if present
-        // Linux: RCPI is in P-RXV DW1 (second DWORD of Group 3)
-        // If Group 5 is present, Linux uses Group 5's first DWORD instead
-        let mut rssi: i8 = -80; // default if no RCPI available
-        if has_group3 {
-            // P-RXV offset: base + Group4 + Group1 + Group2
-            let mut g3_off = base_rxd;
-            if has_group4 { g3_off += 16; }
-            if has_group1 { g3_off += 16; }
-            if has_group2 { g3_off += 8; }
-
-            // RCPI source: Group 5 DW0 if present, otherwise P-RXV DW1
-            let rcpi_val = if has_group5 {
-                // Group 5 starts at g3_off + 8 (after P-RXV 2 DW) + 24 (6 DW skip)
-                let g5_off = g3_off + 8 + 24; // rxd += 2 (P-RXV) + 6 (C-RXV part 1)
-                if g5_off + 4 <= pkt_len {
-                    u32::from_le_bytes([rxd[g5_off], rxd[g5_off+1], rxd[g5_off+2], rxd[g5_off+3]])
-                } else {
-                    0
-                }
-            } else if g3_off + 8 <= pkt_len {
-                // P-RXV DW1
-                u32::from_le_bytes([rxd[g3_off+4], rxd[g3_off+5], rxd[g3_off+6], rxd[g3_off+7]])
-            } else {
-                0
-            };
-
-            if rcpi_val != 0 {
-                let rcpi0 = (rcpi_val & 0xFF) as u8;
-                let rcpi1 = ((rcpi_val >> 8) & 0xFF) as u8;
-                let rcpi2 = ((rcpi_val >> 16) & 0xFF) as u8;
-                let rcpi3 = ((rcpi_val >> 24) & 0xFF) as u8;
-                let max_rcpi = [rcpi0, rcpi1, rcpi2, rcpi3]
-                    .iter()
-                    .copied()
-                    .filter(|&r| r > 0 && r < 255)
-                    .max()
-                    .unwrap_or(0);
-                if max_rcpi > 0 {
-                    rssi = ((max_rcpi as i16 - 220) / 2) as i8;
-                }
-            }
-        }
-
-        // The 802.11 frame starts after the RXD + hdr_offset
-        let frame_start = rxd_total + hdr_offset;
-
-        if frame_start >= pkt_len {
-            return None;
-        }
-
-        let frame_data = rxd[frame_start..pkt_len.min(rx_byte_cnt)].to_vec();
-
-        if frame_data.len() < 10 {
-            return None;
-        }
-
-        // Use firmware-reported channel if available, otherwise fall back to configured channel
-        let rx_channel = if ch_freq > 0 { ch_freq } else { self.channel };
-
-        Some(RxFrame {
-            data: frame_data,
-            rssi,
-            channel: rx_channel,
-            band: match self.band { Band::Band2g => 0, Band::Band5g => 1, Band::Band6g => 2 },
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default(),
-            ..Default::default()
-        })
-    }
-
     /// Read MAC address from EEPROM via MCU.
     fn read_mac_from_eeprom(&mut self) -> Result<MacAddress> {
         // MAC is at EEPROM offset 0x004
@@ -3687,7 +3500,7 @@ impl ChipDriver for Mt7921au {
         self.mcu_set_vif_ps_awake()?;
 
         // Drain any stale data from USB endpoints before configuring monitor mode.
-        self.drain_usb_endpoints()?;
+        self.drain_rx();
 
         // STEP 1: Create a virtual interface (VIF) in the firmware.
         self.mcu_add_dev()?;
@@ -3759,7 +3572,7 @@ impl ChipDriver for Mt7921au {
         self.reg_set(MT_UWFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_RX_DMA_EN)?;
 
         // Drain again after config — catch any responses from commands above
-        self.drain_usb_endpoints()?;
+        self.drain_rx();
 
         Ok(())
     }
@@ -3917,9 +3730,10 @@ impl ChipDriver for Mt7921au {
     }
 
     fn rx_frame(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
+        use crate::core::chip::ParsedPacket;
         // MT7921 with aggregation enabled (AGG_LMT=64, AGG_TO=0xFF).
         // Each USB read may return multiple packets back-to-back in the buffer.
-        // parse_rx_packet() walks the buffer extracting frames one at a time.
+        // mt7921au_parse_rx() walks the buffer extracting frames one at a time.
         // Many packets are non-data (MCU events, TX status) — we loop through
         // them efficiently with short USB reads between buffer exhaustions.
         let deadline = Instant::now() + timeout;
@@ -3927,11 +3741,15 @@ impl ChipDriver for Mt7921au {
         loop {
             // Parse any buffered packets first (zero USB cost)
             while self.rx_pos < self.rx_len {
-                if let Some(frame) = self.parse_rx_packet() {
-                    return Ok(Some(frame));
-                }
-                if self.rx_pos >= self.rx_len {
+                let buf = &self.rx_buf[self.rx_pos..self.rx_len];
+                let (consumed, packet) = mt7921au_parse_rx(buf, self.channel);
+                if consumed == 0 {
+                    self.rx_pos = self.rx_len;
                     break;
+                }
+                self.rx_pos += consumed;
+                if let ParsedPacket::Frame(frame) = packet {
+                    return Ok(Some(frame));
                 }
             }
 
