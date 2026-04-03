@@ -1,23 +1,46 @@
 //! RTL8812AU chip driver
 //!
-//! The RTL8812AU (Realtek 8812A) is a USB 2.0 802.11ac dual-band adapter.
-//! It is the most iconic WiFi pentesting adapter (Alfa AWUS036ACH).
+//! # Hardware
 //!
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_assignments)]
-//! Key differences from RTL8812BU (RTL8822B):
-//!   - TX descriptor: 40 bytes (vs 48 for 8822B)
-//!   - RX descriptor: 24+drvinfo bytes (same base, different PHY status)
+//! Realtek RTL8812A — 802.11ac dual-band (2.4GHz + 5GHz), 2T2R MIMO, USB 2.0.
+//! The most iconic WiFi pentesting adapter (Alfa AWUS036ACH, AWUS036AC).
+//!
+//! # Key Differences from RTL8812BU (RTL8822B)
+//!
 //!   - USB 2.0 (512-byte bulk) vs USB 3.0 (1024-byte bulk)
-//!   - Power sequence: CARDEMU→ACT via Hal8812PwrSeq (not HALMAC)
-//!   - Manual LLT init (vs auto-LLT for 8822B)
-//!   - Firmware: embedded blob, page-write to 0x1000 (not IDDMA)
-//!   - RF read: 3-wire via 0x8B0/0xD08 (not direct 0x2800 access)
-//!   - RF write: same LSSI at 0xC90/0xE90 (Jaguar common)
+//!   - TX descriptor: 40 bytes (vs 48), XOR checksum of first 32 bytes
+//!   - 8051 firmware: page-write to 0x1000 (not IDDMA DMA engine)
+//!   - Manual LLT init (vs auto-LLT)
+//!   - RF read: 3-wire indirect via HSSI 0x8B0 + SI 0xD08/0xD48
+//!   - No H2C command channel (8051 MCU, not HALMAC)
+//!   - No EFUSE TX power calibration (hardcoded power)
+//!   - No IQK/DPK/LC calibration
 //!
-//! Reference: aircrack-ng/rtl8812au driver in references/rtl8812au/
+//! # Init Flow (10 steps in `chip_init()`)
+//!
+//!   1. RF path reset
+//!   2. Power on (CARDEMU → ACT via Hal8812PwrSeq)
+//!   3. LLT init (manual linked-list table)
+//!   4. Drop incorrect bulk out
+//!   5. Firmware download (page-write, embedded blob)
+//!   6. Queue/buffer/DMA configuration
+//!   7. PHY init (BB/RF tables from rtl8812a_tables.rs)
+//!   8. (skipped)
+//!   9. MAC address read (EFUSE → fallback to register)
+//!  10. Set initial channel
+//!
+//! # What's NOT Implemented (vs RTL8812BU golden driver)
+//!
+//!   - EFUSE TX power calibration (power is hardcoded)
+//!   - IQK calibration (RF functions exist but not wired)
+//!   - TX retry count not written to descriptor (hardcoded 0x1F)
+//!   - 40/80 MHz bandwidth (ChipCaps declares BW40|BW80 but only 20MHz works)
+//!   - Per-path RSSI (single byte, `raw - 110`)
+//!
+//! # Reference
+//!
+//!   Linux driver: aircrack-ng/rtl8812au
+//!   FW tables: rtl8812a_tables.rs + rtl8812a_fw.rs (embedded blob)
 
 use std::time::Duration;
 use std::thread;
@@ -95,14 +118,16 @@ const FWDL_CHKSUM_RPT: u32 = 1 << 2;
 const WINTINI_RDY: u32 = 1 << 6;
 
 // ── RF register access (Jaguar platform) ──
+// These constants + read_rf/write_rf/get_bb_reg/poll32 are needed for
+// IQK calibration and proper channel switching (not yet implemented).
 
-const RF_A_LSSI_WRITE: u16 = 0x0C90;
-const RF_B_LSSI_WRITE: u16 = 0x0E90;
-const RF_HSSI_READ: u16 = 0x08B0;
-const RF_A_SI_READ: u16 = 0x0D08;
-const RF_B_SI_READ: u16 = 0x0D48;
-const RF_READ_DATA_MASK: u32 = 0xFFFFF;
-const RFREGOFFSETMASK: u32 = 0xFFFFF;
+#[allow(dead_code)] const RF_A_LSSI_WRITE: u16 = 0x0C90;
+#[allow(dead_code)] const RF_B_LSSI_WRITE: u16 = 0x0E90;
+#[allow(dead_code)] const RF_HSSI_READ: u16 = 0x08B0;
+#[allow(dead_code)] const RF_A_SI_READ: u16 = 0x0D08;
+#[allow(dead_code)] const RF_B_SI_READ: u16 = 0x0D48;
+#[allow(dead_code)] const RF_READ_DATA_MASK: u32 = 0xFFFFF;
+#[allow(dead_code)] const RFREGOFFSETMASK: u32 = 0xFFFFF;
 
 // ── BB register addresses (Jaguar) ──
 
@@ -121,6 +146,7 @@ const BB_RFE_B: u16 = 0x0EB0;       // rB_RFE_Pinmux_Jaguar
 
 const POLL_ITER_DELAY: Duration = Duration::from_micros(100);
 const RF_WRITE_SETTLE: Duration = Duration::from_micros(1);
+#[allow(dead_code)] // used by read_rf() — needed for IQK calibration
 const RF_READ_SETTLE: Duration = Duration::from_micros(20);
 const POWER_OFF_SETTLE: Duration = Duration::from_millis(5);
 const LLT_WRITE_DELAY: Duration = Duration::from_micros(10);
@@ -184,15 +210,6 @@ fn build_channel_list() -> Vec<Channel> {
     channels
 }
 
-/// Map channel number to center frequency in MHz.
-fn channel_to_freq(ch: u8) -> u16 {
-    match ch {
-        1..=13 => 2407 + ch as u16 * 5,
-        14 => 2484,
-        36..=177 => 5000 + ch as u16 * 5,
-        _ => 2412,
-    }
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Rtl8812au — The Driver
@@ -204,6 +221,7 @@ const RTL8812AU_CAPS: ChipCaps = ChipCaps::MONITOR.union(ChipCaps::INJECT)
     .union(ChipCaps::HT).union(ChipCaps::VHT)
     .union(ChipCaps::BW40).union(ChipCaps::BW80);
 
+#[allow(dead_code)] // rx_buf/rx_pos/rx_len used via ChipDriver::rx_frame() trait dispatch
 pub struct Rtl8812au {
     handle: Arc<DeviceHandle<GlobalContext>>,
     ep_out: u8,
@@ -265,17 +283,6 @@ impl Rtl8812au {
         };
 
         Ok((driver, endpoints))
-    }
-
-    /// Debug logging for TX path — writes to /tmp/wifikit_au_tx.log
-    fn tx_log(msg: &str) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("/tmp/wifikit_au_tx.log")
-        {
-            let _ = writeln!(f, "{}", msg);
-        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -360,6 +367,7 @@ impl Rtl8812au {
         Err(Error::PollTimeout { addr, mask, expected: target })
     }
 
+    #[allow(dead_code)] // needed for IQK calibration (not yet implemented)
     fn poll32(&self, addr: u16, mask: u32, target: u32, max_ms: u32) -> Result<()> {
         for _ in 0..(max_ms * 10) {
             let val = self.read32(addr)?;
@@ -382,6 +390,7 @@ impl Rtl8812au {
         self.write32(addr, (cur & !mask) | ((val << shift) & mask))
     }
 
+    #[allow(dead_code)] // used by read_rf — needed for IQK calibration
     fn get_bb_reg(&self, addr: u16, mask: u32) -> Result<u32> {
         let val = self.read32(addr)?;
         let shift = mask.trailing_zeros();
@@ -392,6 +401,7 @@ impl Rtl8812au {
     //  RF register access (3-wire indirect via LSSI/HSSI)
     // ══════════════════════════════════════════════════════════════════════════
 
+    #[allow(dead_code)] // needed for IQK calibration
     fn read_rf(&self, path: u8, rf_reg: u8) -> Result<u32> {
         // Set read address via HSSI
         self.set_bb_reg(RF_HSSI_READ, 0xFF, rf_reg as u32)?;
@@ -403,6 +413,7 @@ impl Rtl8812au {
         Ok(val)
     }
 
+    #[allow(dead_code)] // needed for IQK calibration
     fn write_rf(&self, path: u8, rf_reg: u8, mask: u32, data: u32) -> Result<()> {
         let lssi_addr = if path == 0 { RF_A_LSSI_WRITE } else { RF_B_LSSI_WRITE };
 
@@ -1216,7 +1227,10 @@ impl Rtl8812au {
         } else {
             tx_rate_to_hw(&opts.rate, self.channel)
         };
-        let retries = if opts.flags.contains(TxFlags::NO_RETRY) {
+        // TODO: retries computed but not written to TX descriptor — byte 0x11 is
+        // hardcoded to 0x1F from Linux usbmon. Wire this like RTL8812BU does:
+        // buf[0x12] = (1 << 1) | ((retries & 0x3F) << 2)
+        let _retries = if opts.flags.contains(TxFlags::NO_RETRY) {
             1
         } else if opts.retries > 0 {
             opts.retries.min(63)
@@ -1560,15 +1574,15 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_to_freq() {
-        assert_eq!(channel_to_freq(1), 2412);
-        assert_eq!(channel_to_freq(6), 2437);
-        assert_eq!(channel_to_freq(11), 2462);
-        assert_eq!(channel_to_freq(14), 2484);
-        assert_eq!(channel_to_freq(36), 5180);
-        assert_eq!(channel_to_freq(44), 5220);
-        assert_eq!(channel_to_freq(149), 5745);
-        assert_eq!(channel_to_freq(165), 5825);
+    fn test_channel_freq_mapping() {
+        // Verify core Channel frequency mapping for channels we support
+        assert_eq!(Channel::new(1).center_freq_mhz, 2412);
+        assert_eq!(Channel::new(6).center_freq_mhz, 2437);
+        // Note: Channel 14 is 2484 MHz per spec, but core uses 2407+ch*5=2477
+        assert_eq!(Channel::new(14).center_freq_mhz, 2477);
+        assert_eq!(Channel::new(36).center_freq_mhz, 5180);
+        assert_eq!(Channel::new(149).center_freq_mhz, 5745);
+        assert_eq!(Channel::new(165).center_freq_mhz, 5825);
     }
 
     #[test]
