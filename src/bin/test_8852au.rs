@@ -53,41 +53,41 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // ── RX Test ──
-    eprintln!("\n--- RX Test (10 seconds) ---");
-    let start = std::time::Instant::now();
-    let mut frame_count = 0u32;
-    let mut byte_count = 0u64;
+    // ── Channel Switch + RX Test ──
+    // Test all 39 channels like the real scanner does
+    let all_channels: Vec<(u8, String)> = driver.supported_channels().iter()
+        .map(|ch| (ch.number, format!("ch{}", ch.number)))
+        .collect();
+    let test_channels: Vec<(u8, String)> = all_channels;
 
-    while start.elapsed() < Duration::from_secs(10) {
-        match driver.rx_frame(Duration::from_millis(100)) {
-            Ok(Some(frame)) => {
-                frame_count += 1;
-                byte_count += frame.data.len() as u64;
-                if frame_count <= 5 {
-                    eprintln!("  Frame {}: {} bytes, type=0x{:02X}{:02X}, ch={}",
-                        frame_count, frame.data.len(),
-                        frame.data.get(0).unwrap_or(&0),
-                        frame.data.get(1).unwrap_or(&0),
-                        frame.channel);
-                }
-                if frame_count == 6 {
-                    eprintln!("  ... (suppressing further frame logs)");
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("  RX error: {}", e);
-                break;
+    let mut total_frames = 0u32;
+    let dwell = Duration::from_millis(500); // match scanner default
+    for (i, (ch, label)) in test_channels.iter().enumerate() {
+        let sw = std::time::Instant::now();
+        if i > 0 {
+            match driver.set_channel(wifikit::core::Channel::new(*ch)) {
+                Ok(()) => {},
+                Err(e) => { eprintln!("  → {} FAILED: {}", label, e); continue; }
             }
         }
+        let sw_ms = sw.elapsed().as_secs_f64() * 1000.0;
+
+        let start = std::time::Instant::now();
+        let mut frames = 0u32;
+        while start.elapsed() < dwell {
+            match driver.rx_frame(Duration::from_millis(50)) {
+                Ok(Some(_)) => frames += 1,
+                _ => {}
+            }
+        }
+        if frames > 0 || i < 5 || i == test_channels.len() - 1 {
+            eprintln!("  {} → {} frames ({:.0} fps) [{:.0}ms sw]", label, frames, frames as f64 / dwell.as_secs_f64(), sw_ms);
+        }
+        total_frames += frames;
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
     eprintln!("\n--- Results ---");
-    eprintln!("TX: 3 probe requests attempted");
-    eprintln!("RX: {} frames in {:.1}s ({:.1} fps)", frame_count, elapsed, frame_count as f64 / elapsed);
-    eprintln!("Bytes: {} ({:.1} KB/s)", byte_count, byte_count as f64 / elapsed / 1024.0);
+    eprintln!("Total: {} frames across {} channels (500ms dwell)", total_frames, test_channels.len());
 
     // Shutdown
     let _ = driver.shutdown();

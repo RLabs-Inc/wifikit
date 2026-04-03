@@ -410,22 +410,12 @@ fn run_hop_bench(driver: &mut wifikit::chips::rtl8852au::Rtl8852au, channels: &[
         }
         switch_stats.record(sw_start.elapsed());
 
-        // Active scan: send 3 broadcast probe requests at 10ms intervals
-        // (matches Linux driver's SCAN_PROBE_TIMES=3, SCAN_PROBE_INTERVAL=10ms)
-        let mac = driver.mac();
-        if let Some(probe) = wifikit::protocol::frames::build_probe_request(
-            &mac, "", &[]
-        ) {
-            let opts = TxOptions::default();
-            for i in 0..3 {
-                let _ = driver.tx_frame(&probe, &opts);
-                if i < 2 { std::thread::sleep(Duration::from_millis(10)); }
-            }
-        }
+        // TX probe requests disabled — TX on EP5 may stall RX on this chip
+        // TODO: re-enable once TX/RX independence is verified
 
         let dwell_end = Instant::now() + dwell;
         while Instant::now() < dwell_end && Instant::now() < deadline {
-            match driver.rx_frame(Duration::from_millis(10)) {
+            match driver.rx_frame(Duration::from_millis(50)) {
                 Ok(Some(frame)) => {
                     global_stats.classify(&frame.data);
                     per_band.entry(band_name).or_default().classify(&frame.data);

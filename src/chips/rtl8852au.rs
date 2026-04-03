@@ -577,8 +577,7 @@ impl Rtl8852au {
                     endpoints.bulk_out_all),
             }
         })?;
-        eprintln!("[RTL8852AU] Endpoints: OUT=0x{:02X} IN=0x{:02X} FW=0x{:02X} (all OUT: {:?})",
-            ep_out, ep_in, ep_fw, endpoints.bulk_out_all);
+        // Debug: eprintln!("[RTL8852AU] Endpoints: OUT=0x{:02X} IN=0x{:02X} FW=0x{:02X}", ep_out, ep_in, ep_fw);
 
         let driver = Self {
             handle: Arc::new(handle),
@@ -1783,20 +1782,25 @@ impl Rtl8852au {
         self.set_reg_bb(0x0804, 0xFF, 0xFF)?;
         self.set_reg_bb(0x0804, 0xFF, 0x00)?;
         self.set_reg_bb(0x0804, 0xFF, 0xFF)?;
+        // Wait for BB reset to settle before re-enabling radio
+        thread::sleep(Duration::from_micros(100));
 
         // ═══ Step 7: hal_reset(disable) — resume radio ═══
         // From hal_com_i.c:251-282
 
-        // Re-enable ADC (BB reg 0x20FC bits [31:24] = 0x0)
-        self.set_reg_bb(0x20FC, 0xFF000000, 0x0)?;
-        // Re-enable DFS (BB reg 0x0 bit 31 = 1)
-        self.set_reg_bb(0x0, 1u32 << 31, 1)?;
+        // BB reset enable = true (BB reg 0x704 bit 1 = 1) — do this FIRST
+        // to ensure BB is ready before re-enabling ADC/PPDU
+        self.set_reg_bb(0x0704, 0x2, 1)?;
         // Re-enable TSSI continuous mode (both paths)
         // enable = set bit 30 to 0
         self.set_reg_bb(0x5818, 1 << 30, 0)?;
         self.set_reg_bb(0x7818, 1 << 30, 0)?;
-        // BB reset enable = true (BB reg 0x704 bit 1 = 1)
-        self.set_reg_bb(0x0704, 0x2, 1)?;
+        // Re-enable DFS (BB reg 0x0 bit 31 = 1)
+        self.set_reg_bb(0x0, 1u32 << 31, 1)?;
+        // Re-enable ADC/PPDU status (BB reg 0x20FC bits [31:24] = 0x0) — LAST
+        // This is the critical write that restores RX. Must come after BB is
+        // fully reset and TSSI is re-enabled.
+        self.set_reg_bb(0x20FC, 0xFF000000, 0x0)?;
 
         self.channel = ch;
         Ok(())
@@ -2080,8 +2084,6 @@ impl Rtl8852au {
                     // causing a burst of incoming data that must be drained before
                     // the firmware will accept new H2C commands.
                     if *ep == 0x07 && reg_ops_since_last_bulk > 50 && h2c_sent > 0 {
-                        eprintln!("[RTL8852AU]   Drain pause: {} reg ops since last H2C, waiting 500ms...",
-                            reg_ops_since_last_bulk);
                         thread::sleep(Duration::from_millis(500));
                     }
 
@@ -2094,7 +2096,23 @@ impl Rtl8852au {
                         }
                     }
 
-                    // Send raw pcap bytes verbatim — no header rebuilding
+                    // Skip ADDR_CAM (cat=1,cls=6,func=0) and FWROLE_MAINTAIN
+                    // (cat=1,cls=8,func=4) — these set up MAC address filtering
+                    // that blocks RX. Without them, firmware delivers all frames
+                    // in monitor mode (promiscuous via RX filter register).
+                    if *ep == 0x07 {
+                        if let Some((cat, class, func, _)) = Self::parse_h2c_from_pcap(data) {
+                            if cat == 1 && class == 6 && func == 0 {
+                                bulk_skip += 1;
+                                continue;
+                            }
+                            if cat == 1 && class == 8 && func == 4 {
+                                bulk_skip += 1;
+                                continue;
+                            }
+                        }
+                    }
+
                     let target_ep = if *ep == 0x07 { self.ep_fw } else { self.ep_out };
                     let timeout = Duration::from_millis(if data.len() > 1024 { 2000 } else { 500 });
                     match self.handle.write_bulk(target_ep, data, timeout) {
@@ -2103,12 +2121,7 @@ impl Rtl8852au {
                             if *ep == 0x07 {
                                 h2c_sent += 1;
                                 reg_ops_since_last_bulk = 0;
-                                if let Some((cat, class, func, _)) = Self::parse_h2c_from_pcap(data) {
-                                    eprintln!("[RTL8852AU]   H2C RAW cat={} cls={} func={} ({} bytes): OK [#{}]",
-                                        cat, class, func, data.len(), h2c_sent);
-                                } else {
-                                    eprintln!("[RTL8852AU]   Bulk EP7 raw ({} bytes): OK", data.len());
-                                }
+                                let _ = Self::parse_h2c_from_pcap(data);
                             }
                         }
                         Err(e) => {
@@ -2130,7 +2143,8 @@ impl Rtl8852au {
             }
         }
 
-        eprintln!("[RTL8852AU] {} complete: R={} W={}/{} B={}/{} skip={}",
+        // Debug: phase completion summary
+        let _ = (
             name, read_ok, write_ok, write_fail, bulk_ok, bulk_fail, bulk_skip);
 
         Ok(())
@@ -2311,8 +2325,7 @@ impl Rtl8852au {
             (0x8908, "RXDMA_SET"),
             (0xCE20, "RX_FLTR"),
         ];
-        for (addr, name) in regs {
-        }
+        let _ = (label, regs);
     }
 
     /// Board-specific registers that must NOT be written from pcap values
@@ -2359,20 +2372,11 @@ impl Rtl8852au {
                     Ok(n) if n > 0 => {
                         total_reads += 1;
                         total_bytes += n;
-                        if n >= 4 {
-                            let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                            let pkt_len = dw0 & 0x3FFF;
-                            let rpkt_type = (dw0 >> 24) & 0xF;
-                            eprintln!("[RTL8852AU] drain: {} bytes, rpkt_type={}, pkt_len={} (total: {}B in {} reads)",
-                                n, rpkt_type, pkt_len, total_bytes, total_reads);
-                        }
                     }
                     _ => {}
                 }
             }
-            if total_bytes > 0 {
-                eprintln!("[RTL8852AU] drain thread: {}B total in {} reads", total_bytes, total_reads);
-            }
+            let _ = (total_bytes, total_reads);
         });
 
         // ── Phase 0: Pre-FWDL (our proven read-modify-write code) ──
@@ -2382,22 +2386,24 @@ impl Rtl8852au {
         // ── Phase 1: Firmware download ──
         self.load_firmware()?;
 
-        // ── Phase 2: Post-FWDL — register ops + OUTSRC cal H2C ONLY ──
-        // Skip FWDL zone (325 ops). Then replay register ops + only the 6 OUTSRC
-        // calibration H2C commands (cls=8 BB cal + cls=9 RF cal). Skip all other
-        // H2C commands (ADDR_CAM, MEDIA_RPT, etc.) to avoid MAC filtering.
+        // ── Phase 2: Post-FWDL — all register ops + calibration H2C ──
+        // Skip FWDL zone (325 ops) and ADDR_CAM/FWROLE_MAINTAIN H2C commands.
+        // ADDR_CAM contains the pcap capture machine's MAC; sending it enables
+        // firmware address filtering that blocks all RX in monitor mode.
         const FWDL_ZONE_OPS: usize = 325;
         let post_fwdl_only = &super::rtl8852a_phase_post_fwdl::POST_FWDL_SEQUENCE[FWDL_ZONE_OPS..];
         self.replay_phase_complete("Post-FWDL",
             post_fwdl_only, false)?;
 
-        // ── Phase 3: Monitor mode ──
-        self.replay_phase_complete("Monitor",
-            super::rtl8852a_phase_monitor::MONITOR_SEQUENCE, false)?;
-
-        // ── Phase 4: Default channel (ch1 2.4GHz) ──
-        self.replay_phase_complete("Channel 1",
-            super::rtl8852a_phase_ch1::CH1_SEQUENCE, false)?;
+        // ── Phase 3: Monitor mode — programmatic, no pcap replay ──
+        // The pcap monitor sequence contains a full channel switch (hal_reset →
+        // BB/RF retune → hal_resume) plus ADDR_CAM commands. Replaying this
+        // kills RX because op[31] disables PPDU status (0x120FC = 0x0F000000)
+        // and subsequent ADDR_CAM commands that should restore it are device-
+        // specific. Instead: just set the RX filter to monitor mode.
+        let rx_fltr_monitor = 0x031644BFu32; // from pcap: accept all frame types
+        self.write32(R_AX_RX_FLTR_OPT, rx_fltr_monitor)?;
+        // Monitor mode configured: RX_FLTR = 0x031644BF (promiscuous)
 
         // ── Stop background drain ──
         drain_running.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2407,8 +2413,9 @@ impl Rtl8852au {
 
         self.dump_key_regs("After complete init");
 
-        // ── Read MAC address ──
+        // Read MAC address after init is complete
         self.read_mac_address()?;
+        // MAC read from EFUSE autoload registers
 
         Ok(())
     }
