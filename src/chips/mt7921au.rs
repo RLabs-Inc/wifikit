@@ -1,30 +1,102 @@
-//! MT7921AU chip driver
+//! MT7921AU chip driver — WiFi 6 (802.11ax), tri-band
 //!
-//! The MT7921AU (MediaTek MT7961) is a WiFi 6 (802.11ax) USB adapter.
-//! It supports 2.4 GHz, 5 GHz, and 6 GHz bands with HE capabilities.
+//! # Hardware
 //!
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_assignments)]
+//! MediaTek MT7921AU (MT7961) — 802.11ax tri-band (2.4GHz + 5GHz + 6GHz), 2T2R MIMO, USB 3.0.
+//! WiFi 6 (HE) capable with firmware-driven MCU architecture.
+//! Used in: Fenvi FU-AX1800 (USB3), Comfast CF-952AX, and others.
+//! This is the project's most feature-rich driver — testmode spectrum analyzer, I/Q capture,
+//! rogue AP, burst TX injection engine, and MIB channel survey all hardware-confirmed.
+//!
 //! Key differences from Realtek RTL8812AU/BU:
-//!   - Firmware-driven: onboard MCU runs autonomous firmware
-//!   - Register access: USB vendor requests 0x63 (read) / 0x66 (write)
-//!   - Channel switching: MCU command, not direct register writes
-//!   - Monitor mode: MCU sniffer command (UNI_CMD 0x24)
-//!   - TX/RX: MCU-managed DMA queues, 64-byte TXWI descriptors
-//!   - Firmware: ROM patch + WM RAM code downloaded at init
+//!   - Firmware-driven: onboard MCU runs autonomous firmware (ROM patch + WM RAM)
+//!   - Register access: USB vendor requests 0x63 (read) / 0x66 (write), extended addressing
+//!   - Channel switching: MCU command (CHANNEL_SWITCH 0x08), not direct register writes
+//!   - Monitor mode: MCU sniffer command (UNI_CMD 0x24) + RX filter drop-bit clearing
+//!   - TX/RX: MCU-managed DMA queues, 64-byte TXWI descriptors, SDIO header framing
+//!   - Testmode: firmware RF test interface (ATE commands) for spectrum/injection/calibration
 //!
-//! USB endpoints (same layout for all MT7921AU variants):
-//!   - EP 0x84/0x85 BULK IN  (RX data + events)
-//!   - EP 0x04-0x09 BULK OUT (TX queues by priority)
-//!   - EP 0x86 INT IN        (MCU events)
+//! # Init Flow (9 steps in `full_init()`)
 //!
-//! Reference: openwrt/mt76 driver in references/mt76/
-//!   mt792x_usb.c    — USB register access, DMA init
-//!   mt7921/usb.c    — USB probe, MCU init
-//!   mt7921/mcu.c    — firmware download, MCU commands
-//!   mt792x_regs.h   — register addresses and bit definitions
+//!   1. Read chip ID/revision (retry + WFSYS reset if stuck from previous session)
+//!   2. Check firmware state (CONN_ON_MISC N9_RDY bit)
+//!   3. WFSYS reset if firmware was already running
+//!   4. MCU power on (power sequence + poll conn_infra status)
+//!   5. DMA init (WFDMA + UDMA config, RX aggregation, endpoint mapping)
+//!   6. Set normal mode (SWDEF register)
+//!   7. Download and start firmware (ROM patch + WM RAM, section-by-section)
+//!   8. Post-firmware: NIC capabilities query + FW log enable
+//!   9. Read MAC address from EEPROM
+//!
+//! # USB Protocol
+//!
+//!   Register I/O: vendor control transfers
+//!     Read:  bmRequestType=0x5F, bRequest=0x63, wValue=addr[15:0], wIndex=addr[31:16]
+//!     Write: bmRequestType=0x5F, bRequest=0x66, wValue=addr[15:0], wIndex=addr[31:16]
+//!   UHW access: bRequest=0x01/0x02 with TYPE_UHW_VENDOR (for EEPROM, mode switch)
+//!   Data TX: bulk OUT with SDIO_HDR(4) + TXWI(64) + 802.11 frame + pad + tail(4)
+//!   Data RX: bulk IN with RXWI header, USB aggregation (AGG_LMT=64, AGG_TO=0xFF)
+//!   MCU commands: bulk OUT EP8 with MCU_TXD header, response via EP4/EP5 bulk IN
+//!
+//! # USB Endpoints
+//!
+//!   EP 0x08       BULK OUT — MCU commands
+//!   EP 0x04       BULK OUT — AC_BK / firmware scatter
+//!   EP 0x05       BULK OUT — AC_BE (primary data TX)
+//!   EP 0x06       BULK OUT — AC_VI
+//!   EP 0x07       BULK OUT — AC_VO
+//!   EP 0x09       BULK OUT — firmware download
+//!   EP 0x84/0x85  BULK IN  — RX data + MCU events
+//!
+//! # MCU Command Architecture
+//!
+//!   Three command paths:
+//!     1. EXT commands (mcu_send_ext_cmd): MCU_CMD_EXT_CMP header, for UNI_CMD, CHANNEL_SWITCH
+//!     2. CE commands (mcu_send_ce_cmd): host-originated, for NIC_CAPS, FW_LOG, BSS_ABORT
+//!     3. Direct messages (mcu_send_msg): raw MCU_TXD, for firmware download
+//!   Responses: parsed from EP4/EP5 bulk IN with sequence matching
+//!   RX thread path: when RxHandle active, MCU responses forwarded via mpsc channel
+//!
+//! # Testmode (RF Test / Spectrum Analyzer)
+//!
+//!   Firmware ATE (Automatic Test Equipment) interface:
+//!     - Spectrum analyzer: MIB survey registers (busy/tx/rx/obss time per channel)
+//!     - Burst TX engine: configurable rate/BW/power/count/IPG packet injection
+//!     - Continuous wave: CW tone for jamming/range testing/antenna tuning
+//!     - RF calibration: per-antenna power, frequency offset, TSSI readback
+//!     - I/Q capture: raw baseband samples (via testmode ICAP)
+//!   All accessed through testmode_set_at() / testmode_query_at() wrappers
+//!
+//! # Architecture Decisions
+//!
+//!   - Combo device support: WiFi is iface 3 for MediaTek VID (0-2 = Bluetooth)
+//!   - Monitor mode is 7-step: radio_init → PM exit → add_dev → sniffer → RX filter → UDMA
+//!   - Channel survey uses direct MIB register reads (no testmode needed)
+//!   - TX uses WMM queue mapping: frame type → TID → AC → endpoint selection
+//!   - RX thread forwards MCU responses via unbounded mpsc channel (bounded drops responses)
+//!   - set_mac() uses POWERED_ADDR_CHANGE: firmware updates OMAC in-place
+//!   - Rogue AP: beacon offload via MCU command, proper VIF lifecycle
+//!
+//! # What's NOT Implemented
+//!
+//!   - 160 MHz bandwidth (ChipCaps declares up to BW80)
+//!   - Per-rate RSSI (single value from RXWI GROUP_4)
+//!   - Full EEPROM parsing (only MAC address extracted)
+//!   - Power save management (always exits PM on monitor init)
+//!   - Firmware crash recovery (no watchdog/restart mechanism)
+//!
+//! # Reference
+//!
+//!   Linux driver: openwrt/mt76 in references/mt76/
+//!     mt792x_usb.c    — USB register access, DMA init
+//!     mt7921/usb.c    — USB probe, MCU init
+//!     mt7921/mcu.c    — firmware download, MCU commands
+//!     mt792x_regs.h   — register addresses and bit definitions
+
+// Register map constants — complete chip register vocabulary for full driver implementation.
+// Struct fields/methods used via ChipDriver trait dispatch appear unused to the compiler.
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
 use std::time::{Duration, Instant};
 use std::thread;
@@ -763,9 +835,6 @@ impl Mt7921au {
         let mut ep_fwdl_out: u8 = EP_OUT_FWDL_DEFAULT;
         let mut ep_data_in: u8 = EP_IN_DATA;
         let mut ep_event_in: u8 = EP_IN_EVENT;
-        let mut n_bulk_out: u8 = 0;
-        let mut n_bulk_in: u8 = 0;
-
         for iface in config.interfaces() {
             for alt in iface.descriptors() {
                 // Look for vendor-specific interface (class=0xFF, subclass=0xFF)
@@ -775,8 +844,8 @@ impl Mt7921au {
                     // MT76 USB uses enumeration ORDER for endpoint assignment:
                     //   [0]=MCU cmd, [1]=AC_BK/scatter, [2]=AC_BE(data),
                     //   [3]=AC_VI, [4]=AC_VO, [5]=FWDL
-                    n_bulk_out = 0;
-                    n_bulk_in = 0;
+                    let mut n_bulk_out: u8 = 0;
+                    let mut n_bulk_in: u8 = 0;
                     for ep in alt.endpoint_descriptors() {
                         match (ep.direction(), ep.transfer_type()) {
                             (rusb::Direction::Out, rusb::TransferType::Bulk) => {
@@ -1092,21 +1161,16 @@ impl Mt7921au {
     /// Drain all pending data from both RX endpoints.
     /// This prevents USB buffer backup that can stall vendor requests.
     /// Linux handles this with pre-submitted URBs; we must drain manually.
-    fn drain_all_rx(&self, label: &str) {
+    fn drain_all_rx(&self, _label: &str) {
         let mut buf = [0u8; 4096];
-        let mut total = 0usize;
         let endpoints = [self.ep_data_in, self.ep_event_in];
         for &ep in &endpoints {
             for _ in 0..10 {
                 match self.handle.read_bulk(ep, &mut buf, Duration::from_millis(50)) {
-                    Ok(n) if n > 0 => {
-                        total += n;
-                    }
+                    Ok(n) if n > 0 => {}
                     _ => break,
                 }
             }
-        }
-        if total > 0 {
         }
     }
 
@@ -2688,28 +2752,6 @@ impl Mt7921au {
         Ok(())
     }
 
-    /// Fire-and-forget variant — sends channel switch without waiting for MCU response.
-    fn mcu_set_chan_info_no_wait(&mut self, ext_cmd: u8, channel: Channel) -> Result<()> {
-        let channel_band = band_to_idx(channel.band);
-        let (center_ch, bw) = channel_center_and_bw(channel);
-
-        let mut req = [0u8; 80];
-        req[0] = channel.number; // control_ch
-        req[1] = center_ch;     // center_ch
-        req[2] = bw;            // bw: CMD_CBW_*
-        req[3] = 2;             // tx_streams_num = hweight8(0x3) = 2
-        req[4] = if ext_cmd == MCU_EXT_CMD_SET_RX_PATH {
-            0x3              // antenna_mask for SET_RX_PATH
-        } else {
-            2                // stream count for CHANNEL_SWITCH
-        };
-        req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL
-        req[10] = channel_band; // channel_band: 0=2.4G, 1=5G, 2=6G
-
-        self.mcu_send_ext_cmd(ext_cmd, &req, false)?;
-        Ok(())
-    }
-
     /// MAC hardware init — configure RX DMA, de-aggregation, WTBL, and per-band settings.
     /// Matches mt7921_mac_init() from init.c EXACTLY:
     ///   1. MDP_DCR1 RX max length
@@ -2962,63 +3004,20 @@ impl Mt7921au {
 
     /// Remove the virtual interface from the firmware.
     /// Matches mt76_connac_mcu_uni_add_dev() with enable=false.
-    /// Linux sends BSS_INFO_UPDATE(active=0) first, then DEV_INFO_UPDATE(active=0).
-    fn mcu_remove_dev(&mut self) -> Result<()> {
-        let omac_idx: u8 = 0;
-        let band_idx: u8 = 0;
-        let bss_idx: u8 = 0;
-        let wcid_idx: u16 = 543;
-        let conn_type: u32 = (1u32 << 1) | (1u32 << 16); // CONNECTION_INFRA_AP
-
-        // 1. BSS_INFO_UPDATE with active=0 (disable BSS first)
-        let mut bss_req = [0u8; 36];
-        bss_req[0] = bss_idx;
-        let t = 4;
-        bss_req[t..t+2].copy_from_slice(&0u16.to_le_bytes()); // tag = UNI_BSS_INFO_BASIC
-        bss_req[t+2..t+4].copy_from_slice(&32u16.to_le_bytes()); // len
-        bss_req[t+4] = 0; // active = false (DISABLE)
-        bss_req[t+5] = omac_idx;
-        bss_req[t+6] = omac_idx;
-        bss_req[t+7] = band_idx;
-        bss_req[t+8..t+12].copy_from_slice(&conn_type.to_le_bytes());
-        bss_req[t+20..t+22].copy_from_slice(&wcid_idx.to_le_bytes());
-        bss_req[t+26..t+28].copy_from_slice(&wcid_idx.to_le_bytes());
-
-        self.mcu_send_uni_cmd(0x02, &bss_req, true)?;
-
-        // 2. DEV_INFO_UPDATE with active=0 (deregister MAC)
-        let mut dev_req = [0u8; 16];
-        dev_req[0] = omac_idx;
-        dev_req[1] = band_idx;
-        dev_req[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag = DEV_INFO_ACTIVE
-        dev_req[6..8].copy_from_slice(&12u16.to_le_bytes()); // len
-        dev_req[8] = 0; // active = false (DISABLE)
-        dev_req[10..16].copy_from_slice(&self.mac_addr.0);
-
-        self.mcu_send_uni_cmd(0x01, &dev_req, true)?;
-
-        Ok(())
-    }
-
     /// Drain all pending data from both USB bulk IN endpoints.
     /// Linux pre-submits URBs during init so firmware events are consumed
     /// continuously. We read on-demand, so events accumulate. This drains
     /// them to prevent USB buffer stalls that block the WFDMA.
     fn drain_usb_endpoints(&self) -> Result<()> {
         let mut buf = [0u8; 4096];
-        let mut total = 0usize;
         let endpoints = [self.ep_data_in, self.ep_event_in];
         for &ep in &endpoints {
             loop {
                 match self.handle.read_bulk(ep, &mut buf, Duration::from_millis(20)) {
-                    Ok(n) if n > 0 => {
-                        total += n;
-                    }
+                    Ok(n) if n > 0 => {}
                     _ => break,
                 }
             }
-        }
-        if total > 0 {
         }
         Ok(())
     }
@@ -3306,76 +3305,6 @@ impl Mt7921au {
     //  Full Init Sequence
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Probe whether firmware is already running on this device.
-    ///
-    /// Some devices (especially the 0x0E8D combo) retain firmware in RAM
-    /// from a previous Linux driver load. If CONN_ON_MISC shows N9 ready,
-    /// we can skip the entire firmware download and go straight to MCU commands.
-    ///
-    /// Returns true if firmware is live and MCU is ready.
-    fn probe_firmware_state(&self) -> Result<bool> {
-        let conn_misc = self.reg_read(MT_CONN_ON_MISC)?;
-        let fw_state = conn_misc & MT_TOP_MISC2_FW_N9_RDY;
-        let pwr_on = conn_misc & MT_TOP_MISC2_FW_PWR_ON;
-
-
-        // Also read TOP_MISC for additional firmware state info
-        match self.reg_read(MT_TOP_MISC) {
-            Ok(top_misc) => {
-                let fw_state_bits = top_misc & MT_TOP_MISC_FW_STATE;
-            }
-            Err(_) => {},
-        }
-
-        // Check SWDEF_MODE — if normal mode (0), firmware set it during boot
-        match self.reg_read(MT_SWDEF_MODE) {
-            Ok(_) => {},
-            Err(_) => {},
-        }
-
-        // N9 ready means both bits [1:0] are set = firmware is live
-        Ok(fw_state == MT_TOP_MISC2_FW_N9_RDY)
-    }
-
-    /// Fast init path: firmware already running, just set up DMA and go.
-    fn init_with_running_firmware(&mut self) -> Result<()> {
-
-        // DMA still needs init for our USB endpoints to work
-        self.dma_init(false)?;
-
-        // Mark MCU as running
-        self.mcu_running = true;
-
-        // Try a simple MCU query to confirm communication works
-        match self.mcu_send_msg(MCU_CMD_PATCH_SEM_CONTROL, &PATCH_SEM_GET.to_le_bytes(), true) {
-            Ok(status) => {
-                // Release the semaphore right away
-                let _ = self.mcu_send_msg(MCU_CMD_PATCH_SEM_CONTROL, &PATCH_SEM_RELEASE.to_le_bytes(), true);
-            }
-            Err(e) => {
-            }
-        }
-
-        // Drain any pending RX data
-        {
-            let mut drain = [0u8; 4096];
-            let mut total = 0;
-            for _ in 0..5 {
-                match self.handle.read_bulk(self.ep_data_in, &mut drain, Duration::from_millis(50)) {
-                    Ok(n) if n > 0 => total += n,
-                    _ => break,
-                }
-            }
-            if total > 0 {
-            }
-        }
-
-        // Read MAC address
-        self.mac_addr = self.read_mac_from_eeprom()?;
-
-        Ok(())
-    }
-
     /// Complete initialization sequence.
     /// Matches mt7921u_probe() from the kernel driver.
     ///
@@ -3418,7 +3347,6 @@ impl Mt7921au {
         // 3. ONLY reset WFSYS if firmware was already running (matches Linux exactly)
         if fw_n9_rdy {
             self.wfsys_reset()?;
-        } else {
         }
 
         // 4. Power on MCU
