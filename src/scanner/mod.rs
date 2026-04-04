@@ -285,17 +285,11 @@ impl Scanner {
                     std::thread::sleep(settle_time);
                 }
 
-                // Dwell on this channel.
-                // Active scan probe is sent AFTER dwell — see below.
-                self.dwell();
-
-                // Active scan: send broadcast probe request at END of dwell.
-                // Why end, not beginning? The probe triggers every AP on the channel
-                // to respond with a full probe response frame. Sending at the start
-                // floods the USB RX buffer with probe responses, displacing STA data
-                // frames. By sending at the end, we get clean STA capture during the
-                // dwell, and the probe responses arrive on the NEXT channel visit
-                // (or are captured by the tail of this dwell if any time remains).
+                // Active scan: send broadcast probe request at START of dwell.
+                // IEEE 802.11 §11.1.4: probe request → wait → collect responses.
+                // APs respond in 1-5ms, so the entire dwell window captures responses
+                // plus beacons plus STA data. This is how every real scanner works —
+                // probes at the start, collect everything during dwell.
                 if self.config.active {
                     if let Some(probe) = frames::build_probe_request(&mac, "", &[]) {
                         let opts = TxOptions {
@@ -305,6 +299,9 @@ impl Scanner {
                         let _ = shared.tx_frame(&probe, &opts);
                     }
                 }
+
+                // Dwell on this channel — collect probe responses + beacons + data.
+                self.dwell();
             }
 
             // Completed one full round through all channels.
