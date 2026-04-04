@@ -761,10 +761,9 @@ pub struct Mt7921au {
     ep_data_in: u8,
     /// Event bulk IN endpoint
     ep_event_in: u8,
-    /// Current channel number
-    channel: u8,
-    /// Current band
-    band: Band,
+    /// Current channel — single source of truth for channel number, band, and bandwidth.
+    /// Updated exclusively by switch_channel(), never set directly.
+    current_channel: Channel,
     /// MAC address read from EEPROM
     mac_addr: MacAddress,
     /// RX ring buffer
@@ -926,8 +925,7 @@ impl Mt7921au {
             ep_fwdl_out,
             ep_data_in,
             ep_event_in,
-            channel: 0,
-            band: Band::Band2g,
+            current_channel: Channel::new(1),
             mac_addr: MacAddress::ZERO,
             rx_buf: vec![0u8; RX_BUF_SIZE],
             rx_pos: 0,
@@ -2113,179 +2111,165 @@ impl Mt7921au {
         Ok(())
     }
 
-    /// Set TX power for a band.
-    /// Matches mt76_connac_mcu_rate_txpower_band() from the kernel driver.
-    ///
-    /// The full implementation sends per-channel power limits in batches.
-    /// This simplified version sends max power (127 = 0.5 dBm units) for
-    /// all channels in the current band, which is sufficient for monitor mode.
-    ///
-    /// Uses EXT cmd TX_POWER_FEATURE_CTRL (0x58).
     /// Set per-rate TX power limits for all channels in a band.
-    /// `max_dbm` = maximum power in dBm (0 = use hardware max from SKU tables).
-    /// Values are in half-dBm units internally. Firmware clamps to eFuse limits.
+    /// Matches mt76_connac_mcu_rate_txpower_band() from mt76_connac_mcu.c:2121.
+    ///
+    /// Uses CE cmd SET_RATE_TX_POWER (0x5d) — NOT EXT cmd 0x58.
+    /// The firmware requires this command with proper country code and 6GHz channel
+    /// entries before it will enable the 6GHz RF path. Without it, 6GHz is deaf.
+    ///
+    /// TLV format (from mt76_connac_mcu.h):
+    ///   mt76_connac_tx_power_limit_tlv (44 bytes header):
+    ///     [0]     ver: u8
+    ///     [1]     pad: u8
+    ///     [2-3]   len: le16
+    ///     [4]     n_chan: u8           — channels in this batch (max 8 for connac2)
+    ///     [5]     band: u8            — 1=2.4GHz, 2=5GHz, 3=6GHz
+    ///     [6]     last_msg: u8        — 1 if last batch across ALL bands
+    ///     [7]     pad: u8
+    ///     [8-11]  alpha2[4]: u8       — country code (e.g., "BR\0\0")
+    ///     [12-43] pad2[32]: u8
+    ///   Per-channel SKU (162 bytes each, MT_SKU_POWER_LIMIT=161):
+    ///     [0]     channel: u8
+    ///     [1-161] pwr_limit[161]: i8  — per-rate power limits in half-dBm
+    ///
+    /// `max_dbm` clamps all per-rate values. 0 = use hardware max (127 half-dBm).
     fn mcu_set_rate_txpower_limited(&mut self, band: Band, max_dbm: i8) -> Result<()> {
-        // Convert dBm to half-dBm. 0 means "no limit" (use SKU defaults).
         let max_half_dbm: u8 = if max_dbm > 0 {
             (max_dbm as u8).saturating_mul(2)
         } else {
-            127 // no limit — firmware uses eFuse max
+            127 // no limit — firmware clamps to eFuse max
         };
-        self.mcu_set_rate_txpower_inner(band, max_half_dbm)
+        self.mcu_set_rate_txpower_inner(band, max_half_dbm, false)
     }
 
     fn mcu_set_rate_txpower(&mut self, band: Band) -> Result<()> {
-        self.mcu_set_rate_txpower_inner(band, 0) // 0 = use SKU defaults, no clamping
+        self.mcu_set_rate_txpower_inner(band, 127, false)
     }
 
-    fn mcu_set_rate_txpower_inner(&mut self, band: Band, max_half_dbm: u8) -> Result<()> {
-        // TX power feature ctrl sub-command for rate power
-        const TX_POWER_LIMIT_TABLE_RATE: u8 = 4;
+    /// Send TX power for all 3 bands. Called during radio_init.
+    /// The `last_ch` is the highest channel across ALL bands — Linux uses this
+    /// to set last_msg=1 only on the very last batch of the last band.
+    fn mcu_set_rate_txpower_all(&mut self) -> Result<()> {
+        self.mcu_set_rate_txpower_inner(Band::Band2g, 127, false)?;
+        self.mcu_set_rate_txpower_inner(Band::Band5g, 127, false)?;
+        self.mcu_set_rate_txpower_inner(Band::Band6g, 127, true)?; // last band
+        Ok(())
+    }
 
-        let (ch_list, band_idx): (&[u8], u8) = match band {
-            Band::Band2g => (&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], 0),
-            Band::Band5g => (&[36, 40, 44, 48, 52, 56, 60, 64,
-                               100, 104, 108, 112, 116, 120, 124, 128,
-                               132, 136, 140, 144, 149, 153, 157, 161, 165], 1),
-            Band::Band6g => {
-                // All 59 primary 20 MHz channels: 1-233 step 4
-                const CHANNELS_6G: [u8; 59] = [
-                    1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61,
-                    65, 69, 73, 77, 81, 85, 89, 93, 97, 101, 105, 109, 113, 117,
-                    121, 125, 129, 133, 137, 141, 145, 149, 153, 157, 161, 165, 169,
-                    173, 177, 181, 185, 189, 193, 197, 201, 205, 209, 213, 217, 221,
-                    225, 229, 233,
-                ];
-                (&CHANNELS_6G[..], 2)
-            },
+    fn mcu_set_rate_txpower_inner(&mut self, band: Band, max_half_dbm: u8, is_last_band: bool) -> Result<()> {
+        /// CE cmd 0x5d — matches MCU_CE_CMD_SET_RATE_TX_POWER from mt76_connac_mcu.h
+        const MCU_CE_CMD_SET_RATE_TX_POWER: u8 = 0x5d;
+
+        // Channel lists from Linux mt76_connac_mcu.c:2126-2156.
+        // These include ALL channels (primary + center frequencies for 40/80/160)
+        // because firmware needs power limits for every possible operating frequency.
+        let (ch_list, band_byte): (&[u8], u8) = match band {
+            Band::Band2g => (&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], 1),
+            Band::Band5g => (&[
+                 36,  38,  40,  42,  44,  46,  48,
+                 50,  52,  54,  56,  58,  60,  62,
+                 64, 100, 102, 104, 106, 108, 110,
+                112, 114, 116, 118, 120, 122, 124,
+                126, 128, 132, 134, 136, 138, 140,
+                142, 144, 149, 151, 153, 155, 157,
+                159, 161, 165, 169, 173, 177,
+            ], 2),
+            Band::Band6g => (&[
+                  1,   3,   5,   7,   9,  11,  13,
+                 15,  17,  19,  21,  23,  25,  27,
+                 29,  33,  35,  37,  39,  41,  43,
+                 45,  47,  49,  51,  53,  55,  57,
+                 59,  61,  65,  67,  69,  71,  73,
+                 75,  77,  79,  81,  83,  85,  87,
+                 89,  91,  93,  97,  99, 101, 103,
+                105, 107, 109, 111, 113, 115, 117,
+                119, 121, 123, 125, 129, 131, 133,
+                135, 137, 139, 141, 143, 145, 147,
+                149, 151, 153, 155, 157, 161, 163,
+                165, 167, 169, 171, 173, 175, 177,
+                179, 181, 183, 185, 187, 189, 193,
+                195, 197, 199, 201, 203, 205, 207,
+                209, 211, 213, 215, 217, 219, 221,
+                225, 227, 229, 233,
+            ], 3),
         };
 
-        // Send channels in batches of 8 (connac2 batch size)
-        let batch_len = 8;
-        let sku_len = 252; // sizeof(mt76_connac_sku_tlv) for connac2
+        // Connac2: batch_len=8, sku_len=162 (1 byte channel + 161 bytes power limits)
+        let batch_len: usize = 8;
+        let sku_len: usize = 162; // sizeof(mt76_connac_sku_tlv) = 1 + MT_SKU_POWER_LIMIT(161)
+        let hdr_len: usize = 44; // sizeof(mt76_connac_tx_power_limit_tlv)
+        let n_batches = (ch_list.len() + batch_len - 1) / batch_len;
 
-        for batch_start in (0..ch_list.len()).step_by(batch_len) {
-            let batch_end = (batch_start + batch_len).min(ch_list.len());
-            let batch_channels = &ch_list[batch_start..batch_end];
-            let is_last = batch_end >= ch_list.len();
+        // The last channel across ALL bands determines last_msg.
+        // Linux: if phy has 6GHz, last_ch = chan_list_6ghz[last] = 233.
+        let last_ch: u8 = 233; // MT7921AU has 6GHz → last is always 233
 
-            // Build payload: header (4 bytes) + per-channel SKU TLVs
+        for batch_idx in 0..n_batches {
+            let start = batch_idx * batch_len;
+            let end = (start + batch_len).min(ch_list.len());
+            let batch_channels = &ch_list[start..end];
             let n_chan = batch_channels.len();
-            let payload_len = 4 + n_chan * sku_len;
+
+            // Header (44 bytes) + per-channel SKUs
+            let payload_len = hdr_len + n_chan * sku_len;
             let mut payload = vec![0u8; payload_len];
 
-            // Header: { power_ctrl_id: u8, power_limit_type: u8, band_idx: u8 }
-            payload[0] = TX_POWER_LIMIT_TABLE_RATE; // power_ctrl_id
-            payload[1] = if is_last { 1 } else { 0 }; // last_msg indicator
-            payload[2] = n_chan as u8; // num channels in this batch
-            payload[3] = band_idx;
+            // ── tx_power_limit_tlv header (44 bytes) ──
+            // [0] ver = 0
+            // [1] pad = 0
+            // [2-3] len = 0 (Linux leaves this zero)
+            // [4] n_chan
+            payload[4] = n_chan as u8;
+            // [5] band: 1=2.4G, 2=5G, 3=6G
+            payload[5] = band_byte;
+            // [6] last_msg: 1 only when this batch contains the global last channel
+            let batch_last_ch = *batch_channels.last().unwrap_or(&0);
+            payload[6] = if is_last_band && batch_last_ch == last_ch { 1 } else { 0 };
+            // [7] pad
+            // [8-11] alpha2 country code
+            payload[8] = b'B';
+            payload[9] = b'R';
+            // [12-43] pad2 = zeros
 
-            // Per-channel SKU TLVs: each is sku_len bytes
-            // { channel: u8, pad[3], pwr[sku_entries]: i8 }
-            // SKU entry layout (from captures txpower_sku.txt, eeprom values in 0.5dBm):
-            //   [0..3]   = CCK   1m/2m/5m/11m         (4 entries, 2.4GHz only)
-            //   [4..11]  = OFDM  6m..54m              (8 entries)
-            //   [12..19] = HT20  MCS0..7              (8 entries)
-            //   [20..28] = HT40  MCS0..7 + MCS32      (9 entries)
-            //   [29..38] = VHT20 MCS0..9              (10 entries, 5/6GHz only)
-            //   [39..48] = VHT40 MCS0..9              (10 entries)
-            //   [49..58] = VHT80 MCS0..9              (10 entries)
-            //   [59..68] = VHT160 MCS0..9             (10 entries)
-            //   [69..80] = HE26  MCS0..11             (12 entries)
-            //   [81..92] = HE52  MCS0..11             (12 entries)
-            //   [93..104]= HE106 MCS0..11             (12 entries)
-            //   [105..116]= HE242 MCS0..11            (12 entries)
-            //   [117..128]= HE484 MCS0..11            (12 entries)
-            //   [129..140]= HE996 MCS0..11            (12 entries)
-            //   [141..152]= HE996x2 MCS0..11          (12 entries)
+            // ── Per-channel SKU entries (162 bytes each) ──
+            // Layout: channel(1) + pwr_limit[161]
+            // Power limit indices (from mt76_connac_mcu.h SKU table):
+            //   [0..3]    CCK 1M/2M/5.5M/11M        (4, 2.4GHz only)
+            //   [4..11]   OFDM 6M..54M               (8)
+            //   [12..19]  HT20 MCS0..7               (8)
+            //   [20..28]  HT40 MCS0..7 + MCS32       (9)
+            //   [29..38]  VHT20 MCS0..9              (10)
+            //   [39..48]  VHT40 MCS0..9              (10)
+            //   [49..58]  VHT80 MCS0..9              (10)
+            //   [59..68]  VHT160 MCS0..9             (10)
+            //   [69..80]  HE26 MCS0..11              (12)
+            //   [81..92]  HE52 MCS0..11              (12)
+            //   [93..104] HE106 MCS0..11             (12)
+            //   [105..116] HE242 MCS0..11            (12)
+            //   [117..128] HE484 MCS0..11            (12)
+            //   [129..140] HE996 MCS0..11            (12)
+            //   [141..152] HE996x2 MCS0..11          (12)
+            //   Total: 4+8+8+9+10+10+10+10+12*7 = 153 entries used of 161
+
             for (i, &ch) in batch_channels.iter().enumerate() {
-                let off = 4 + i * sku_len;
+                let off = hdr_len + i * sku_len;
                 payload[off] = ch;
-                // Base: fill ALL entries with max (127 half-dBm = 63.5 dBm).
-                // Firmware clamps to min(our_value, efuse), so this is safe.
-                // Then overlay per-rate values from SKU capture below.
-                for j in 4..sku_len {
-                    payload[off + j] = 127;
-                }
-                // Per-rate power from SKU capture (eeprom values in 0.5dBm units).
-                // Values from txpower_sku.txt captured on Fenvi USB3 adapter.
-                let pwr = &mut payload[off + 4..off + sku_len];
-                match band {
-                    Band::Band2g => {
-                        // CCK: 37 (18.5dBm)
-                        for p in &mut pwr[0..4] { *p = 40; }
-                        // OFDM: 31-34
-                        pwr[4] = 37; pwr[5] = 36; pwr[6] = 36; pwr[7] = 36;
-                        pwr[8] = 36; pwr[9] = 36; pwr[10] = 34; pwr[11] = 34;
-                        // HT20: 27-33
-                        pwr[12] = 36; pwr[13] = 36; pwr[14] = 36; pwr[15] = 36;
-                        pwr[16] = 36; pwr[17] = 35; pwr[18] = 32; pwr[19] = 30;
-                        // HT40: 27-33
-                        pwr[20] = 36; pwr[21] = 36; pwr[22] = 36; pwr[23] = 36;
-                        pwr[24] = 36; pwr[25] = 35; pwr[26] = 32; pwr[27] = 30;
-                        pwr[28] = 36; // MCS32
-                        // VHT20-VHT160: same as HT range
-                        for j in 29..69 { pwr[j] = 36; }
-                        // HE26-HE996x2: 23-36 per MCS
-                        let he_pwr: [u8; 12] = [36, 36, 36, 36, 36, 35, 32, 30, 29, 28, 26, 26];
-                        for ru in 0..7 {
-                            for (k, &v) in he_pwr.iter().enumerate() {
-                                pwr[69 + ru * 12 + k] = v;
-                            }
-                        }
-                    }
-                    Band::Band5g => {
-                        // OFDM: 31-34
-                        pwr[4] = 37; pwr[5] = 36; pwr[6] = 36; pwr[7] = 36;
-                        pwr[8] = 36; pwr[9] = 36; pwr[10] = 34; pwr[11] = 34;
-                        // HT20/40: same as 2.4G
-                        for j in 12..29 { pwr[j] = 36; }
-                        // VHT20/40: 25-33
-                        let vht_pwr: [u8; 10] = [36, 36, 36, 36, 36, 35, 32, 30, 29, 28];
-                        for bw in 0..2 { // VHT20, VHT40
-                            for (k, &v) in vht_pwr.iter().enumerate() {
-                                pwr[29 + bw * 10 + k] = v;
-                            }
-                        }
-                        // VHT80/160: 27 flat (wider BW = lower per-tone)
-                        for j in 49..69 { pwr[j] = 30; }
-                        // HE26-HE484: per-rate staircase
-                        let he_pwr: [u8; 12] = [36, 36, 36, 36, 36, 35, 32, 30, 29, 28, 26, 26];
-                        for ru in 0..5 { // HE26..HE484
-                            for (k, &v) in he_pwr.iter().enumerate() {
-                                pwr[69 + ru * 12 + k] = v;
-                            }
-                        }
-                        // HE996/996x2: 27 flat (wide RU = lower power density)
-                        for j in 129..153 { pwr[j] = 30; }
-                    }
-                    Band::Band6g => {
-                        // 6GHz: no CCK/HT, only OFDM+VHT+HE
-                        // OFDM: 34 flat
-                        for j in 4..12 { pwr[j] = 34; }
-                        // VHT/HT: 30 flat
-                        for j in 12..69 { pwr[j] = 30; }
-                        // HE: per-rate staircase (lower power for 6GHz regulatory)
-                        let he_pwr: [u8; 12] = [30, 30, 30, 30, 30, 29, 27, 25, 24, 23, 21, 21];
-                        for ru in 0..7 {
-                            for (k, &v) in he_pwr.iter().enumerate() {
-                                pwr[69 + ru * 12 + k] = v;
-                            }
-                        }
-                    }
-                }
 
-                // Clamp all per-rate values to requested max if set
-                if max_half_dbm > 0 && max_half_dbm < 127 {
-                    for j in 4..sku_len {
-                        if payload[off + j] > max_half_dbm {
-                            payload[off + j] = max_half_dbm;
-                        }
-                    }
+                // Fill all power limits with max — firmware clamps to min(our, eFuse).
+                // This is what a pentesting tool wants: maximum allowed power on every rate.
+                let pwr = &mut payload[off + 1..off + sku_len];
+                for p in pwr.iter_mut() {
+                    *p = max_half_dbm;
                 }
             }
 
-            self.mcu_send_ext_cmd(0x58, &payload, true)?;
+            // Send via CE cmd — fire-and-forget (Linux sends with wait_resp=false)
+            self.mcu_send_ce_cmd(MCU_CE_CMD_SET_RATE_TX_POWER, &payload, false)?;
+
+            // Linux reads a CR after each batch to avoid PSE buffer underflow
+            // (mt76_connac_mcu.c:2252). Match this behavior.
+            let _ = self.reg_read(0x820c8000); // MT_PSE_BASE
         }
 
         Ok(())
@@ -2863,7 +2847,7 @@ impl Mt7921au {
     ///     5. set_channel_domain          — regulatory (skipped for now)
     ///     6. set_rx_path(ch)             — RX path config
     ///     7. set_tx_sar_pwr             — TX power limits
-    fn radio_init(&mut self, ch: u8, band: Band) -> Result<()> {
+    fn radio_init(&mut self, channel: Channel) -> Result<()> {
         // Phase 1: __mt7921_init_hardware() — EEPROM calibration
         self.mcu_set_eeprom()?;
 
@@ -2872,11 +2856,58 @@ impl Mt7921au {
         self.mac_init()?;
         self.wtbl_clear_all()?;
         self.mcu_set_channel_domain()?;
-        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, Channel::new(ch))?;
+        // Initial channel uses SET_RX_PATH (0x4E) — matches Linux __mt7921_start().
+        // SET_RX_PATH configures antenna paths + initial channel. rx_streams = antenna bitmask.
+        // Sniffer is not active yet, so no sniffer config needed here.
+        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, channel)?;
+        self.current_channel = channel;
 
-        self.mcu_set_rate_txpower(Band::Band2g)?;
-        self.mcu_set_rate_txpower(Band::Band5g)?;
-        self.mcu_set_rate_txpower(Band::Band6g)?;
+        // Send TX power limits for ALL bands via CE 0x5d (SET_RATE_TX_POWER).
+        // This is REQUIRED for 6GHz — firmware won't enable the 6GHz RF path
+        // without receiving country-coded per-channel power limits.
+        // Matches Linux __mt7921_start() → mt76_connac_mcu_set_rate_txpower().
+        self.mcu_set_rate_txpower_all()?;
+        Ok(())
+    }
+
+    /// Central channel switching — the ONE path for ALL runtime channel changes.
+    ///
+    /// Uses CHANNEL_SWITCH (0x08) for full RF reconfiguration — PLL retune, AGC recal,
+    /// LNA path switch between 2.4G/5G/6G. Matches Linux mt7921_set_channel().
+    /// rx_streams = hweight8(antenna_mask) = stream count (not bitmask like SET_RX_PATH).
+    ///
+    /// When sniffer is active, also updates the sniffer config which has its own
+    /// band encoding (1/2/3 for 2.4/5/6 GHz) and BW encoding (0=20/40, 1=80, 2=160).
+    /// Matches Linux change_chanctx() calling config_sniffer() for monitor VIFs.
+    /// Without this, hopping between bands leaves the sniffer configured for the
+    /// wrong band — subtle frame loss that's hard to diagnose.
+    fn switch_channel(&mut self, channel: Channel) -> Result<()> {
+        let prev_band = self.current_channel.band;
+
+        // Use SET_RX_PATH for 6GHz band transitions — usbmon captures show Linux
+        // always uses SET_RX_PATH (0x4E) when initializing on 6GHz. The 6GHz radio
+        // frontend needs explicit antenna path configuration (rx_streams=bitmask)
+        // that CHANNEL_SWITCH (rx_streams=count) doesn't provide.
+        // For same-band hops on 2.4/5GHz, CHANNEL_SWITCH does full RF reconfig.
+        let cmd = if channel.band == Band::Band6g || prev_band == Band::Band6g {
+            MCU_EXT_CMD_SET_RX_PATH
+        } else {
+            MCU_EXT_CMD_CHANNEL_SWITCH
+        };
+        self.mcu_set_chan_info(cmd, channel)?;
+
+        // Re-send TX power limits when switching TO 6GHz band.
+        // The pcap shows Linux sends all-band TX power after every SET_RX_PATH
+        // to 6GHz. The firmware may need fresh regulatory tables when the radio
+        // is tuned to a new band — especially 6GHz which has strict requirements.
+        if channel.band == Band::Band6g && prev_band != Band::Band6g {
+            self.mcu_set_rate_txpower_all()?;
+        }
+
+        if self.sniffer_enabled {
+            self.mcu_config_sniffer_channel(channel)?;
+        }
+        self.current_channel = channel;
         Ok(())
     }
 
@@ -3074,17 +3105,7 @@ impl Mt7921au {
         // tlv.drop_err = 1 (byte 16)
         payload[16] = 1;
 
-        // Try with wait_resp first; if it times out, send without waiting.
-        // The MCU may need additional mac80211 setup (MAC enable, RX path)
-        // before it responds to sniffer config commands.
-        match self.mcu_send_uni_cmd(MCU_UNI_CMD_SNIFFER, &payload, true) {
-            Ok(_) => {}
-            Err(_) => {
-                self.mcu_send_uni_cmd(MCU_UNI_CMD_SNIFFER, &payload, false)?;
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_SNIFFER, &payload, true)?;
         Ok(())
     }
 
@@ -3222,7 +3243,7 @@ impl Mt7921au {
         // Our existing VIF (from mcu_add_dev in set_monitor_mode) already has
         // CONNECTION_INFRA_AP — same as what Linux uses for AP mode.
         // We just need to give the firmware a beacon template.
-        let beacon = build_beacon_frame(ssid, bssid, self.channel, beacon_interval);
+        let beacon = build_beacon_frame(ssid, bssid, self.current_channel.number, beacon_interval);
 
         // Try firmware beacon offload first (ideal — firmware handles timing)
         match self.mcu_beacon_offload(&beacon, true) {
@@ -3452,26 +3473,7 @@ impl ChipDriver for Mt7921au {
                 reason: "MCU not running".into(),
             });
         }
-
-        // Linux uses CHANNEL_SWITCH (0x08) for channel hopping — it does full RF
-        // reconfiguration (PLL retune, AGC recal, LNA path switch between 2.4G/5G).
-        // SET_RX_PATH (0x4E) is only used at init (__mt7921_start) for antenna setup.
-        //
-        // Previously we used SET_RX_PATH for everything, which worked on 2.4GHz
-        // (since radio_init starts on ch6/2.4G) but left 5GHz RF front-end
-        // half-configured, losing ~10dB. CHANNEL_SWITCH may fail on 6GHz —
-        // handle that separately if needed.
-        self.mcu_set_chan_info(MCU_EXT_CMD_CHANNEL_SWITCH, channel)?;
-
-        // NOTE: sniffer config (mcu_config_sniffer_channel) is sent once at
-        // monitor mode init, NOT on every channel hop. In Linux, it's only
-        // called from chanctx_assign_vif, not from set_channel().
-        // Sending it every hop may reset firmware RF gain settings.
-        // The CHANNEL_SWITCH command alone handles band/frequency changes.
-
-        self.channel = channel.number;
-        self.band = channel.band;
-        Ok(())
+        self.switch_channel(channel)
     }
 
     fn supported_channels(&self) -> &[Channel] {
@@ -3490,7 +3492,7 @@ impl ChipDriver for Mt7921au {
         // Initialize radio subsystem first (MAC enable + RX path)
         // Matches __mt7921_start() from the kernel driver.
         if !self.radio_initialized {
-            self.radio_init(6, Band::Band2g)?;
+            self.radio_init(Channel::new(6))?;
             self.radio_initialized = true;
         }
 
@@ -3511,8 +3513,9 @@ impl ChipDriver for Mt7921au {
         // STEP 3: Enable sniffer mode.
         self.mcu_set_sniffer(true)?;
 
-        // STEP 4: Configure sniffer channel.
-        self.mcu_config_sniffer_channel(Channel::new(self.channel))?;
+        // STEP 4: Configure sniffer channel — uses current_channel which was
+        // set by radio_init(). Matches Linux change_chanctx() for monitor VIF.
+        self.mcu_config_sniffer_channel(self.current_channel)?;
 
         // STEP 5: Set RX filter for monitor mode — accept ALL frames.
         // Matches mt7921_configure_filter() from main.c.
@@ -3742,7 +3745,7 @@ impl ChipDriver for Mt7921au {
             // Parse any buffered packets first (zero USB cost)
             while self.rx_pos < self.rx_len {
                 let buf = &self.rx_buf[self.rx_pos..self.rx_len];
-                let (consumed, packet) = mt7921au_parse_rx(buf, self.channel);
+                let (consumed, packet) = mt7921au_parse_rx(buf, self.current_channel.number);
                 if consumed == 0 {
                     self.rx_pos = self.rx_len;
                     break;
@@ -3815,9 +3818,9 @@ impl ChipDriver for Mt7921au {
         // dbm > 0 clamps all per-rate values to that limit.
         // Useful for stealth operation or targeted injection at reduced power.
         if dbm <= 0 {
-            self.mcu_set_rate_txpower(self.band)?;
+            self.mcu_set_rate_txpower(self.current_channel.band)?;
         } else {
-            self.mcu_set_rate_txpower_limited(self.band, dbm)?;
+            self.mcu_set_rate_txpower_limited(self.current_channel.band, dbm)?;
         }
         Ok(())
     }
@@ -4012,7 +4015,16 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         return (consumed, ParsedPacket::Skip);
     }
 
-    // RXD DW3 — channel
+    // RXD DW3 — channel info (mt76_connac2_mac.h)
+    //   bits[7:0]   = RXV_SEQ
+    //   bits[15:8]  = CH_FREQ (encoded channel — see below)
+    //   bits[17:16] = ADDR_TYPE (NOT band!)
+    //
+    // CH_FREQ encoding (from mt792x_get_status_freq_info in mt792x.h):
+    //   1-14     → 2.4GHz channel 1-14
+    //   36-177   → 5GHz channel as-is
+    //   181-239  → 6GHz: channel = (chfreq - 181) * 4 + 1
+    //             (181→ch1, 182→ch5, 183→ch9, ..., 239→ch233)
     let rxd_dw3 = u32::from_le_bytes([rxd[12], rxd[13], rxd[14], rxd[15]]);
     let ch_freq = ((rxd_dw3 >> 8) & 0xFF) as u8;
 
@@ -4067,13 +4079,26 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         return (consumed, ParsedPacket::Skip);
     }
 
-    let rx_channel = if ch_freq > 0 { ch_freq } else { channel };
+    // Decode ch_freq into actual channel number + band index.
+    // Matches mt792x_get_status_freq_info() from mt792x.h exactly.
+    let (rx_channel, rx_band) = if ch_freq > 180 {
+        // 6GHz: firmware encodes as 181-239 → channel = (chfreq - 181) * 4 + 1
+        let ch_6g = (ch_freq - 181) * 4 + 1;
+        (ch_6g, 2u8) // band=2 (6GHz)
+    } else if ch_freq > 14 {
+        (ch_freq, 1u8) // band=1 (5GHz)
+    } else if ch_freq > 0 {
+        (ch_freq, 0u8) // band=0 (2.4GHz)
+    } else {
+        // ch_freq=0: firmware didn't report channel, use scanner's current
+        (channel, if channel <= 14 { 0u8 } else { 1u8 })
+    };
 
     (consumed, ParsedPacket::Frame(RxFrame {
         data: frame_data,
         rssi,
         channel: rx_channel,
-        band: if rx_channel <= 14 { 0 } else { 1 },
+        band: rx_band,
         timestamp: Duration::ZERO,
         ..Default::default()
     }))
