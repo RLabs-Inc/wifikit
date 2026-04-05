@@ -415,7 +415,6 @@ impl Default for PpduPhyStatus {
 }
 
 /// Debug counters for PPDU status diagnosis — writes to /tmp/wifikit_ppdu_debug.log
-#[derive(Default)]
 struct PpduDebugStats {
     total_non_wifi: u64,
     rpkt_type_counts: [u64; 16],
@@ -427,6 +426,23 @@ struct PpduDebugStats {
     ppdu_parse_fail: u64,
     ppdu_too_short: u64,
     last_rssi: i8,
+    /// Raw U(8,1) RSSI byte histogram — shows what firmware actually reports
+    raw_rssi_hist: Vec<u32>,
+    /// Last 10 raw RSSI values (byte3 from physts header)
+    last_raw: [u8; 10],
+    last_raw_idx: usize,
+}
+
+impl Default for PpduDebugStats {
+    fn default() -> Self {
+        Self {
+            total_non_wifi: 0, rpkt_type_counts: [0; 16],
+            ppdu_received: 0, ppdu_parsed: 0, ppdu_with_rssi: 0,
+            ppdu_correlated: 0, ppdu_no_match: 0,
+            ppdu_parse_fail: 0, ppdu_too_short: 0, last_rssi: 0,
+            raw_rssi_hist: vec![0; 256], last_raw: [0; 10], last_raw_idx: 0,
+        }
+    }
 }
 
 impl PpduDebugStats {
@@ -463,6 +479,20 @@ impl PpduDebugStats {
                 self.ppdu_correlated as f64 / self.ppdu_received as f64 * 100.0
             } else { 0.0 };
             let _ = writeln!(f, "Correlation rate: {:.1}%", corr_rate);
+            // Raw RSSI histogram — shows the distribution of firmware-reported values
+            let _ = writeln!(f, "\nRaw RSSI byte histogram (top 15):");
+            let mut sorted: Vec<(u8, u32)> = self.raw_rssi_hist.iter().enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(i, c)| (i as u8, *c))
+                .collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            for (raw, count) in sorted.iter().take(15) {
+                let dbm = if *raw == 0 { 0i16 } else { (*raw >> 1) as i16 - 110 };
+                let _ = writeln!(f, "  raw=0x{:02X}({:3}) → {:4} dBm : {} times",
+                    raw, raw, dbm, count);
+            }
+            let _ = writeln!(f, "\nLast 10 raw RSSI bytes: {:?}",
+                &self.last_raw[..self.last_raw_idx.min(10)]);
         }
     }
 }
@@ -540,6 +570,15 @@ impl PpduStatusCache {
         } else {
             None
         }
+    }
+
+    /// Clear all PHY and pending slots — prevents cross-buffer RSSI bleed.
+    fn clear_slots(&mut self) {
+        for slot in &mut self.phy_slots {
+            slot.valid = false;
+        }
+        // Don't clear pending_frames — a WiFi frame from the end of buffer N
+        // might get its PPDU from the start of buffer N+1
     }
 
     fn apply_phy_to_frame(frame: &mut RxFrame, phy: &PpduPhyStatus) {
@@ -706,6 +745,11 @@ pub struct Rtl8852au {
     rx_buf: Vec<u8>,
     rx_pos: usize,
     rx_len: usize,
+    rx_queue: Vec<RxFrame>,
+    /// Per-source-MAC RSSI cache — like Linux's STA_UPDATE_MA_RSSI.
+    /// When PPDU correlation succeeds, cache the RSSI by source MAC.
+    /// When correlation fails (rssi=0), fill from cache.
+    rssi_cache: std::collections::HashMap<[u8; 6], i8>,
     channels: Vec<Channel>,
     vid: u16,
     pid: u16,
@@ -788,6 +832,8 @@ impl Rtl8852au {
             rx_buf: vec![0u8; RX_BUF_SIZE],
             rx_pos: 0,
             rx_len: 0,
+            rx_queue: Vec::with_capacity(64),
+            rssi_cache: std::collections::HashMap::with_capacity(2048),
             channels: build_channel_list(),
             vid,
             pid,
@@ -2497,6 +2543,12 @@ impl Rtl8852au {
                             if phy.rssi_avg != 0 {
                                 s.ppdu_with_rssi += 1;
                                 s.last_rssi = phy.rssi_avg;
+                                // Record raw byte that produced this dBm value
+                                let raw = ((phy.rssi_avg as i16 + 110) * 2).clamp(0, 255) as u8;
+                                s.raw_rssi_hist[raw as usize] += 1;
+                                let idx = s.last_raw_idx % 10;
+                                s.last_raw[idx] = raw;
+                                s.last_raw_idx += 1;
                             }
                         });
                         // store_ppdu may return a completed frame if a pending WiFi frame matches
@@ -2618,6 +2670,24 @@ impl Rtl8852au {
         (consumed, old_pending)
     }
 
+    /// Apply per-source-MAC RSSI cache — like Linux's STA_UPDATE_MA_RSSI.
+    /// If PPDU gave us RSSI → cache it. If RSSI=0 → fill from cache.
+    fn apply_rssi_cache(&mut self, frame: &mut RxFrame) {
+        if frame.data.len() < 16 { return; }
+        // Source MAC is at offset 10 in 802.11 header (addr2)
+        let src = [frame.data[10], frame.data[11], frame.data[12],
+                   frame.data[13], frame.data[14], frame.data[15]];
+        if src == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] { return; }
+
+        if frame.rssi != 0 {
+            // Good RSSI from PPDU — cache it
+            self.rssi_cache.insert(src, frame.rssi);
+        } else if let Some(&cached) = self.rssi_cache.get(&src) {
+            // No RSSI — fill from cache
+            frame.rssi = cached;
+        }
+    }
+
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
         // Try parsing from existing buffer
         while self.rx_pos < self.rx_len {
@@ -2628,14 +2698,10 @@ impl Rtl8852au {
                 break;
             }
             self.rx_pos += consumed;
-            if let Some(f) = frame {
+            if let Some(mut f) = frame {
+                self.apply_rssi_cache(&mut f);
                 return Ok(Some(f));
             }
-        }
-
-        // Check completed queue (from previous PPDU correlations)
-        if let Some(f) = self.ppdu_cache.pop_completed() {
-            return Ok(Some(f));
         }
 
         // New USB bulk transfer
@@ -2645,6 +2711,9 @@ impl Rtl8852au {
                 rusb::Error::Timeout => Error::RxTimeout,
                 other => Error::Usb(other),
             })?;
+
+        // Clear stale PPDU slots between buffers
+        self.ppdu_cache.clear_slots();
 
         self.rx_len = actual;
         self.rx_pos = 0;
@@ -2658,14 +2727,10 @@ impl Rtl8852au {
                 break;
             }
             self.rx_pos += consumed;
-            if let Some(f) = frame {
+            if let Some(mut f) = frame {
+                self.apply_rssi_cache(&mut f);
                 return Ok(Some(f));
             }
-        }
-
-        // Check completed queue after processing buffer
-        if let Some(f) = self.ppdu_cache.pop_completed() {
-            return Ok(Some(f));
         }
 
         Ok(None)

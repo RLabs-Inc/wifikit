@@ -15,9 +15,6 @@ use super::rtl8852au::Rtl8852au;
 #[allow(dead_code)]
 #[allow(unused_variables)]
 impl Rtl8852au {
-// Auto-generated from usb3_gentle_tx.pcap — 40 channels
-// Each function replays the EXACT register sequence Linux uses.
-
 /// Channel switch via pcap replay.
 pub(crate) fn pcap_channel_switch(&self, ch: u8) -> Result<()> {
     match ch {
