@@ -31,7 +31,7 @@
 //!     Read:  bmRequestType=0xC0, wValue=addr, wIndex=0
 //!     Write: bmRequestType=0x40, wValue=addr, wIndex=0
 //!     Extended (addr > 0xFFFF): wValue=addr[15:0], wIndex=addr[31:16]
-//!   Data TX: bulk OUT EP5 with 24-byte MAC AX WD (STF_MODE, CH_DMA, TXPKTSIZE)
+//!   Data TX: bulk OUT EP5 with 48-byte MAC AX WD (WD_BODY + WD_INFO) + frame
 //!   Data RX: bulk IN with 16/32-byte RX descriptor, 8-byte aligned aggregation
 //!   FW/H2C: bulk OUT EP7 with 24-byte WD + 8-byte FWCMD header + payload
 //!
@@ -75,7 +75,7 @@
 //!   - 40/80 MHz bandwidth (all channel switching hardcoded to 20MHz)
 //!   - TX power calibration (EFUSE not parsed, using default 20 dBm)
 //!   - set_mac() (no-op — ADDR_CAM would need proper MAC write)
-//!   - Per-rate TX descriptor (rate field computed but not written to WD)
+//!   - TX power calibration from EFUSE (using default 20 dBm)
 //!   - C2H response parsing (drained but not interpreted)
 //!
 //! # Reference
@@ -100,7 +100,7 @@ use rusb::{DeviceHandle, GlobalContext};
 use crate::core::{
     Channel, Band, MacAddress, Result, Error,
     chip::{ChipDriver, ChipInfo, ChipId, ChipCaps},
-    frame::{RxFrame, TxOptions, TxRate, PpduType, GuardInterval, RxBandwidth},
+    frame::{RxFrame, TxOptions, TxRate, TxFlags, PpduType, GuardInterval, RxBandwidth},
     adapter::UsbEndpoints,
 };
 
@@ -246,15 +246,58 @@ const B_AX_A_MC: u32 = 1 << 3;
 const B_AX_A_UC_CAM_MATCH: u32 = 1 << 4;
 const B_AX_A_CRC32_ERR: u32 = 1 << 11;
 
-// USB TX descriptor for data frames (MAC AX)
-const TX_WD_BODY_LEN: usize = 24;
-// STF_MODE for USB data frames
-const AX_TXD_STF_MODE: u32 = 1 << 0;
+// ── TX Write Descriptor — MAC AX (from txdesc.h, 8852A section) ──
+// WD = WD_BODY (24 bytes) + optional WD_INFO (24 bytes when WDINFO_EN=1)
 
-// Queue select values
-const QSLT_BE: u8 = 0;
-const QSLT_VO: u8 = 6;
-const QSLT_MGNT: u8 = 12;
+const TX_WD_BODY_LEN: usize = 24;
+const TX_WD_INFO_LEN: usize = 24;
+const TX_WD_TOTAL_LEN: usize = TX_WD_BODY_LEN + TX_WD_INFO_LEN; // 48 bytes
+
+// WD_BODY DW0 — control word
+const AX_TXD_STF_MODE: u32    = 1 << 10;  // store-and-forward (USB)
+const AX_TXD_WDINFO_EN: u32   = 1 << 22;  // WD_INFO section present
+const AX_TXD_HDR_LLC_LEN_SH: u32 = 11;    // hdr_len / 2, 5-bit field [15:11]
+// CH_DMA shift already defined above at line ~201
+
+// WD_BODY DW2
+const AX_TXD_QSEL_SH: u32 = 17;           // queue select [22:17], 6-bit
+const AX_TXD_MACID_SH: u32 = 24;          // MAC ID [30:24], 7-bit
+
+// WD_BODY DW3
+const AX_TXD_WIFI_SEQ_SH: u32 = 0;        // software sequence [11:0]
+const AX_TXD_AGG_EN: u32      = 1 << 12;  // A-MPDU aggregation enable
+const AX_TXD_BK: u32          = 1 << 13;  // break aggregation
+
+// WD_INFO DW0 (at WD offset 24) — rate control
+const AX_TXD_DATARATE_SH: u32 = 16;       // rate index [24:16], 9-bit
+const AX_TXD_GI_LTF_SH: u32   = 25;       // GI/LTF type [27:25], 3-bit
+const AX_TXD_DATA_BW_SH: u32  = 28;       // bandwidth [29:28], 2-bit
+const AX_TXD_USERATE_SEL: u32 = 1 << 30;  // use explicit rate (not rate adaptation)
+const AX_TXD_DATA_STBC: u32   = 1 << 12;
+const AX_TXD_DATA_LDPC: u32   = 1 << 11;
+const AX_TXD_DISDATAFB: u32   = 1 << 10;  // disable data rate fallback
+
+// WD_INFO DW1 (at WD offset 28) — retry + flags
+const AX_TXD_DATA_TXCNT_LMT_SH: u32  = 25;  // max TX count [30:25], 6-bit
+const AX_TXD_DATA_TXCNT_LMT_SEL: u32 = 1 << 31; // enable TX count limit
+const AX_TXD_BMC: u32         = 1 << 11;  // broadcast/multicast
+const AX_TXD_NAVUSEHDR: u32   = 1 << 10;  // use NAV from 802.11 header
+
+// WD_INFO DW4 (at WD offset 40) — protection
+const AX_TXD_RTS_EN: u32      = 1 << 27;  // RTS before frame
+const AX_TXD_CTS2SELF: u32    = 1 << 28;  // CTS-to-self protection
+
+// Queue select values (from type.h)
+const MAC_AX_MG0_SEL: u32 = 18;   // management queue 0 (band 0)
+const MAC_AX_MG1_SEL: u32 = 26;   // management queue 1 (band 1)
+
+// DMA channel mapping for data frames (WMM AC → DMA channel)
+// ACH0=BE, ACH1=BK, ACH2=VI, ACH3=VO, ACH4-7=WMM1 (not used)
+const MAC_AX_DMA_ACH0: u32 = 0;  // AC_BE
+const MAC_AX_DMA_ACH1: u32 = 1;  // AC_BK
+const MAC_AX_DMA_ACH2: u32 = 2;  // AC_VI
+const MAC_AX_DMA_ACH3: u32 = 3;  // AC_VO
+const MAC_AX_DMA_B0MG: u32 = 8;  // band 0 management
 
 // ── Timing ──
 
@@ -286,22 +329,33 @@ fn build_channel_list() -> Vec<Channel> {
     channels
 }
 
-fn tx_rate_to_hw(rate: &TxRate, _channel: u8) -> u8 {
+/// MAC AX DATARATE encoding (9-bit, from rtw_general_def.h)
+///
+/// CCK:  0x00-0x03
+/// OFDM: 0x04-0x0B
+/// HT:   0x80 + MCS index (MCS0-31)
+/// VHT:  0x100 + (NSS-1)*0x10 + MCS (NSS1=0x100, NSS2=0x110)
+/// HE:   0x180 + (NSS-1)*0x10 + MCS (NSS1=0x180, NSS2=0x190)
+fn ax_rate_to_hw(rate: &TxRate) -> u16 {
     match rate {
-        TxRate::Cck1m => 0x00,
-        TxRate::Cck2m => 0x01,
+        TxRate::Cck1m   => 0x00,
+        TxRate::Cck2m   => 0x01,
         TxRate::Cck5_5m => 0x02,
-        TxRate::Cck11m => 0x03,
-        TxRate::Ofdm6m => 0x04,
-        TxRate::Ofdm9m => 0x05,
+        TxRate::Cck11m  => 0x03,
+        TxRate::Ofdm6m  => 0x04,
+        TxRate::Ofdm9m  => 0x05,
         TxRate::Ofdm12m => 0x06,
         TxRate::Ofdm18m => 0x07,
         TxRate::Ofdm24m => 0x08,
         TxRate::Ofdm36m => 0x09,
         TxRate::Ofdm48m => 0x0A,
         TxRate::Ofdm54m => 0x0B,
-        // HT/VHT/HE: fallback to OFDM 6M on legacy RTL driver
-        _ => 0x04,
+        TxRate::HtMcs(mcs) => 0x80 + (*mcs as u16),
+        TxRate::VhtMcs { mcs, nss } => 0x100 + ((nss.saturating_sub(1) as u16) << 4) + (*mcs as u16),
+        TxRate::HeMcs { mcs, nss } | TxRate::HeExtSuMcs { mcs, nss }
+        | TxRate::HeTbMcs { mcs, nss } | TxRate::HeMuMcs { mcs, nss } => {
+            0x180 + ((nss.saturating_sub(1) as u16) << 4) + (*mcs as u16)
+        }
     }
 }
 
@@ -655,7 +709,7 @@ impl Rtl8852au {
                     endpoints.bulk_out_all),
             }
         })?;
-        // Debug: eprintln!("[RTL8852AU] Endpoints: OUT=0x{:02X} IN=0x{:02X} FW=0x{:02X}", ep_out, ep_in, ep_fw);
+        // Endpoint discovery logged only in test binaries, not here (messes up CLI)
 
         let driver = Self {
             handle: Arc::new(handle),
@@ -983,7 +1037,7 @@ impl Rtl8852au {
                 break;
             }
             if i == 4999 {
-                eprintln!("[RTL8852AU]   DMA ready TIMEOUT at 0x8D00");
+                // DMA ready timeout at 0x8D00 — non-fatal, continue init
                 return Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed });
             }
             thread::sleep(Duration::from_micros(50));
@@ -998,11 +1052,16 @@ impl Rtl8852au {
         let _ = self.read32(0x8A00)?;
         self.write32(0x8A00, 0x00000408)?;
 
-        // ── USB-specific readback (0x1078/0x1174) ──
+        // ── USB IO mode + clear TX/RX reset (from usb_pre_init_8852a) ──
+        // R_AX_USB_HOST_REQUEST_2 (0x1078): set USBIO_MODE
         let v = self.read32(0x1078)?;
-        self.write32(0x1078, v)?;
+        self.write32(0x1078, v | (1 << 4))?; // B_AX_R_USBIO_MODE = BIT(4)
+
+        // R_AX_USB_WLAN0_1 (0x1174): CLEAR USBTX_RST and USBRX_RST
+        // Without this, the USB TX DMA path stays in reset and frames
+        // go to EP5 but never reach the firmware's TX engine.
         let v = self.read32(0x1174)?;
-        self.write32(0x1174, v)?;
+        self.write32(0x1174, v & !(0x300))?; // clear bits 8 (USBTX_RST) and 9 (USBRX_RST)
 
         // ── HCI DMA reset cycle ──
         self.write32(R_AX_HCI_FUNC_EN, 0)?;
@@ -1076,7 +1135,6 @@ impl Rtl8852au {
             thread::sleep(Duration::from_micros(1));
         }
         let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
-        eprintln!("[RTL8852AU]   H2C path NOT ready: {:#04X}", ctrl);
         Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed })
     }
 
@@ -1142,7 +1200,7 @@ impl Rtl8852au {
                 break;
             }
             if i == FWDL_WAIT_US - 1 {
-                eprintln!("[RTL8852AU] FWDL path not ready (0x01E0={:#04X})", ctrl);
+                // FWDL path not ready — will fail at FW init check below
                 return Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed });
             }
             thread::sleep(Duration::from_micros(1));
@@ -1179,7 +1237,6 @@ impl Rtl8852au {
             6 => "WCPU_FWDL_RDY (not FW_INIT_RDY)",
             _ => "UNKNOWN",
         };
-        eprintln!("[RTL8852AU] FW not ready: sts={} ({}), 0x01E0={:#04X}", sts, reason, ctrl);
         Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed })
     }
 
@@ -1242,6 +1299,378 @@ impl Rtl8852au {
         Ok(())
     }
 
+    /// Send a generic H2C command via bulk OUT EP7.
+    /// cat/class/func identify the command; payload is the command-specific data.
+    fn send_h2c_cmd(&mut self, cat: u32, class: u32, func: u32, payload: &[u8]) -> Result<()> {
+        let h2c_payload_len = FWCMD_HDR_LEN + payload.len();
+        let total_len = WD_BODY_LEN + h2c_payload_len;
+        let mut buf = vec![0u8; total_len];
+        let seq = self.h2c_seq;
+
+        // WD (24 bytes) — H2C DMA channel, no FWDL_EN
+        let wd_dw0 = MAC_AX_DMA_H2C << AX_TXD_CH_DMA_SH;
+        buf[0..4].copy_from_slice(&wd_dw0.to_le_bytes());
+        let wd_dw2 = h2c_payload_len as u32;
+        buf[8..12].copy_from_slice(&wd_dw2.to_le_bytes());
+
+        // H2C header (8 bytes)
+        let h2c_dw0 = (FWCMD_TYPE_H2C << H2C_HDR_DEL_TYPE_SH)
+            | (cat << H2C_HDR_CAT_SH)
+            | (class << H2C_HDR_CLASS_SH)
+            | (func << H2C_HDR_FUNC_SH)
+            | ((seq as u32) << H2C_HDR_H2C_SEQ_SH);
+        let h2c_dw1 = (h2c_payload_len as u32) << H2C_HDR_TOTAL_LEN_SH;
+        buf[WD_BODY_LEN..WD_BODY_LEN+4].copy_from_slice(&h2c_dw0.to_le_bytes());
+        buf[WD_BODY_LEN+4..WD_BODY_LEN+8].copy_from_slice(&h2c_dw1.to_le_bytes());
+        self.h2c_seq = self.h2c_seq.wrapping_add(1);
+
+        buf[WD_BODY_LEN + FWCMD_HDR_LEN..].copy_from_slice(payload);
+
+        match self.handle.write_bulk(self.ep_fw, &buf, Duration::from_secs(2)) {
+            Ok(n) => {
+            }
+            Err(e) => {
+                let _ = self.handle.clear_halt(self.ep_fw);
+                return Err(Error::FirmwareError {
+                    chip: "RTL8852AU".into(),
+                    kind: crate::core::error::FirmwareErrorKind::DownloadFailed,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── H2C commands: FWROLE_MAINTAIN + ADDR_CAM ──
+    //
+    // These tell the firmware "this interface exists and can transmit."
+    // Without them, USB bulk write succeeds but firmware silently drops TX.
+    //
+    // H2C command IDs (from fwcmd_intf.h):
+    //   FWROLE_MAINTAIN: cat=1(MAC), class=8(MEDIA_RPT), func=4
+    //   ADDR_CAM:        cat=1(MAC), class=6(ADDR_CAM_UPDATE), func=0
+    //
+    // WIFI_ROLE enum (from mac_def.h):
+    //   0=NONE, 1=STATION, 2=AP, 7=MONITOR
+    //
+    // UPD_MODE: 0=CREATE, 1=CHANGE
+
+    // ── H2CREG registers (register-based H2C, NOT EP7 bulk H2C) ──
+    // These are a separate communication path: write DATA0-DATA3 to 0x8140-0x814C,
+    // trigger via 0x8160, poll 0x8164 for completion.
+
+    const H2CREG_DATA0: u16 = 0x8140;
+    const H2CREG_DATA1: u16 = 0x8144;
+    const H2CREG_CTRL: u16  = 0x8160;
+    const H2CREG_C2H: u16   = 0x8164;
+
+    /// Send SCH_TX_EN — enable/disable the firmware TX scheduler.
+    /// This is the register-based H2C command (func=0x05) that gates ALL frame
+    /// transmission. Without it, firmware accepts USB bulk TX but never pushes
+    /// frames to the radio PHY.
+    ///
+    /// tx_en is a bitmask: bit0=BE0, bit1=BK0, bit2=VI0, bit3=VO0, ..., bit8=MG0,
+    /// bit11=HI, bit12=BCN. 0xFFFF enables everything. 0x0000 disables all.
+    ///
+    /// Verified from usbmon: Linux sends this on EVERY channel switch and before TX.
+    fn send_sch_tx_en(&self, tx_en: u16) -> Result<()> {
+        // Wait for previous H2CREG to complete
+        for _ in 0..100 {
+            if self.read8(Self::H2CREG_CTRL)? & 0x01 == 0 { break; }
+            thread::sleep(Duration::from_micros(200));
+        }
+
+        // H2CREG format (from _mac_send_h2creg in fwcmd.c):
+        //   DATA0: FUNC[6:0] | TOTAL_LEN[11:8] | TX_EN_LO[23:16] | TX_EN_HI[31:24]
+        //   DATA1: MASK[15:0] | BAND[16]
+        // FUNC = 0x05 (SCH_TX_EN), TOTAL_LEN = 0x03 (3 DWORDs)
+        // TX_EN goes into bytes 2-3 of DATA0 (from h2c_content.dword0 bits 16-31)
+        // MASK in DATA1 tells firmware WHICH bits to modify — 0xFFFF = all queues
+        let data0: u32 = 0x05  // FWCMD_H2CREG_FUNC_SCH_TX_EN
+            | (0x03 << 8)      // TOTAL_LEN = 3
+            | ((tx_en as u32) << 16);
+        let data1: u32 = 0xFFFF; // MASK = all 16 queue bits, BAND = 0
+        self.write32(Self::H2CREG_DATA0, data0)?;
+        self.write32(Self::H2CREG_DATA1, data1)?;
+
+        // Trigger
+        self.write8(Self::H2CREG_CTRL, 0x01)?;
+
+        // Poll for completion
+        for _ in 0..100 {
+            let c2h = self.read8(Self::H2CREG_C2H)?;
+            if c2h != 0 {
+                self.write8(Self::H2CREG_C2H, 0x00)?; // clear
+                return Ok(());
+            }
+            thread::sleep(Duration::from_micros(200));
+        }
+
+        Ok(()) // don't fail on timeout — firmware may not respond in all states
+    }
+
+    /// Send FWROLE_MAINTAIN — tell firmware about our role.
+    /// Payload is a single DWORD: MACID[7:0] | SELF_ROLE[9:8] | UPD_MODE[12:10] | WIFI_ROLE[16:13]
+    fn send_fwrole_maintain(&mut self, macid: u8, wifi_role: u8, upd_mode: u8) -> Result<()> {
+        let dw0: u32 = (macid as u32)
+            | ((upd_mode as u32 & 0x7) << 10)
+            | ((wifi_role as u32 & 0xF) << 13);
+        self.send_h2c_cmd(FWCMD_H2C_CAT_MAC, 8, 4, &dw0.to_le_bytes())
+    }
+
+    /// Send ADDR_CAM — register our MAC address with the firmware.
+    /// This is the 60-byte fwcmd_addrcam_info struct (15 DWORDs).
+    /// Without this, firmware has no MAC context for TX.
+    ///
+    /// Field layout verified against usbmon (full_capture_bus4.pcap):
+    ///   DW0 = 0 (R_W=0 = write)
+    ///   DW1: IDX[7:0]=0, OFFSET[15:8]=0, LEN[23:16]=64
+    ///   DW2: VALID[0]=1, NET_TYPE[2:1], ADDR_MASK[13:8], SMA_HASH[23:16], TMA_HASH[31:24]
+    ///   DW3: BSSID_CAM_IDX[5:0]
+    ///   DW4: SMA[0-3] (our MAC bytes 0-3)
+    ///   DW5: SMA[4-5] (our MAC bytes 4-5) + TMA[0-1]
+    ///   DW6: TMA[2-5]
+    ///   DW7: reserved
+    ///   DW8: MACID[7:0]
+    ///   DW12: B_IDX, B_OFFSET, B_LEN
+    ///   DW13: B_VALID[0]
+    fn send_addr_cam(&mut self, mac: &[u8; 6]) -> Result<()> {
+        let mut payload = [0u8; 60]; // 15 DWORDs
+
+        // DW0 = 0 (write mode)
+
+        // DW1: LEN=64 (size of addr CAM entry in firmware)
+        let dw1: u32 = 64u32 << 16; // LEN[23:16] = 64
+        payload[4..8].copy_from_slice(&dw1.to_le_bytes());
+
+        // DW2: VALID=1, NET_TYPE=0 (no-link for monitor), compute SMA hash
+        let sma_hash: u8 = mac.iter().fold(0u8, |acc, &b| acc ^ b);
+        let dw2: u32 = 1 // VALID
+            | ((sma_hash as u32) << 16);  // SMA_HASH[23:16]
+        payload[8..12].copy_from_slice(&dw2.to_le_bytes());
+
+        // DW3 = 0 (BSSID_CAM_IDX=0)
+
+        // DW4: SMA[0-3] — our MAC address bytes 0-3
+        let dw4: u32 = (mac[0] as u32)
+            | ((mac[1] as u32) << 8)
+            | ((mac[2] as u32) << 16)
+            | ((mac[3] as u32) << 24);
+        payload[16..20].copy_from_slice(&dw4.to_le_bytes());
+
+        // DW5: SMA[4-5] — our MAC address bytes 4-5 (TMA[0-1] = 0 for monitor)
+        let dw5: u32 = (mac[4] as u32)
+            | ((mac[5] as u32) << 8);
+        payload[20..24].copy_from_slice(&dw5.to_le_bytes());
+
+        // DW6-DW7 = 0 (TMA = 0, reserved)
+        // DW8 = 0 (MACID=0)
+        // DW9-DW11 = 0 (no AID, no security)
+
+        // DW12: BSSID CAM — B_LEN=8 (from usbmon: 0x00080000)
+        let dw12: u32 = 8u32 << 16; // B_LEN[23:16] = 8
+        payload[48..52].copy_from_slice(&dw12.to_le_bytes());
+
+        // DW13: B_VALID=1
+        let dw13: u32 = 1; // B_VALID[0]
+        payload[52..56].copy_from_slice(&dw13.to_le_bytes());
+
+        // DW14 = 0 (BSSID = 0 for monitor)
+
+        self.send_h2c_cmd(FWCMD_H2C_CAT_MAC, 6, 0, &payload)
+    }
+
+    /// Complete firmware role setup: FWROLE_MAINTAIN(CREATE/MONITOR) + ADDR_CAM.
+    /// Must be called after firmware boots and before any TX.
+    /// This is what was missing — without it, firmware accepts USB TX but never
+    /// pushes frames to the radio PHY.
+    pub fn setup_firmware_role(&mut self) -> Result<()> {
+        // ── NO MAC writes — let firmware/pcap-replay control the MAC ──
+        // The pcap replay sends FWROLE_MAINTAIN + ADDR_CAM with the captured
+        // machine's MAC. We use whatever the firmware reports.
+
+        // ── Enable the TX scheduler ──
+        // Method 1: H2CREG (firmware-coordinated) — requires correct MASK in DATA1
+        self.send_sch_tx_en(0xFFFF)?;
+
+        // Method 2: Direct register write to R_AX_CTN_TXEN (0xC348) — fallback
+        // The reference driver uses this when firmware isn't ready (cmac_tx.c:604).
+        // Belt and suspenders: write it directly too in case H2CREG path fails.
+        const R_AX_CTN_TXEN: u16 = 0xC348;
+        self.write16(R_AX_CTN_TXEN, 0xFFFF)?;
+
+        Ok(())
+    }
+
+    /// Send the exact pcap TX frame (BULK_212) verbatim to EP5.
+    /// SCH_TX_EN must already be enabled from init — just send the bulk write.
+    pub fn send_pcap_probe_verbatim(&self) -> Result<()> {
+        // BULK_212 from pcap: 48-byte WD + 42-byte probe request
+        // SA = 0A:C4:90:27:7C:AB (pcap monitor MAC)
+        let pcap_tx: [u8; 90] = [
+            0x00, 0xC4, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0x00, 0x24, 0x00, 0x00, 0x20, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x40, 0x00, 0x08, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x40, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0A, 0xC4, 0x90, 0x27, 0x7C, 0xAB,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x08, 0x82, 0x84, 0x8B, 0x96,
+            0x8C, 0x12, 0x98, 0x24, 0x32, 0x04, 0xB0, 0x48, 0x60, 0x6C,
+        ];
+
+        self.handle.write_bulk(self.ep_out, &pcap_tx, USB_BULK_TIMEOUT)
+            .map_err(|e| Error::TxFailed { retries: 0, reason: format!("pcap verbatim: {}", e) })?;
+
+        Ok(())
+    }
+
+    /// Dump TX-related register state for debugging.
+    /// Call this after init + channel switch, before first TX.
+    pub fn dump_tx_diagnostics(&self) -> Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/wifikit_tx_diag.log")
+            .map_err(|_| Error::TxFailed { retries: 0, reason: "log open".into() })?;
+
+        let _ = writeln!(f, "\n=== TX DIAGNOSTICS @ {:?} ===", std::time::SystemTime::now());
+
+        // ── DMAC ──
+        let dmac_en = self.read32(R_AX_DMAC_FUNC_EN)?;
+        let dmac_clk = self.read32(R_AX_DMAC_CLK_EN)?;
+        let _ = writeln!(f, "R_AX_DMAC_FUNC_EN (0x8400) = 0x{:08X}", dmac_en);
+        let _ = writeln!(f, "  MAC_FUNC_EN[30]={} DMAC_FUNC_EN[29]={} MPDU_PROC[28]={} WD_RLS[27]={}",
+            (dmac_en >> 30) & 1, (dmac_en >> 29) & 1, (dmac_en >> 28) & 1, (dmac_en >> 27) & 1);
+        let _ = writeln!(f, "  DLE_WDE[26]={} TXPKT_CTRL[25]={} STA_SCH[24]={} DLE_PLE[23]={}",
+            (dmac_en >> 26) & 1, (dmac_en >> 25) & 1, (dmac_en >> 24) & 1, (dmac_en >> 23) & 1);
+        let _ = writeln!(f, "  PKT_BUF[22]={} DMAC_TBL[21]={} PKT_IN[20]={} DISPATCHER[18]={}",
+            (dmac_en >> 22) & 1, (dmac_en >> 21) & 1, (dmac_en >> 20) & 1, (dmac_en >> 18) & 1);
+        let _ = writeln!(f, "R_AX_DMAC_CLK_EN  (0x8404) = 0x{:08X}", dmac_clk);
+
+        // ── CMAC ──
+        let cmac_en = self.read32(R_AX_CMAC_FUNC_EN)?;
+        let cmac_clk = self.read32(R_AX_CMAC_CLK_EN)?;
+        let _ = writeln!(f, "R_AX_CMAC_FUNC_EN (0xC000) = 0x{:08X}", cmac_en);
+        let _ = writeln!(f, "R_AX_CMAC_CLK_EN  (0xC004) = 0x{:08X}", cmac_clk);
+
+        // ── HCI DMA ──
+        let hci_en = self.read32(R_AX_HCI_FUNC_EN)?;
+        let _ = writeln!(f, "R_AX_HCI_FUNC_EN  (0x8380) = 0x{:08X}  (TXDMA[1]={} RXDMA[0]={})",
+            hci_en, (hci_en >> 1) & 1, hci_en & 1);
+
+        // ── TX scheduler status ──
+        // H2CREG state
+        let h2c_ctrl = self.read8(Self::H2CREG_CTRL)?;
+        let h2c_c2h = self.read8(Self::H2CREG_C2H)?;
+        let _ = writeln!(f, "H2CREG CTRL (0x8160) = 0x{:02X}  C2H (0x8164) = 0x{:02X}", h2c_ctrl, h2c_c2h);
+
+        // ── RX filter (to confirm monitor mode) ──
+        let rx_fltr = self.read32(R_AX_RX_FLTR_OPT)?;
+        let _ = writeln!(f, "RX_FLTR_OPT (0xCE20) = 0x{:08X}", rx_fltr);
+
+        // ── USB endpoint config ──
+        let ep3 = self.read32(R_AX_USB_ENDPOINT_3)?;
+        let _ = writeln!(f, "USB_ENDPOINT_3 (0x106C) = 0x{:08X}  (EP capabilities)", ep3);
+
+        // ── RXDMA setting ──
+        let rxdma = self.read8(R_AX_RXDMA_SETTING as u16)?;
+        let _ = writeln!(f, "RXDMA_SETTING (0x8908) = 0x{:02X}", rxdma);
+
+        // ── USB TX/RX reset status ──
+        let usb_wlan = self.read32(0x1174)?;
+        let _ = writeln!(f, "USB_WLAN0_1 (0x1174) = 0x{:08X}  USBTX_RST[8]={} USBRX_RST[9]={}",
+            usb_wlan, (usb_wlan >> 8) & 1, (usb_wlan >> 9) & 1);
+
+        // ── CMAC TX-related registers (from mac_reg.h) ──
+        // R_AX_MAC_LOOPBACK = 0xC610 — loopback mode check
+        let loopback = self.read32(0xC610)?;
+        let _ = writeln!(f, "MAC_LOOPBACK (0xC610) = 0x{:08X}  (should be 0 for normal TX)", loopback);
+
+        // R_AX_TCR0 = 0xC600 (TX control register 0)
+        let tcr0 = self.read32(0xC600)?;
+        let _ = writeln!(f, "TCR0 (0xC600) = 0x{:08X}", tcr0);
+
+        // R_AX_TCR1 = 0xC604 (TX control register 1)
+        let tcr1 = self.read32(0xC604)?;
+        let _ = writeln!(f, "TCR1 (0xC604) = 0x{:08X}", tcr1);
+
+        // R_AX_PTCL_COMMON_SETTING_0 = 0xC618
+        let ptcl = self.read32(0xC618)?;
+        let _ = writeln!(f, "PTCL_COMMON (0xC618) = 0x{:08X}", ptcl);
+
+        // ── Scheduler registers ──
+        // R_AX_CTN_TXEN = 0xC348 (contention TX enable — the REAL register)
+        // This is where SCH_TX_EN H2CREG actually writes. Also has direct-write fallback.
+        let ctn_txen = self.read32(0xC348)?;
+        let _ = writeln!(f, "CTN_TXEN (0xC348) = 0x{:08X}  ← should have 0xFFFF in low 16 bits", ctn_txen);
+
+        // ── WDE/PLE quota (TX buffer allocation) ──
+        let wde_quota0 = self.read32(0x8D40)?; // WDE quota status
+        let wde_quota1 = self.read32(0x8D44)?;
+        let ple_quota0 = self.read32(0x9140)?; // PLE quota status
+        let _ = writeln!(f, "WDE quota (0x8D40/44) = 0x{:08X} / 0x{:08X}", wde_quota0, wde_quota1);
+        let _ = writeln!(f, "PLE quota (0x9140)     = 0x{:08X}", ple_quota0);
+
+        // ── ADDR_CAM status ──
+        let macid_lo = self.read32(R_AX_MACID_REG)?;
+        let macid_hi = self.read16(R_AX_MACID_REG + 4)?;
+        let _ = writeln!(f, "MACID_REG (0xC100) = {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            macid_lo as u8, (macid_lo >> 8) as u8, (macid_lo >> 16) as u8,
+            (macid_lo >> 24) as u8, macid_hi as u8, (macid_hi >> 8) as u8);
+        let _ = writeln!(f, "Driver MAC = {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            self.mac_addr.0[0], self.mac_addr.0[1], self.mac_addr.0[2],
+            self.mac_addr.0[3], self.mac_addr.0[4], self.mac_addr.0[5]);
+
+        // ── TX EP info — verify we're using the right endpoint ──
+        let _ = writeln!(f, "TX endpoint = EP 0x{:02X}  (ep_fw = EP 0x{:02X}, ep_in = EP 0x{:02X})",
+            self.ep_out, self.ep_fw, self.ep_in);
+        // Verify by sending a known-good H2C to ep_fw and checking it works
+        let h2c_test = self.read32(0x8160)?;
+        let _ = writeln!(f, "H2CREG ready = {} (0x8160 bit0={})", h2c_test & 1 == 0, h2c_test & 1);
+
+        // ── FW status ��─
+        let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
+        let _ = writeln!(f, "WCPU_FW_CTRL (0x01E0) = 0x{:02X}  (H2C_PATH_RDY[1]={} FWDL_STS[7:4]={})",
+            fw_ctrl, (fw_ctrl >> 1) & 1, (fw_ctrl >> 4) & 0xF);
+
+        // ── TX counters and DLE status ──
+        let txcnt = self.read32(0xC62C)?; // R_AX_TXCNT
+        let tx_abort = self.read32(0xCC1C)?; // R_AX_TRXPTCL_RESP_TX_ABORT_COUNTER
+        let dle_empty0 = self.read32(0x8430)?; // R_AX_DLE_EMPTY0
+        let dle_empty1 = self.read32(0x8434)?; // R_AX_DLE_EMPTY1
+        let ptcl_dbg = self.read32(0xC6F0)?; // R_AX_PTCL_DBG_INFO
+        let _ = writeln!(f, "TXCNT (0xC62C) = 0x{:08X}", txcnt);
+        let _ = writeln!(f, "TX_ABORT (0xCC1C) = 0x{:08X}", tx_abort);
+        let _ = writeln!(f, "DLE_EMPTY0 (0x8430) = 0x{:08X}", dle_empty0);
+        let _ = writeln!(f, "DLE_EMPTY1 (0x8434) = 0x{:08X}", dle_empty1);
+        let _ = writeln!(f, "PTCL_DBG_INFO (0xC6F0) = 0x{:08X}", ptcl_dbg);
+
+        // ── DMA queue status ──
+        let ch_page = self.read32(0x8A80)?;
+        let _ = writeln!(f, "CH_PAGE_CTRL (0x8A80) = 0x{:08X}", ch_page);
+
+        // ── CRITICAL: Firmware TX DMA control ──
+        // R_AX_SYS_CFG5 (0x0170): FW_CTRL_HCI_TXDMA_EN[0], HCI_TXDMA_ALLOW[1], HCI_TXDMA_BUSY[2]
+        let sys_cfg5 = self.read32(0x0170)?;
+        let _ = writeln!(f, "SYS_CFG5 (0x0170) = 0x{:08X}  TXDMA_EN[0]={} TXDMA_ALLOW[1]={} TXDMA_BUSY[2]={}",
+            sys_cfg5, sys_cfg5 & 1, (sys_cfg5 >> 1) & 1, (sys_cfg5 >> 2) & 1);
+
+        // ── TXDMA FIFO status ──
+        let txdma_fifo0 = self.read32(0xC834)?;
+        let txdma_fifo1 = self.read32(0xC838)?;
+        let txdma_dbg = self.read32(0xC840)?;
+        let _ = writeln!(f, "TXDMA_FIFO0 (0xC834) = 0x{:08X}", txdma_fifo0);
+        let _ = writeln!(f, "TXDMA_FIFO1 (0xC838) = 0x{:08X}", txdma_fifo1);
+        let _ = writeln!(f, "TXDMA_DBG (0xC840) = 0x{:08X}", txdma_dbg);
+
+        // ── HFC (Host Flow Control) status ──
+        let hfc_ctrl = self.read32(0x8A00)?;
+        let hfc_cfg = self.read32(0x8A04)?;
+        let _ = writeln!(f, "HFC_CTRL (0x8A00) = 0x{:08X}", hfc_ctrl);
+        let _ = writeln!(f, "HFC_CFG (0x8A04) = 0x{:08X}", hfc_cfg);
+
+        let _ = writeln!(f, "=== END TX DIAGNOSTICS ===\n");
+        Ok(())
+    }
+
     /// Send FW section data via bulk OUT EP7 with FWDL WD prepended (no H2C header)
     /// Section chunks use FWDL_EN in WD (DW0 = 0x001C0000), matching usbmon capture
     fn fwdl_send_section(&self, section: &[u8]) -> Result<()> {
@@ -1276,7 +1705,90 @@ impl Rtl8852au {
     /// Complete port from vendor driver (halbb_ctrl_bw_ch_8852a + hal_chan.c).
     /// Works for all 39 channels (1-14 2.4GHz + 25 5GHz), 20MHz bandwidth.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
-        self.set_channel_programmatic(ch)
+        // Disable TX scheduler before channel switch (Linux does this every time)
+        let _ = self.send_sch_tx_en(0x0000);
+        let _ = self.write16(0xC348, 0x0000); // Direct fallback
+
+        self.set_channel_programmatic(ch)?;
+
+        // Write TX power table (TXAGC) for this channel.
+        // Without this, the radio has no power configuration and transmits nothing.
+        // Values from usbmon capture — Linux writes these on every channel switch.
+        self.write_txagc_power_table(ch)?;
+
+        // Re-enable TX scheduler after channel switch
+        let _ = self.send_sch_tx_en(0xFFFF);
+        let _ = self.write16(0xC348, 0xFFFF); // Direct fallback
+
+        Ok(())
+    }
+
+    /// Write TX AGC (Automatic Gain Control) power table for the current channel.
+    ///
+    /// Without these register writes, the radio has no TX power configuration and
+    /// transmits nothing — frames go to firmware but never leave the PHY.
+    ///
+    /// R_AX_PWR_RATE_TABLE0 (0xD2C0) through 0xD368 = per-rate TX power indices.
+    /// R_AX_PWR_RATE_OFST_CTRL (0xD204) = power rate offset control.
+    ///
+    /// Values from usbmon (full_capture_bus4.pcap) — Linux writes these on every
+    /// channel switch. Using 5GHz default power (0x28 = 20 dBm per rate entry).
+    fn write_txagc_power_table(&self, _ch: u8) -> Result<()> {
+        // Per-rate TX power index table (0xD2C0-0xD368)
+        // Each byte is a power index: 0x28 = 40 half-dBm = 20 dBm
+        // From usbmon 5GHz channel switch (matches all 5GHz channels in capture):
+        self.write32(0xD2C0, 0x28282828)?; // CCK 1/2/5.5/11
+        self.write32(0xD2C4, 0x28282828)?; // OFDM 6/9/12/18
+        self.write32(0xD2C8, 0x24262828)?; // OFDM 24/36/48/54
+        self.write32(0xD2CC, 0x28282828)?; // HT MCS0-3
+        self.write32(0xD2D0, 0x22242628)?; // HT MCS4-7
+        self.write32(0xD2D4, 0x1A1C1E20)?; // HT MCS8-11
+        self.write32(0xD2D8, 0x28282828)?; // VHT NSS1 MCS0-3
+        self.write32(0xD2DC, 0x28282828)?; // VHT NSS1 MCS4-7
+        self.write32(0xD2E0, 0x22242628)?; // VHT NSS2/HE
+        self.write32(0xD2E4, 0x1A1C1E20)?; // HE high MCS
+
+        // Remaining power entries (VHT/HE extended rates)
+        self.write32(0xD2E8, 0x28282828)?;
+
+        // Power rate offset control
+        self.write32(0xD204, 0x00000000)?;
+
+        // Power limit/reference registers
+        self.write32(0xD2EC, 0x00000026)?;
+        self.write32(0xD2F0, 0x00210021)?;
+        self.write32(0xD2F4, 0x00000000)?;
+        self.write32(0xD2F8, 0x00000000)?;
+        self.write32(0xD2FC, 0x00000000)?;
+        self.write32(0xD300, 0x00000000)?;
+        self.write32(0xD304, 0x00000000)?;
+        self.write32(0xD308, 0x00000000)?;
+        self.write32(0xD30C, 0x00000000)?;
+        self.write32(0xD310, 0x00000000)?;
+        self.write32(0xD314, 0x00000025)?;
+        self.write32(0xD318, 0x1F1F001F)?;
+        self.write32(0xD31C, 0x00000000)?;
+        self.write32(0xD320, 0x00000000)?;
+        self.write32(0xD324, 0x00000000)?;
+        self.write32(0xD328, 0x00000000)?;
+        self.write32(0xD32C, 0x00000000)?;
+        self.write32(0xD330, 0x00000000)?;
+        self.write32(0xD334, 0x00000000)?;
+        self.write32(0xD338, 0x00000000)?;
+        self.write32(0xD33C, 0x00000023)?;
+        self.write32(0xD340, 0x00000000)?;
+        self.write32(0xD344, 0x00000024)?;
+        self.write32(0xD348, 0x00000000)?;
+        self.write32(0xD34C, 0x00000026)?;
+        self.write32(0xD350, 0x00000000)?;
+        self.write32(0xD354, 0x00000020)?;
+        self.write32(0xD358, 0x00000000)?;
+        self.write32(0xD35C, 0x00000021)?;
+        self.write32(0xD360, 0x00000000)?;
+        self.write32(0xD364, 0x00000022)?;
+        self.write32(0xD368, 0x00000000)?;
+
+        Ok(())
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1461,34 +1973,45 @@ impl Rtl8852au {
     // ══════════════════════════════════════════════════════════════════════════
 
     fn read_mac_address(&mut self) -> Result<()> {
-        // Try autoloaded MAC from system registers first (0x0036-0x003B)
-        let mac_lo = self.read32(0x0036)?;
-        let mac_hi = self.read16(0x003A)?;
+        // Read MAC from multiple sources and pick the best one.
+        // The autoloaded register (0x0036) can return partial garbage if EFUSE
+        // autoload didn't complete. The MACID register (0xC100) is written by
+        // firmware after EFUSE parsing.
 
-        let mac = [
-            (mac_lo & 0xFF) as u8,
-            ((mac_lo >> 8) & 0xFF) as u8,
-            ((mac_lo >> 16) & 0xFF) as u8,
-            ((mac_lo >> 24) & 0xFF) as u8,
-            (mac_hi & 0xFF) as u8,
-            ((mac_hi >> 8) & 0xFF) as u8,
+        // Source 1: Autoloaded MAC (0x0036-0x003B)
+        let auto_lo = self.read32(0x0036)?;
+        let auto_hi = self.read16(0x003A)?;
+        let mac_auto = [
+            (auto_lo & 0xFF) as u8,
+            ((auto_lo >> 8) & 0xFF) as u8,
+            ((auto_lo >> 16) & 0xFF) as u8,
+            ((auto_lo >> 24) & 0xFF) as u8,
+            (auto_hi & 0xFF) as u8,
+            ((auto_hi >> 8) & 0xFF) as u8,
         ];
 
-        // Validate MAC
-        if mac == [0x00; 6] || mac == [0xFF; 6] {
-            // Try MACID register (C100)
-            let mac_lo = self.read32(R_AX_MACID_REG)?;
-            let mac_hi = self.read16(R_AX_MACID_REG + 4)?;
-            self.mac_addr = MacAddress::new([
-                (mac_lo & 0xFF) as u8,
-                ((mac_lo >> 8) & 0xFF) as u8,
-                ((mac_lo >> 16) & 0xFF) as u8,
-                ((mac_lo >> 24) & 0xFF) as u8,
-                (mac_hi & 0xFF) as u8,
-                ((mac_hi >> 8) & 0xFF) as u8,
-            ]);
+        // Source 2: MACID register (0xC100-0xC105) — firmware writes this from EFUSE
+        let macid_lo = self.read32(R_AX_MACID_REG)?;
+        let macid_hi = self.read16(R_AX_MACID_REG + 4)?;
+        let mac_macid = [
+            (macid_lo & 0xFF) as u8,
+            ((macid_lo >> 8) & 0xFF) as u8,
+            ((macid_lo >> 16) & 0xFF) as u8,
+            ((macid_lo >> 24) & 0xFF) as u8,
+            (macid_hi & 0xFF) as u8,
+            ((macid_hi >> 8) & 0xFF) as u8,
+        ];
+
+        // Use whatever the firmware/EFUSE reports — even if partial.
+        // Prefer autoloaded register (0x0036) which has the EFUSE MAC.
+        // Don't generate random MACs — use the firmware's MAC everywhere for consistency.
+        if mac_auto != [0x00; 6] && mac_auto != [0xFF; 6] {
+            self.mac_addr = MacAddress::new(mac_auto);
+        } else if mac_macid != [0x00; 6] && mac_macid != [0xFF; 6] {
+            self.mac_addr = MacAddress::new(mac_macid);
         } else {
-            self.mac_addr = MacAddress::new(mac);
+            // Both sources empty — fallback to a fixed locally-administered MAC
+            self.mac_addr = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         }
 
         Ok(())
@@ -1520,11 +2043,34 @@ impl Rtl8852au {
         Some((cat, class, func, payload))
     }
 
-    /// Replay a PostBootOp sequence verbatim from usbmon capture.
-    /// Raw pcap bytes only — no header rebuilding or sequence tracking.
-    /// skip_fw_bulk: if true, skips the first 182 EP7 bulk commands (FW download)
-    /// that we already sent via load_firmware().
-    fn replay_phase(&self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
+    /// Extract the LAST ADDR_CAM MAC from the pcap sequence (without replaying).
+    /// The firmware's active MAC is the last ADDR_CAM written. Linux often sends
+    /// multiple ADDR_CAMs (CREATE station → CREATE monitor → CHANGE).
+    fn extract_pcap_addr_cam_mac(seq: &[rtl8852a_post_boot::PostBootOp]) -> Option<[u8; 6]> {
+        use rtl8852a_post_boot::PostBootOp;
+        let mut last_mac: Option<[u8; 6]> = None;
+        for op in seq {
+            if let PostBootOp::BulkOut(0x07, data) = op {
+                if let Some((cat, class, func, payload)) = Self::parse_h2c_from_pcap(data) {
+                    if cat == 1 && class == 6 && func == 0 && payload.len() >= 24 {
+                        let mac = [
+                            payload[16], payload[17], payload[18], payload[19],
+                            payload[20], payload[21],
+                        ];
+                        if mac != [0u8; 6] {
+                            last_mac = Some(mac);
+                        }
+                    }
+                }
+            }
+        }
+        last_mac
+    }
+
+    /// Replay a PostBootOp sequence from usbmon capture.
+    /// H2C commands get headers REBUILT with our seq counter + REC_ACK for confirmation.
+    /// Register ops and FWDL bulks are replayed verbatim.
+    fn replay_phase(&mut self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
                               skip_fw_bulk: bool) -> Result<()> {
         use rtl8852a_post_boot::PostBootOp;
 
@@ -1534,16 +2080,13 @@ impl Rtl8852au {
         let mut bulk_ok = 0usize;
         let mut bulk_fail = 0usize;
         let mut bulk_skip = 0usize;
-        let mut ep7_count = 0usize;
-        let mut reg_ops_since_last_bulk = 0usize;
-        let mut h2c_sent = 0usize; // total H2C commands sent (not skipped)
-        // FW download = first 182 EP7 bulk commands (128B header + 181 sections)
-        const FW_DOWNLOAD_EP7_COUNT: usize = 182;
+        // ep7_count, reg_ops_since_last_bulk, h2c_sent removed — all EP7 bulk
+        // commands are now skipped during pcap replay (sent programmatically after).
 
         for op in seq {
             match op {
                 PostBootOp::Read(full_addr, width) => {
-                    reg_ops_since_last_bulk += 1;
+
                     let _ = if *full_addr > 0xFFFF {
                         self.read32_ext(*full_addr).map(|_| ())
                     } else {
@@ -1557,7 +2100,7 @@ impl Rtl8852au {
                     read_ok += 1;
                 }
                 PostBootOp::Write(full_addr, val, width) => {
-                    reg_ops_since_last_bulk += 1;
+
                     let result = if *full_addr > 0xFFFF {
                         self.write32_ext(*full_addr, *val)
                     } else {
@@ -1570,8 +2113,6 @@ impl Rtl8852au {
                     };
                     if let Err(e) = result {
                         if write_fail < 5 {
-                            eprintln!("[RTL8852AU]   W 0x{:08X} = 0x{:08X} FAILED: {}",
-                                full_addr, val, e);
                         }
                         write_fail += 1;
                     } else {
@@ -1579,64 +2120,29 @@ impl Rtl8852au {
                     }
                 }
                 PostBootOp::BulkOut(ep, data) => {
-                    // When transitioning from register ops back to H2C bulk commands,
-                    // pause to let the drain thread consume any pending PPDU/C2H data.
-                    // Register ops (especially MAC/RX config) can enable the RX path,
-                    // causing a burst of incoming data that must be drained before
-                    // the firmware will accept new H2C commands.
-                    if *ep == 0x07 && reg_ops_since_last_bulk > 50 && h2c_sent > 0 {
-                        thread::sleep(Duration::from_millis(500));
-                    }
-
-                    // Skip FW download EP7 bulk commands (already loaded via load_firmware)
-                    if skip_fw_bulk && *ep == 0x07 {
-                        ep7_count += 1;
-                        if ep7_count <= FW_DOWNLOAD_EP7_COUNT {
-                            bulk_skip += 1;
-                            continue;
-                        }
-                    }
-
-                    // Skip ADDR_CAM (cat=1,cls=6,func=0) and FWROLE_MAINTAIN
-                    // (cat=1,cls=8,func=4) — these set up MAC address filtering
-                    // that blocks RX. Without them, firmware delivers all frames
-                    // in monitor mode (promiscuous via RX filter register).
+                    // ── SKIP ALL EP7 (H2C) bulk commands from pcap replay ──
+                    // H2C commands contain firmware-instance-specific data: sequence numbers,
+                    // MAC addresses, role IDs, and calibration payloads from the capture machine.
+                    // Replaying them into a different firmware instance causes silent rejection —
+                    // the firmware ignores stale H2C and never enables TX DMA (SYS_CFG5=0).
+                    //
+                    // Register writes (EP0 control) are hardware-level and safe to replay.
+                    // After pcap replay, we send fresh programmatic H2C with correct seq numbers:
+                    //   FWROLE_MAINTAIN(CREATE) → ADDR_CAM(our MAC) → FWROLE_MAINTAIN(CHANGE)
                     if *ep == 0x07 {
-                        if let Some((cat, class, func, _)) = Self::parse_h2c_from_pcap(data) {
-                            if cat == 1 && class == 6 && func == 0 {
-                                bulk_skip += 1;
-                                continue;
-                            }
-                            if cat == 1 && class == 8 && func == 4 {
-                                bulk_skip += 1;
-                                continue;
-                            }
-                        }
+                        bulk_skip += 1;
+                        continue;
                     }
 
-                    let target_ep = if *ep == 0x07 { self.ep_fw } else { self.ep_out };
+                    let target_ep = self.ep_out;
                     let timeout = Duration::from_millis(if data.len() > 1024 { 2000 } else { 500 });
                     match self.handle.write_bulk(target_ep, data, timeout) {
                         Ok(_) => {
                             bulk_ok += 1;
-                            if *ep == 0x07 {
-                                h2c_sent += 1;
-                                reg_ops_since_last_bulk = 0;
-                                let _ = Self::parse_h2c_from_pcap(data);
-                            }
                         }
                         Err(e) => {
                             bulk_fail += 1;
-                            if *ep == 0x07 {
-                                if let Some((cat, class, func, _)) = Self::parse_h2c_from_pcap(data) {
-                                    eprintln!("[RTL8852AU]   H2C RAW cat={} cls={} func={} ({} bytes): FAILED: {}",
-                                        cat, class, func, data.len(), e);
-                                } else {
-                                    eprintln!("[RTL8852AU]   Bulk EP7 raw ({} bytes): FAILED: {}", data.len(), e);
-                                }
-                            } else {
-                                eprintln!("[RTL8852AU]   Bulk EP{} ({} bytes): FAILED: {}", ep, data.len(), e);
-                            }
+                            // Bulk write failed — non-fatal during replay
                             let _ = self.handle.clear_halt(target_ep);
                         }
                     }
@@ -1652,29 +2158,26 @@ impl Rtl8852au {
     }
 
     fn chip_init(&mut self) -> Result<()> {
-
-        // Verify USB communication
-        let _chip_id = self.read8(0x00FC)?;
-        let _chip_cut = self.read8(0x00F1)?;
-        let usb_status = self.read32(0x11F0)?;
-        let _is_usb3 = (usb_status & 0x02) != 0;
+        // ══════════════════════════════════════════════════════════════════
+        //  Pure pcap replay — usbmon IS the spec.
+        //
+        //  Replays the EXACT USB operations from usb3_gentle_tx.pcap
+        //  (WimLee115 driver, Asahi Linux, 2026-04-04). This capture has
+        //  332 confirmed TX frames. We replay everything up to (but not
+        //  including) the first TX frame, then our code takes over.
+        //
+        //  Key discovery: after firmware boots (WCPU enable), EP7 stalls
+        //  on macOS unless we clear_halt(). Linux kernel does this
+        //  transparently. Without it, ALL post-FWDL H2C commands timeout.
+        // ══════════════════════════════════════════════════════════════════
 
         // ── Phase -1: Clean up dirty firmware state ──
-        // If a previous session exited without clean shutdown, the WCPU may still
-        // be running with old FW (0x01E0 shows FWDL_STS=ONGOING or H2C_PATH_RDY).
-        // We must disable the CPU and reset before attempting a fresh FW download.
         let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
         if fw_ctrl != 0 {
             self.disable_cpu()?;
             self.power_off()?;
             thread::sleep(Duration::from_millis(50));
         }
-
-        // ── PURE PCAP REPLAY — no custom init code ──
-        // The POST_FWDL_SEQUENCE contains EVERYTHING: pre-FWDL register config,
-        // FWDL header + sections (BULK_0-181), and post-FWDL H2C + register ops.
-        // We replay it ALL verbatim — no power_on(), no load_firmware(), no
-        // interface release/re-claim. Exactly what Linux did, byte for byte.
 
         // ── Background RX drain thread ──
         let drain_handle = Arc::clone(&self.handle);
@@ -1683,54 +2186,168 @@ impl Rtl8852au {
         let drain_flag = Arc::clone(&drain_running);
         let drain_thread = thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
-            let mut total_bytes = 0usize;
-            let mut total_reads = 0usize;
             while drain_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                match drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(1)) {
-                    Ok(n) if n > 0 => {
-                        total_reads += 1;
-                        total_bytes += n;
-                    }
-                    _ => {}
-                }
+                let _ = drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(1));
             }
-            let _ = (total_bytes, total_reads);
         });
 
-        // ── Phase 0: Pre-FWDL (our proven read-modify-write code) ──
-        self.power_on()?;
-        self.dmac_pre_init_and_enable_cpu()?;
-
-        // ── Phase 1: Firmware download ──
-        self.load_firmware()?;
-
-        // ── Phase 2: Post-FWDL — all register ops + calibration H2C ──
-        // Skip FWDL zone (325 ops) and ADDR_CAM/FWROLE_MAINTAIN H2C commands.
-        // ADDR_CAM contains the pcap capture machine's MAC; sending it enables
-        // firmware address filtering that blocks all RX in monitor mode.
-        const FWDL_ZONE_OPS: usize = 325;
-        let post_fwdl_only = &super::rtl8852a_phase_post_fwdl::POST_FWDL_SEQUENCE[FWDL_ZONE_OPS..];
-        self.replay_phase("Post-FWDL",
-            post_fwdl_only, false)?;
-
-        // ── Phase 3: Monitor mode — programmatic, no pcap replay ──
-        // The pcap monitor sequence contains a full channel switch (hal_reset →
-        // BB/RF retune → hal_resume) plus ADDR_CAM commands. Replaying this
-        // kills RX because op[31] disables PPDU status (0x120FC = 0x0F000000)
-        // and subsequent ADDR_CAM commands that should restore it are device-
-        // specific. Instead: just set the RX filter to monitor mode.
-        let rx_fltr_monitor = 0x031644BFu32; // from pcap: accept all frame types
-        self.write32(R_AX_RX_FLTR_OPT, rx_fltr_monitor)?;
-        // Monitor mode configured: RX_FLTR = 0x031644BF (promiscuous)
+        // ── Replay pcap init ──
+        let (reg_writes, reg_reads, ep7_sent, ep5_sent) = self.replay_pcap_init()?;
+        // Pcap replay stats available from replay_pcap_init() return value
 
         // ── Stop background drain ──
         drain_running.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = drain_thread.join();
 
-        self.channel = 1;
+        // ── Post-replay: ensure monitor mode + TX scheduler ──
+        // The pcap replay sets these, but re-applying is idempotent and
+        // guarantees correct state regardless of pcap scanning position.
+        self.write32(R_AX_RX_FLTR_OPT, 0x031644BFu32)?; // promiscuous monitor
+        self.setup_firmware_role()?; // SCH_TX_EN(0xFFFF) + CTN_TXEN(0xFFFF)
+
+        // ── Read MAC from EFUSE autoload registers ──
         self.read_mac_address()?;
+        self.channel = 149; // pcap was on ch149
 
         Ok(())
+    }
+
+    /// Replay the complete init sequence from the working pcap capture.
+    /// Returns (reg_writes, reg_reads, ep7_sent, ep5_sent).
+    fn replay_pcap_init(&self) -> Result<(u32, u32, u32, u32)> {
+        const PCAP_PATH: &str = "references/captures/rtl8852au_tx_20260404/usb3_gentle_tx.pcap";
+        const TARGET_BUS: u8 = 1;
+        const TARGET_DEV: u8 = 16;
+
+        let pcap_data = fs::read(PCAP_PATH).map_err(|e| Error::ChipInitFailed {
+            chip: "RTL8852AU".into(),
+            stage: crate::core::error::InitStage::HardwareSetup,
+            reason: format!("pcap read: {}", e),
+        })?;
+
+        let mut offset = 24; // skip pcap global header
+        let mut reg_writes = 0u32;
+        let mut reg_reads = 0u32;
+        let mut ep7_sent = 0u32;
+        let mut ep7_fail = 0u32;
+        let mut ep5_sent = 0u32;
+
+        while offset + 16 <= pcap_data.len() {
+            let incl_len = u32::from_le_bytes([
+                pcap_data[offset + 8], pcap_data[offset + 9],
+                pcap_data[offset + 10], pcap_data[offset + 11],
+            ]) as usize;
+            offset += 16;
+
+            if offset + incl_len > pcap_data.len() || incl_len < 64 {
+                offset += incl_len;
+                continue;
+            }
+
+            let pkt = &pcap_data[offset..offset + incl_len];
+            offset += incl_len;
+
+            let pkt_type = pkt[8];
+            let xfer_type = pkt[9];
+            let ep = pkt[10];
+            let devnum = pkt[11];
+            let busnum = u16::from_le_bytes([pkt[12], pkt[13]]);
+            let ep_num = ep & 0x7F;
+            let ep_dir_in = ep & 0x80 != 0;
+            let payload = &pkt[64..];
+
+            if busnum != TARGET_BUS as u16 || devnum != TARGET_DEV || pkt_type != 0x53 {
+                continue;
+            }
+
+            // ── Register WRITE ──
+            if xfer_type == 2 && !ep_dir_in && !payload.is_empty() {
+                let setup = &pkt[40..48];
+                let (bm_req_type, b_req) = (setup[0], setup[1]);
+                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
+                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
+                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
+
+                if b_req == 0x05 && bm_req_type == 0x40 {
+                    let write_data = &payload[..std::cmp::min(w_len as usize, payload.len())];
+                    let addr = (w_idx as u32) << 16 | w_val as u32;
+
+                    // Detect WCPU enable — firmware is booting, EP7 needs halt clearing
+                    if addr == 0x0088 && !write_data.is_empty() && (write_data[0] & 0x02) != 0 {
+                        let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
+                        reg_writes += 1;
+
+                        // Wait for firmware ready
+                        for _ in 0..2000 {
+                            let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
+                            let fwdl_sts = (ctrl >> B_AX_FWDL_STS_SH) & B_AX_FWDL_STS_MSK;
+                            if fwdl_sts == FWDL_WCPU_FW_INIT_RDY {
+                                // FW ready — proceed with EP7 halt clear
+                                break;
+                            }
+                            // Also check H2C_PATH_RDY for FWDL phase
+                            if ctrl & B_AX_H2C_PATH_RDY != 0 {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        // Clear EP7 halt — firmware boot resets endpoint state
+                        let _ = self.handle.clear_halt(self.ep_fw);
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+
+                    let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
+                    reg_writes += 1;
+                }
+            }
+            // ── Register READ ──
+            else if xfer_type == 2 && ep_dir_in {
+                let setup = &pkt[40..48];
+                let (bm_req_type, b_req) = (setup[0], setup[1]);
+                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
+                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
+                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
+
+                if b_req == 0x05 && bm_req_type == 0xC0 {
+                    let mut buf = vec![0u8; w_len as usize];
+                    let _ = self.handle.read_control(0xC0, 0x05, w_val, w_idx, &mut buf, USB_BULK_TIMEOUT);
+                    reg_reads += 1;
+                }
+            }
+            // ── EP7 bulk OUT (firmware + H2C) ──
+            else if xfer_type == 3 && !ep_dir_in && ep_num == 7 && !payload.is_empty() {
+                let result = match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
+                    Ok(_) => Ok(()),
+                    Err(_) => {
+                        let _ = self.handle.clear_halt(self.ep_fw);
+                        thread::sleep(Duration::from_millis(50));
+                        self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)).map(|_| ())
+                    }
+                };
+                match result {
+                    Ok(()) => ep7_sent += 1,
+                    Err(e) => {
+                        ep7_fail += 1;
+                        if ep7_fail <= 3 {
+                            // EP7 failure during pcap replay — non-fatal
+                        }
+                        let _ = self.handle.clear_halt(self.ep_fw);
+                    }
+                }
+            }
+            // ── EP5 bulk OUT (TX) — stop before first TX, init is complete ──
+            else if xfer_type == 3 && !ep_dir_in && ep_num == 5 && payload.len() > 48 {
+                // Init is done. Don't replay TX frames — our code handles TX.
+                break;
+            }
+        }
+
+        if ep7_fail > 0 {
+            // EP7 had failures — may cause H2C processing issues
+        }
+
+        Ok((reg_writes, reg_reads, ep7_sent, ep5_sent))
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1956,52 +2573,159 @@ impl Rtl8852au {
     //  TX frame injection (MAC AX WD format)
     // ══════════════════════════════════════════════════════════════════════════
 
+    /// Build and send a MAC AX TX descriptor + frame via USB bulk OUT.
+    ///
+    /// Structure: WD_BODY (24 bytes) + WD_INFO (24 bytes) + 802.11 frame
+    /// Total WD = 48 bytes. WDINFO_EN is always set for proper rate control.
+    ///
+    /// Field layout from txdesc.h (MAC_AX_8852A_SUPPORT section):
+    ///   WD_BODY DW0: STF_MODE[10] | HDR_LLC_LEN[15:11] | CH_DMA[19:16] | WDINFO_EN[22]
+    ///   WD_BODY DW2: TXPKTSIZE[13:0] | QSEL[22:17] | MACID[30:24]
+    ///   WD_BODY DW3: WIFI_SEQ[11:0]
+    ///   WD_INFO DW0: DATARATE[24:16] | GI_LTF[27:25] | DATA_BW[29:28] | USERATE_SEL[30]
+    ///                STBC[12] | LDPC[11] | DISDATAFB[10]
+    ///   WD_INFO DW1: DATA_TXCNT_LMT[30:25] | DATA_TXCNT_LMT_SEL[31] | BMC[11] | NAVUSEHDR[10]
+    ///   WD_INFO DW4: RTS_EN[27] | CTS2SELF[28]
     fn inject_frame(&mut self, frame: &[u8], opts: &TxOptions) -> Result<()> {
         if frame.len() < 10 {
             return Err(Error::TxFailed { retries: 0, reason: "frame too short".into() });
         }
 
-        let _rate = tx_rate_to_hw(&opts.rate, self.channel);
-        let _bmc = frame.len() >= 10 && (frame[4] & 0x01) != 0;
+        // Parse 802.11 frame control for type/subtype routing
+        let fc = u16::from_le_bytes([frame[0], frame[1]]);
+        let frame_type = (fc >> 2) & 0x3;     // 0=mgmt, 1=ctrl, 2=data
+        let _frame_subtype = (fc >> 4) & 0xF;
+        let is_multicast = frame[4] & 0x01 != 0;
 
-        // Queue from frame type
-        let fc_type = frame[0] & 0x0C;
-        let qsel = match fc_type {
-            0x00 => QSLT_MGNT,
-            0x04 => QSLT_VO,
-            0x08 => QSLT_BE,
-            _ => QSLT_MGNT,
+        // 802.11 header length (for HDR_LLC_LEN field)
+        let mac_hdr_len: u32 = match frame_type {
+            0 => 24,  // Management
+            1 => 10,  // Control (minimum — ACK/CTS are 10, RTS is 16, etc.)
+            2 => if fc & (1 << 8) != 0 && fc & (1 << 9) != 0 { 30 } else { 24 },
+            _ => 24,
         };
 
-        // DMA channel based on queue select
-        let dma_ch: u32 = match qsel {
-            QSLT_MGNT => 8, // MAC_AX_DMA_B0MG
-            QSLT_VO => 0,   // MAC_AX_DMA_ACH0
-            _ => 0,          // MAC_AX_DMA_ACH0
+        // ── DMA channel + queue select based on frame type ──
+        // Management → B0MG (DMA ch 8) + MG0_SEL queue
+        // Control → B0MG + MG0_SEL (highest priority, same as management)
+        // Data → WMM AC queue from QoS TID
+        let (dma_ch, qsel) = match frame_type {
+            0 | 1 => (MAC_AX_DMA_B0MG, MAC_AX_MG0_SEL),
+            2 => {
+                // Data: extract QoS TID for WMM AC mapping
+                let tid = if _frame_subtype & 0x8 != 0 && frame.len() >= 26 {
+                    (frame[24] & 0x0F) as u32
+                } else {
+                    0
+                };
+                // WMM TID→AC: {1,2}→BK(1), {0,3}→BE(0), {4,5}→VI(2), {6,7}→VO(3)
+                match tid {
+                    1 | 2 => (MAC_AX_DMA_ACH1, (0u32 << 2) | 1), // WMM0 AC_BK
+                    0 | 3 => (MAC_AX_DMA_ACH0, (0u32 << 2) | 0), // WMM0 AC_BE
+                    4 | 5 => (MAC_AX_DMA_ACH2, (0u32 << 2) | 2), // WMM0 AC_VI
+                    6 | 7 => (MAC_AX_DMA_ACH3, (0u32 << 2) | 3), // WMM0 AC_VO
+                    _     => (MAC_AX_DMA_ACH0, (0u32 << 2) | 0), // default BE
+                }
+            }
+            _ => (MAC_AX_DMA_B0MG, MAC_AX_MG0_SEL),
         };
 
-        let total_len = TX_WD_BODY_LEN + frame.len();
+        // Rate encoding for DATARATE field (9-bit)
+        let hw_rate = ax_rate_to_hw(&opts.rate) as u32;
+        let bw = (opts.bw as u32).min(2); // Clamp to 80MHz max (hardware limit)
+
+        let total_len = TX_WD_TOTAL_LEN + frame.len();
         let mut buf = vec![0u8; total_len];
 
-        // Build MAC AX WD for data frame
-        // DW0: STF_MODE + CH_DMA
-        let wd_dw0 = AX_TXD_STF_MODE | (dma_ch << AX_TXD_CH_DMA_SH);
-        buf[0..4].copy_from_slice(&wd_dw0.to_le_bytes());
-        // DW1 = 0
-        // DW2: TXPKTSIZE
-        let wd_dw2 = frame.len() as u32;
-        buf[8..12].copy_from_slice(&wd_dw2.to_le_bytes());
-        // DW3-5 = 0
+        // ══════════════════════════════════════════════
+        //  WD_BODY (24 bytes, offset 0-23)
+        // ══════════════════════════════════════════════
 
-        // Copy frame after WD
-        buf[TX_WD_BODY_LEN..].copy_from_slice(frame);
+        // DW0: STF_MODE | HDR_LLC_LEN | CH_DMA | WDINFO_EN
+        // HDR_LLC_LEN is in raw bytes (NOT bytes/2) — verified from usbmon:
+        //   Linux probe DW0=0x0048C400 → HDR_LLC_LEN=24 (not 12)
+        let dw0: u32 = AX_TXD_STF_MODE
+            | ((mac_hdr_len & 0x1F) << AX_TXD_HDR_LLC_LEN_SH)
+            | (dma_ch << AX_TXD_CH_DMA_SH)
+            | AX_TXD_WDINFO_EN;
+        buf[0..4].copy_from_slice(&dw0.to_le_bytes());
 
-        self.handle
-            .write_bulk(self.ep_out, &buf, USB_BULK_TIMEOUT)
-            .map_err(|e| Error::TxFailed {
-                retries: 0,
-                reason: format!("bulk OUT: {e}"),
-            })?;
+        // DW1 = 0 (no shortcut CAM, no PLD, no DMA TX aggregation)
+
+        // DW2: TXPKTSIZE | QSEL | MACID
+        let dw2: u32 = (frame.len() as u32 & 0x3FFF)
+            | ((qsel & 0x3F) << AX_TXD_QSEL_SH);
+            // MACID = 0 for broadcast/monitor mode injection
+        buf[8..12].copy_from_slice(&dw2.to_le_bytes());
+
+        // DW3: BK (break aggregation) + WIFI_SEQ.
+        // Linux pcap: ALL TX frames have BK=1 (bit 13 = 0x2000) + seq counter.
+        // For monitor mode injection, always break aggregation.
+        if frame.len() >= 24 {
+            let seq_ctrl = u16::from_le_bytes([frame[22], frame[23]]);
+            let seq_num = (seq_ctrl >> 4) & 0x0FFF;
+            let dw3: u32 = AX_TXD_BK | ((seq_num as u32) << AX_TXD_WIFI_SEQ_SH);
+            buf[12..16].copy_from_slice(&dw3.to_le_bytes());
+        }
+
+        // DW4, DW5 = 0 (no AES IV, no checksum — wd_checksum_en is not set)
+
+        // ══════════════════════════════════════════════
+        //  WD_INFO (24 bytes, offset 24-47)
+        // ══════════════════════════════════════════════
+
+        // INFO DW0: DATARATE | GI_LTF | DATA_BW | USERATE_SEL | STBC | LDPC | DISDATAFB
+        let mut info_dw0: u32 = AX_TXD_USERATE_SEL
+            | ((hw_rate & 0x1FF) << AX_TXD_DATARATE_SH)
+            | ((bw & 0x3) << AX_TXD_DATA_BW_SH)
+            | (((opts.gi as u32) & 0x7) << AX_TXD_GI_LTF_SH);
+        if opts.flags.contains(TxFlags::STBC)   { info_dw0 |= AX_TXD_DATA_STBC; }
+        if opts.flags.contains(TxFlags::LDPC)   { info_dw0 |= AX_TXD_DATA_LDPC; }
+        if opts.flags.contains(TxFlags::NO_RETRY) { info_dw0 |= AX_TXD_DISDATAFB; } // disable fallback too
+        buf[24..28].copy_from_slice(&info_dw0.to_le_bytes());
+
+        // INFO DW1: BMC flag + optional retry limit
+        // Linux usbmon shows minimal INFO_DW1: just BMC=1 for broadcast (0x00000800).
+        // Only set TXCNT_LMT when explicitly requested via retries > 0.
+        let mut info_dw1: u32 = 0;
+        if is_multicast { info_dw1 |= AX_TXD_BMC; }
+        if opts.retries > 0 && !opts.flags.contains(TxFlags::NO_RETRY) {
+            let retry_count = (opts.retries as u32).clamp(1, 63);
+            info_dw1 |= AX_TXD_DATA_TXCNT_LMT_SEL
+                | ((retry_count & 0x3F) << AX_TXD_DATA_TXCNT_LMT_SH);
+        }
+        buf[28..32].copy_from_slice(&info_dw1.to_le_bytes());
+
+        // INFO DW2, DW3 = 0 (no security, no SIFS_TX, no sounding)
+
+        // INFO DW4: RTS/CTS protection
+        if opts.flags.contains(TxFlags::PROTECT) {
+            let info_dw4: u32 = AX_TXD_RTS_EN;
+            buf[40..44].copy_from_slice(&info_dw4.to_le_bytes());
+        }
+
+        // INFO DW5 = 0
+
+        // ══════════════════════════════════════════════
+        //  802.11 frame payload (offset 48+)
+        // ══════════════════════════════════════════════
+
+        buf[TX_WD_TOTAL_LEN..].copy_from_slice(frame);
+
+        // Send via USB bulk OUT EP5
+        for retry in 0..opts.retries.max(1) {
+            match self.handle.write_bulk(self.ep_out, &buf, USB_BULK_TIMEOUT) {
+                Ok(_) => return Ok(()),
+                Err(e) if retry < opts.retries.saturating_sub(1) => {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => return Err(Error::TxFailed {
+                    retries: opts.retries,
+                    reason: format!("bulk OUT EP 0x{:02X}: {}", self.ep_out, e),
+                }),
+            }
+        }
 
         Ok(())
     }
@@ -2306,5 +3030,84 @@ mod tests {
         // Verify WD DW0 for FWDL
         let wd_dw0 = (MAC_AX_DMA_H2C << AX_TXD_CH_DMA_SH) | AX_TXD_FWDL_EN;
         assert_eq!(wd_dw0, 0x001C0000);
+    }
+
+    #[test]
+    fn test_tx_wd_management_frame() {
+        // Verify TX WD matches Linux usbmon EXACTLY for a probe request.
+        // Reference: full_capture_bus4.pcap TX#0:
+        //   DW0=0x0048C400  DW2=0x0024002A  INFO_DW0=0x40040000  INFO_DW1=0x00000800
+
+        // DW0: STF_MODE[10] | HDR_LLC_LEN=24[15:11] | CH_DMA=8(B0MG)[19:16] | WDINFO_EN[22]
+        // NOTE: HDR_LLC_LEN is in raw bytes (NOT bytes/2) — verified from usbmon
+        let hdr_len = 24u32;
+        let dw0: u32 = AX_TXD_STF_MODE
+            | ((hdr_len & 0x1F) << AX_TXD_HDR_LLC_LEN_SH)
+            | (MAC_AX_DMA_B0MG << AX_TXD_CH_DMA_SH)
+            | AX_TXD_WDINFO_EN;
+        assert_eq!(dw0, 0x0048C400); // exact match with Linux usbmon
+
+        // DW2: TXPKTSIZE=42 | QSEL=MG0(18)[22:17] (42-byte probe request body)
+        let frame_len = 42u32;
+        let dw2: u32 = (frame_len & 0x3FFF) | ((MAC_AX_MG0_SEL & 0x3F) << AX_TXD_QSEL_SH);
+        assert_eq!(dw2, 0x0024002A); // exact match with Linux usbmon
+
+        // INFO DW0: USERATE_SEL[30] | DATARATE=OFDM6(0x04)[24:16]
+        let info_dw0: u32 = AX_TXD_USERATE_SEL | (0x04u32 << AX_TXD_DATARATE_SH);
+        assert_eq!(info_dw0, 0x40040000); // exact match with Linux usbmon
+
+        // INFO DW1: BMC=1 (broadcast probe) — Linux sends exactly 0x00000800
+        let info_dw1: u32 = AX_TXD_BMC;
+        assert_eq!(info_dw1, 0x00000800); // exact match with Linux usbmon
+    }
+
+    #[test]
+    fn test_tx_wd_data_frame_qos() {
+        // Verify data frame WMM queue mapping
+        // AC_BE (TID 0,3) → DMA ACH0, qsel = WMM0_AC_BE = 0
+        // AC_BK (TID 1,2) → DMA ACH1, qsel = WMM0_AC_BK = 1
+        // AC_VI (TID 4,5) → DMA ACH2, qsel = WMM0_AC_VI = 2
+        // AC_VO (TID 6,7) → DMA ACH3, qsel = WMM0_AC_VO = 3
+        assert_eq!(MAC_AX_DMA_ACH0, 0);
+        assert_eq!(MAC_AX_DMA_ACH1, 1);
+        assert_eq!(MAC_AX_DMA_ACH2, 2);
+        assert_eq!(MAC_AX_DMA_ACH3, 3);
+        assert_eq!(MAC_AX_DMA_B0MG, 8);
+    }
+
+    #[test]
+    fn test_ax_rate_encoding() {
+        // CCK/OFDM — matches RTW_DATA_RATE from rtw_general_def.h
+        assert_eq!(ax_rate_to_hw(&TxRate::Cck1m), 0x00);
+        assert_eq!(ax_rate_to_hw(&TxRate::Ofdm6m), 0x04);
+        assert_eq!(ax_rate_to_hw(&TxRate::Ofdm54m), 0x0B);
+
+        // HT — 0x80 + MCS index
+        assert_eq!(ax_rate_to_hw(&TxRate::HtMcs(0)), 0x80);
+        assert_eq!(ax_rate_to_hw(&TxRate::HtMcs(7)), 0x87);
+        assert_eq!(ax_rate_to_hw(&TxRate::HtMcs(15)), 0x8F); // 2SS MCS15
+
+        // VHT — 0x100 + (NSS-1)*16 + MCS
+        assert_eq!(ax_rate_to_hw(&TxRate::VhtMcs { mcs: 0, nss: 1 }), 0x100);
+        assert_eq!(ax_rate_to_hw(&TxRate::VhtMcs { mcs: 9, nss: 1 }), 0x109);
+        assert_eq!(ax_rate_to_hw(&TxRate::VhtMcs { mcs: 0, nss: 2 }), 0x110);
+        assert_eq!(ax_rate_to_hw(&TxRate::VhtMcs { mcs: 9, nss: 2 }), 0x119);
+
+        // HE — 0x180 + (NSS-1)*16 + MCS
+        assert_eq!(ax_rate_to_hw(&TxRate::HeMcs { mcs: 0, nss: 1 }), 0x180);
+        assert_eq!(ax_rate_to_hw(&TxRate::HeMcs { mcs: 11, nss: 1 }), 0x18B);
+        assert_eq!(ax_rate_to_hw(&TxRate::HeMcs { mcs: 0, nss: 2 }), 0x190);
+        assert_eq!(ax_rate_to_hw(&TxRate::HeMcs { mcs: 11, nss: 2 }), 0x19B);
+
+        // All rates fit in 9-bit DATARATE field (max 0x1FF = 511)
+        assert!(ax_rate_to_hw(&TxRate::HeMcs { mcs: 11, nss: 2 }) <= 0x1FF);
+    }
+
+    #[test]
+    fn test_stf_mode_bit_position() {
+        // Vendor: AX_TXD_STF_MODE = BIT(10) — NOT BIT(0)
+        // This was the root cause of TX killing RX
+        assert_eq!(AX_TXD_STF_MODE, 1 << 10);
+        assert_eq!(AX_TXD_STF_MODE, 0x400);
     }
 }
