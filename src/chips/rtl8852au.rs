@@ -703,7 +703,6 @@ pub struct Rtl8852au {
     channel: u8,
     mac_addr: MacAddress,
     h2c_seq: u16,
-    pcap_ch_switch_idx: u32,
     rx_buf: Vec<u8>,
     rx_pos: usize,
     rx_len: usize,
@@ -786,7 +785,6 @@ impl Rtl8852au {
             channel: 0,
             mac_addr: MacAddress::ZERO,
             h2c_seq: 0,
-            pcap_ch_switch_idx: 0,
             rx_buf: vec![0u8; RX_BUF_SIZE],
             rx_pos: 0,
             rx_len: 0,
@@ -804,40 +802,40 @@ impl Rtl8852au {
     //  Register access (identical to all Realtek USB chips)
     // ══════════════════════════════════════════════════════════════════════════
 
-    fn read8(&self, addr: u16) -> Result<u8> {
+    pub(crate) fn read8(&self, addr: u16) -> Result<u8> {
         let mut buf = [0u8; 1];
         let r = self.handle.read_control(0xC0, RTL_USB_REQ, addr, 0, &mut buf, RTL_USB_TIMEOUT)?;
         if r < 1 { return Err(Error::RegisterReadFailed { addr }); }
         Ok(buf[0])
     }
 
-    fn write8(&self, addr: u16, val: u8) -> Result<()> {
+    pub(crate) fn write8(&self, addr: u16, val: u8) -> Result<()> {
         let r = self.handle.write_control(0x40, RTL_USB_REQ, addr, 0, &[val], RTL_USB_TIMEOUT)?;
         if r < 1 { return Err(Error::RegisterWriteFailed { addr, val: val as u32 }); }
         Ok(())
     }
 
-    fn read16(&self, addr: u16) -> Result<u16> {
+    pub(crate) fn read16(&self, addr: u16) -> Result<u16> {
         let mut buf = [0u8; 2];
         let r = self.handle.read_control(0xC0, RTL_USB_REQ, addr, 0, &mut buf, RTL_USB_TIMEOUT)?;
         if r < 2 { return Err(Error::RegisterReadFailed { addr }); }
         Ok(u16::from_le_bytes(buf))
     }
 
-    fn write16(&self, addr: u16, val: u16) -> Result<()> {
+    pub(crate) fn write16(&self, addr: u16, val: u16) -> Result<()> {
         let r = self.handle.write_control(0x40, RTL_USB_REQ, addr, 0, &val.to_le_bytes(), RTL_USB_TIMEOUT)?;
         if r < 2 { return Err(Error::RegisterWriteFailed { addr, val: val as u32 }); }
         Ok(())
     }
 
-    fn read32(&self, addr: u16) -> Result<u32> {
+    pub(crate) fn read32(&self, addr: u16) -> Result<u32> {
         let mut buf = [0u8; 4];
         let r = self.handle.read_control(0xC0, RTL_USB_REQ, addr, 0, &mut buf, RTL_USB_TIMEOUT)?;
         if r < 4 { return Err(Error::RegisterReadFailed { addr }); }
         Ok(u32::from_le_bytes(buf))
     }
 
-    fn write32(&self, addr: u16, val: u32) -> Result<()> {
+    pub(crate) fn write32(&self, addr: u16, val: u32) -> Result<()> {
         let r = self.handle.write_control(0x40, RTL_USB_REQ, addr, 0, &val.to_le_bytes(), RTL_USB_TIMEOUT)?;
         if r < 4 { return Err(Error::RegisterWriteFailed { addr, val }); }
         Ok(())
@@ -845,7 +843,7 @@ impl Rtl8852au {
 
     // ── Extended register access (addresses > 0xFFFF via wIndex) ──
 
-    fn read32_ext(&self, addr: u32) -> Result<u32> {
+    pub(crate) fn read32_ext(&self, addr: u32) -> Result<u32> {
         let mut buf = [0u8; 4];
         let w_value = (addr & 0xFFFF) as u16;
         let w_index = ((addr >> 16) & 0xFFFF) as u16;
@@ -854,7 +852,7 @@ impl Rtl8852au {
         Ok(u32::from_le_bytes(buf))
     }
 
-    fn write32_ext(&self, addr: u32, val: u32) -> Result<()> {
+    pub(crate) fn write32_ext(&self, addr: u32, val: u32) -> Result<()> {
         let w_value = (addr & 0xFFFF) as u16;
         let w_index = ((addr >> 16) & 0xFFFF) as u16;
         let r = self.handle.write_control(0x40, RTL_USB_REQ, w_value, w_index, &val.to_le_bytes(), RTL_USB_TIMEOUT)?;
@@ -1769,152 +1767,24 @@ impl Rtl8852au {
     //  Channel switching
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Channel switching — pcap replay from usb3_gentle_tx.pcap.
-    /// Replays the Nth channel switch from the scanning sequence.
-    /// Each switch has ~126 writes + ~97 reads including BB/PHY, CMAC, TX_PWR, SCH_TX_EN.
-    /// Our programmatic code only did 9 writes — missing 117 BB/PHY registers.
+    /// Channel switching — per-channel pcap replay.
+    /// Each channel has its own complete register sequence (126 writes + 97 reads)
+    /// extracted from usb3_gentle_tx.pcap. Covers all 38 WiFi channels (2.4+5GHz).
+    /// Includes BB/PHY, AGC, PPDU status, TX power, SCH_TX_EN — everything.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
-        // Use pcap replay for channel switching — round-robin through the 288 switches
-        // Each pcap switch targets a different channel in the scan sequence.
-        // We don't map ch→pcap_switch_idx yet — just cycle through them.
-        // This gives us correct BB/PHY/PPDU config even if the channel doesn't match exactly.
-        let switch_idx = self.pcap_ch_switch_idx;
-        self.pcap_ch_switch_idx += 1;
-
-        if let Err(_) = self.replay_pcap_channel_switch(switch_idx) {
-            // Fallback to programmatic if pcap replay fails
-            let _ = self.send_sch_tx_en(0x0000);
-            let _ = self.write16(0xC348, 0x0000);
-            self.set_channel_programmatic(ch)?;
-            self.write_txagc_power_table(ch)?;
-            let _ = self.send_sch_tx_en(0xFFFF);
-            let _ = self.write16(0xC348, 0xFFFF);
-        }
-
-        Ok(())
-    }
-
-    /// Replay the Nth channel switch from the pcap scanning sequence.
-    fn replay_pcap_channel_switch(&self, switch_idx: u32) -> Result<()> {
-        const PCAP_PATH: &str = "references/captures/rtl8852au_tx_20260404/usb3_gentle_tx.pcap";
-        const TARGET_BUS: u16 = 1;
-        const TARGET_DEV: u8 = 16;
-
-        let pcap_data = fs::read(PCAP_PATH).map_err(|_| Error::ChipInitFailed {
-            chip: "RTL8852AU".into(),
-            stage: crate::core::error::InitStage::HardwareSetup,
-            reason: "pcap read failed".into(),
-        })?;
-
-        // Parse pcap to find channel switch boundaries (SCH_TX_EN disable → enable)
-        let mut offset = 24;
-        let mut in_switch = false;
-        let mut current_switch = 0u32;
-        let mut found = false;
-        let mut past_first_tx = false;
-
-        while offset + 16 <= pcap_data.len() {
-            let incl_len = u32::from_le_bytes([
-                pcap_data[offset + 8], pcap_data[offset + 9],
-                pcap_data[offset + 10], pcap_data[offset + 11],
-            ]) as usize;
-            offset += 16;
-            if offset + incl_len > pcap_data.len() || incl_len < 64 {
-                offset += incl_len;
-                continue;
-            }
-
-            let pkt = &pcap_data[offset..offset + incl_len];
-            offset += incl_len;
-
-            let pkt_type = pkt[8];
-            let xfer_type = pkt[9];
-            let ep = pkt[10];
-            let devnum = pkt[11];
-            let busnum = u16::from_le_bytes([pkt[12], pkt[13]]);
-            let ep_num = ep & 0x7F;
-            let ep_dir_in = (ep & 0x80) != 0;
-            let payload = &pkt[64..];
-
-            if busnum != TARGET_BUS || devnum != TARGET_DEV || pkt_type != 0x53 {
-                continue;
-            }
-
-            // Track first TX to skip init-phase SCH_TX_EN
-            if xfer_type == 3 && !ep_dir_in && ep_num == 5 && payload.len() > 48 {
-                past_first_tx = true;
-                continue;
-            }
-            if !past_first_tx { continue; }
-
-            // Register WRITE
-            if xfer_type == 2 && !ep_dir_in && !payload.is_empty() {
-                let setup = &pkt[40..48];
-                let (bm, br) = (setup[0], setup[1]);
-                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
-                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
-                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
-
-                if br == 0x05 && bm == 0x40 {
-                    let addr = (w_idx as u32) << 16 | w_val as u32;
-                    let write_data = &payload[..std::cmp::min(w_len as usize, payload.len())];
-
-                    // Detect SCH_TX_EN disable (start of channel switch)
-                    if addr == 0x8140 {
-                        let val = u32::from_le_bytes([
-                            write_data[0], write_data.get(1).copied().unwrap_or(0),
-                            write_data.get(2).copied().unwrap_or(0), write_data.get(3).copied().unwrap_or(0),
-                        ]);
-                        if val == 0x00000305 {
-                            // SCH_TX_EN disable — start of a new channel switch
-                            if in_switch {
-                                current_switch += 1; // previous switch ended without enable?
-                            }
-                            in_switch = true;
-                            if current_switch == switch_idx % 288 {
-                                found = true;
-                            }
-                        } else if val == 0x01000305 && in_switch {
-                            // SCH_TX_EN enable — end of channel switch
-                            if found {
-                                // Replay this last write and we're done
-                                let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
-                                return Ok(());
-                            }
-                            in_switch = false;
-                            current_switch += 1;
-                            if current_switch == switch_idx % 288 {
-                                // Next switch will be ours
-                            }
-                            continue;
-                        }
-                    }
-
-                    // Replay writes for the active switch
-                    if found && in_switch {
-                        let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
-                    }
-                }
-            }
-            // Register READ — replay for the active switch (some reads are needed for timing)
-            else if xfer_type == 2 && ep_dir_in && found && in_switch {
-                let setup = &pkt[40..48];
-                let (bm, br) = (setup[0], setup[1]);
-                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
-                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
-                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
-                if br == 0x05 && bm == 0xC0 {
-                    let mut buf = vec![0u8; w_len as usize];
-                    let _ = self.handle.read_control(0xC0, 0x05, w_val, w_idx, &mut buf, USB_BULK_TIMEOUT);
-                }
+        match self.pcap_channel_switch(ch) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Fallback to programmatic for channels not in pcap (e.g., ch14)
+                let _ = self.send_sch_tx_en(0x0000);
+                let _ = self.write16(0xC348, 0x0000);
+                self.set_channel_programmatic(ch)?;
+                self.write_txagc_power_table(ch)?;
+                let _ = self.send_sch_tx_en(0xFFFF);
+                let _ = self.write16(0xC348, 0xFFFF);
+                Ok(())
             }
         }
-
-        Err(Error::ChipInitFailed {
-            chip: "RTL8852AU".into(),
-            stage: crate::core::error::InitStage::HardwareSetup,
-            reason: format!("pcap switch {} not found", switch_idx),
-        })
     }
 
     /// Write TX AGC (Automatic Gain Control) power table for the current channel.
