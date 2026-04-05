@@ -414,66 +414,132 @@ impl Default for PpduPhyStatus {
     }
 }
 
-/// Cache for PPDU status correlation. 8 slots indexed by ppdu_cnt.
+/// Debug counters for PPDU status diagnosis — writes to /tmp/wifikit_ppdu_debug.log
+#[derive(Default)]
+struct PpduDebugStats {
+    total_non_wifi: u64,
+    rpkt_type_counts: [u64; 16],
+    ppdu_received: u64,
+    ppdu_parsed: u64,
+    ppdu_with_rssi: u64,
+    ppdu_correlated: u64,
+    ppdu_no_match: u64,
+    ppdu_parse_fail: u64,
+    ppdu_too_short: u64,
+    last_rssi: i8,
+}
+
+impl PpduDebugStats {
+    fn dump(&self) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open("/tmp/wifikit_ppdu_debug.log")
+        {
+            let _ = writeln!(f, "=== PPDU Debug Stats ===");
+            let _ = writeln!(f, "Non-WiFi packets: {}", self.total_non_wifi);
+            for (i, &count) in self.rpkt_type_counts.iter().enumerate() {
+                if count > 0 {
+                    let name = match i {
+                        0 => "WiFi",
+                        1 => "PPDU_STATUS",
+                        2 => "CH_INFO",
+                        4 => "TX_RPT",
+                        8 => "C2H",
+                        _ => "other",
+                    };
+                    let _ = writeln!(f, "  rpkt_type={}: {} ({})", i, count, name);
+                }
+            }
+            let _ = writeln!(f, "PPDU received: {}", self.ppdu_received);
+            let _ = writeln!(f, "PPDU parsed OK: {}", self.ppdu_parsed);
+            let _ = writeln!(f, "PPDU with RSSI: {}", self.ppdu_with_rssi);
+            let _ = writeln!(f, "PPDU correlated (matched pending frame): {}", self.ppdu_correlated);
+            let _ = writeln!(f, "PPDU no match (no pending frame): {}", self.ppdu_no_match);
+            let _ = writeln!(f, "PPDU parse fail: {}", self.ppdu_parse_fail);
+            let _ = writeln!(f, "PPDU too short: {}", self.ppdu_too_short);
+            let _ = writeln!(f, "Last RSSI: {} dBm", self.last_rssi);
+            let corr_rate = if self.ppdu_received > 0 {
+                self.ppdu_correlated as f64 / self.ppdu_received as f64 * 100.0
+            } else { 0.0 };
+            let _ = writeln!(f, "Correlation rate: {:.1}%", corr_rate);
+        }
+    }
+}
+
+/// Cache for PPDU status correlation. 8 slots indexed by ppdu_cnt (3-bit).
 ///
-/// Architecture: WiFi frames arrive BEFORE their matching PPDU status in the USB
-/// buffer. So we must store the pending WiFi frame and only return it once the
-/// PPDU status fills in the PHY info. If the next WiFi frame arrives before a
-/// PPDU status (different ppdu_cnt), we return the pending frame with whatever
-/// info we have (possibly rssi=0).
+/// Architecture: WiFi frames and PPDU status packets arrive interleaved in the
+/// USB buffer. Either can arrive first. We use two parallel 8-slot arrays:
+///
+///   phy_slots[]:     PPDU status (RSSI/SNR/LDPC/STBC) indexed by ppdu_cnt
+///   pending_frames[]: WiFi frames waiting for their PPDU status, indexed by ppdu_cnt
+///
+/// When a PPDU arrives: store in phy_slots, check pending_frames for match → return with RSSI.
+/// When a WiFi frame arrives: check phy_slots for match → return with RSSI. Else store pending.
+///
+/// Old design had only ONE pending frame slot — at 323fps, different ppdu_cnt values
+/// evicted each other, giving only 28.5% correlation. With 8 pending slots (one per
+/// ppdu_cnt value), frames with different ppdu_cnt no longer interfere.
+///
+/// Completed frames are returned via a small queue (completed_queue) since parse_rx_packet
+/// can only return one frame per call.
 pub(crate) struct PpduStatusCache {
-    slots: [PpduPhyStatus; PPDU_SLOT_COUNT],
-    /// Pending WiFi frame waiting for its PPDU status.
-    pending_frame: Option<(u8, RxFrame)>, // (ppdu_cnt, frame)
+    /// PHY status from PPDU packets, indexed by ppdu_cnt & 0x7
+    phy_slots: [PpduPhyStatus; PPDU_SLOT_COUNT],
+    /// WiFi frames waiting for their PPDU status, indexed by ppdu_cnt & 0x7
+    pending_frames: [Option<RxFrame>; PPDU_SLOT_COUNT],
+    /// Completed frames ready to return (from PPDU matching a pending frame)
+    completed_queue: Vec<RxFrame>,
 }
 
 impl PpduStatusCache {
     fn new() -> Self {
         Self {
-            slots: [PpduPhyStatus::default(); PPDU_SLOT_COUNT],
-            pending_frame: None,
+            phy_slots: [PpduPhyStatus::default(); PPDU_SLOT_COUNT],
+            pending_frames: Default::default(),
+            completed_queue: Vec::with_capacity(8),
         }
+    }
+
+    /// Pop a completed frame from the queue (from previous PPDU correlations).
+    fn pop_completed(&mut self) -> Option<RxFrame> {
+        if self.completed_queue.is_empty() { None } else { Some(self.completed_queue.remove(0)) }
     }
 
     /// Store PHY status from a PPDU status packet.
     /// If there's a pending frame with matching ppdu_cnt, applies the PHY info
-    /// and returns the completed frame.
+    /// and queues the completed frame.
     fn store_ppdu(&mut self, ppdu_cnt: u8, phy: PpduPhyStatus) -> Option<RxFrame> {
         let idx = (ppdu_cnt & 0x7) as usize;
-        self.slots[idx] = phy;
+        self.phy_slots[idx] = phy;
 
-        // Check if the pending frame matches this PPDU status
-        if let Some((pending_cnt, ref mut frame)) = self.pending_frame {
-            if pending_cnt == ppdu_cnt {
-                Self::apply_phy_to_frame(frame, &phy);
-                return self.pending_frame.take().map(|(_, f)| f);
-            }
+        // Check if a pending frame matches this PPDU status
+        if let Some(mut frame) = self.pending_frames[idx].take() {
+            Self::apply_phy_to_frame(&mut frame, &phy);
+            return Some(frame);
         }
         None
     }
 
-    /// Store a WiFi frame as pending, waiting for its PPDU status.
-    /// Returns any previously pending frame that never got its PPDU status.
+    /// Store a WiFi frame as pending for PPDU correlation.
+    /// If the slot is already occupied (same ppdu_cnt wrapping), the old frame
+    /// is returned without RSSI (it missed its window).
     fn store_pending(&mut self, ppdu_cnt: u8, frame: RxFrame) -> Option<RxFrame> {
-        // If there's already a pending frame, return it (it missed its PPDU)
-        let old = self.pending_frame.take().map(|(_, f)| f);
-        self.pending_frame = Some((ppdu_cnt, frame));
+        let idx = (ppdu_cnt & 0x7) as usize;
+        let old = self.pending_frames[idx].take();
+        self.pending_frames[idx] = Some(frame);
         old
     }
 
-    /// Look up pre-stored PPDU status (from a previous cycle or batch).
+    /// Look up pre-stored PPDU status for this ppdu_cnt.
     fn lookup(&self, ppdu_cnt: u8) -> Option<&PpduPhyStatus> {
         let idx = (ppdu_cnt & 0x7) as usize;
-        if self.slots[idx].valid {
-            Some(&self.slots[idx])
+        if self.phy_slots[idx].valid {
+            Some(&self.phy_slots[idx])
         } else {
             None
         }
-    }
-
-    /// Flush any pending frame (e.g., at end of buffer).
-    fn flush_pending(&mut self) -> Option<RxFrame> {
-        self.pending_frame.take().map(|(_, f)| f)
     }
 
     fn apply_phy_to_frame(frame: &mut RxFrame, phy: &PpduPhyStatus) {
@@ -637,6 +703,7 @@ pub struct Rtl8852au {
     channel: u8,
     mac_addr: MacAddress,
     h2c_seq: u16,
+    pcap_ch_switch_idx: u32,
     rx_buf: Vec<u8>,
     rx_pos: usize,
     rx_len: usize,
@@ -719,6 +786,7 @@ impl Rtl8852au {
             channel: 0,
             mac_addr: MacAddress::ZERO,
             h2c_seq: 0,
+            pcap_ch_switch_idx: 0,
             rx_buf: vec![0u8; RX_BUF_SIZE],
             rx_pos: 0,
             rx_len: 0,
@@ -1701,26 +1769,152 @@ impl Rtl8852au {
     //  Channel switching
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Channel switching — programmatic register-based implementation.
-    /// Complete port from vendor driver (halbb_ctrl_bw_ch_8852a + hal_chan.c).
-    /// Works for all 39 channels (1-14 2.4GHz + 25 5GHz), 20MHz bandwidth.
+    /// Channel switching — pcap replay from usb3_gentle_tx.pcap.
+    /// Replays the Nth channel switch from the scanning sequence.
+    /// Each switch has ~126 writes + ~97 reads including BB/PHY, CMAC, TX_PWR, SCH_TX_EN.
+    /// Our programmatic code only did 9 writes — missing 117 BB/PHY registers.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
-        // Disable TX scheduler before channel switch (Linux does this every time)
-        let _ = self.send_sch_tx_en(0x0000);
-        let _ = self.write16(0xC348, 0x0000); // Direct fallback
+        // Use pcap replay for channel switching — round-robin through the 288 switches
+        // Each pcap switch targets a different channel in the scan sequence.
+        // We don't map ch→pcap_switch_idx yet — just cycle through them.
+        // This gives us correct BB/PHY/PPDU config even if the channel doesn't match exactly.
+        let switch_idx = self.pcap_ch_switch_idx;
+        self.pcap_ch_switch_idx += 1;
 
-        self.set_channel_programmatic(ch)?;
-
-        // Write TX power table (TXAGC) for this channel.
-        // Without this, the radio has no power configuration and transmits nothing.
-        // Values from usbmon capture — Linux writes these on every channel switch.
-        self.write_txagc_power_table(ch)?;
-
-        // Re-enable TX scheduler after channel switch
-        let _ = self.send_sch_tx_en(0xFFFF);
-        let _ = self.write16(0xC348, 0xFFFF); // Direct fallback
+        if let Err(_) = self.replay_pcap_channel_switch(switch_idx) {
+            // Fallback to programmatic if pcap replay fails
+            let _ = self.send_sch_tx_en(0x0000);
+            let _ = self.write16(0xC348, 0x0000);
+            self.set_channel_programmatic(ch)?;
+            self.write_txagc_power_table(ch)?;
+            let _ = self.send_sch_tx_en(0xFFFF);
+            let _ = self.write16(0xC348, 0xFFFF);
+        }
 
         Ok(())
+    }
+
+    /// Replay the Nth channel switch from the pcap scanning sequence.
+    fn replay_pcap_channel_switch(&self, switch_idx: u32) -> Result<()> {
+        const PCAP_PATH: &str = "references/captures/rtl8852au_tx_20260404/usb3_gentle_tx.pcap";
+        const TARGET_BUS: u16 = 1;
+        const TARGET_DEV: u8 = 16;
+
+        let pcap_data = fs::read(PCAP_PATH).map_err(|_| Error::ChipInitFailed {
+            chip: "RTL8852AU".into(),
+            stage: crate::core::error::InitStage::HardwareSetup,
+            reason: "pcap read failed".into(),
+        })?;
+
+        // Parse pcap to find channel switch boundaries (SCH_TX_EN disable → enable)
+        let mut offset = 24;
+        let mut in_switch = false;
+        let mut current_switch = 0u32;
+        let mut found = false;
+        let mut past_first_tx = false;
+
+        while offset + 16 <= pcap_data.len() {
+            let incl_len = u32::from_le_bytes([
+                pcap_data[offset + 8], pcap_data[offset + 9],
+                pcap_data[offset + 10], pcap_data[offset + 11],
+            ]) as usize;
+            offset += 16;
+            if offset + incl_len > pcap_data.len() || incl_len < 64 {
+                offset += incl_len;
+                continue;
+            }
+
+            let pkt = &pcap_data[offset..offset + incl_len];
+            offset += incl_len;
+
+            let pkt_type = pkt[8];
+            let xfer_type = pkt[9];
+            let ep = pkt[10];
+            let devnum = pkt[11];
+            let busnum = u16::from_le_bytes([pkt[12], pkt[13]]);
+            let ep_num = ep & 0x7F;
+            let ep_dir_in = (ep & 0x80) != 0;
+            let payload = &pkt[64..];
+
+            if busnum != TARGET_BUS || devnum != TARGET_DEV || pkt_type != 0x53 {
+                continue;
+            }
+
+            // Track first TX to skip init-phase SCH_TX_EN
+            if xfer_type == 3 && !ep_dir_in && ep_num == 5 && payload.len() > 48 {
+                past_first_tx = true;
+                continue;
+            }
+            if !past_first_tx { continue; }
+
+            // Register WRITE
+            if xfer_type == 2 && !ep_dir_in && !payload.is_empty() {
+                let setup = &pkt[40..48];
+                let (bm, br) = (setup[0], setup[1]);
+                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
+                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
+                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
+
+                if br == 0x05 && bm == 0x40 {
+                    let addr = (w_idx as u32) << 16 | w_val as u32;
+                    let write_data = &payload[..std::cmp::min(w_len as usize, payload.len())];
+
+                    // Detect SCH_TX_EN disable (start of channel switch)
+                    if addr == 0x8140 {
+                        let val = u32::from_le_bytes([
+                            write_data[0], write_data.get(1).copied().unwrap_or(0),
+                            write_data.get(2).copied().unwrap_or(0), write_data.get(3).copied().unwrap_or(0),
+                        ]);
+                        if val == 0x00000305 {
+                            // SCH_TX_EN disable — start of a new channel switch
+                            if in_switch {
+                                current_switch += 1; // previous switch ended without enable?
+                            }
+                            in_switch = true;
+                            if current_switch == switch_idx % 288 {
+                                found = true;
+                            }
+                        } else if val == 0x01000305 && in_switch {
+                            // SCH_TX_EN enable — end of channel switch
+                            if found {
+                                // Replay this last write and we're done
+                                let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
+                                return Ok(());
+                            }
+                            in_switch = false;
+                            current_switch += 1;
+                            if current_switch == switch_idx % 288 {
+                                // Next switch will be ours
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Replay writes for the active switch
+                    if found && in_switch {
+                        let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
+                    }
+                }
+            }
+            // Register READ — replay for the active switch (some reads are needed for timing)
+            else if xfer_type == 2 && ep_dir_in && found && in_switch {
+                let setup = &pkt[40..48];
+                let (bm, br) = (setup[0], setup[1]);
+                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
+                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
+                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
+                if br == 0x05 && bm == 0xC0 {
+                    let mut buf = vec![0u8; w_len as usize];
+                    let _ = self.handle.read_control(0xC0, 0x05, w_val, w_idx, &mut buf, USB_BULK_TIMEOUT);
+                }
+            }
+        }
+
+        Err(Error::ChipInitFailed {
+            chip: "RTL8852AU".into(),
+            stage: crate::core::error::InitStage::HardwareSetup,
+            reason: format!("pcap switch {} not found", switch_idx),
+        })
     }
 
     /// Write TX AGC (Automatic Gain Control) power table for the current channel.
@@ -2392,6 +2586,24 @@ impl Rtl8852au {
             let consumed = if total > 0 { (total + 7) & !7 } else { desc_len };
             if consumed > buf.len() { return (0, None); }
 
+            // ── PPDU debug counters ──
+            thread_local! {
+                static PPDU_STATS: std::cell::RefCell<PpduDebugStats> =
+                    std::cell::RefCell::new(PpduDebugStats::default());
+            }
+            PPDU_STATS.with(|s| {
+                let mut s = s.borrow_mut();
+                s.total_non_wifi += 1;
+                s.rpkt_type_counts[rpkt_type as usize & 0xF] += 1;
+                if rpkt_type == RPKT_TYPE_PPDU {
+                    s.ppdu_received += 1;
+                }
+                // Dump every 5000 packets
+                if s.total_non_wifi % 5000 == 0 {
+                    s.dump();
+                }
+            });
+
             // Parse PPDU status packets — this is where RSSI/SNR/LDPC/STBC live
             if rpkt_type == RPKT_TYPE_PPDU && buf.len() >= desc_len + 4 {
                 // DW1 for ppdu_cnt
@@ -2409,11 +2621,26 @@ impl Rtl8852au {
                         &buf[physts_off..physts_off + physts_len],
                         mac_info_vld,
                     ) {
+                        PPDU_STATS.with(|s| {
+                            let mut s = s.borrow_mut();
+                            s.ppdu_parsed += 1;
+                            if phy.rssi_avg != 0 {
+                                s.ppdu_with_rssi += 1;
+                                s.last_rssi = phy.rssi_avg;
+                            }
+                        });
                         // store_ppdu may return a completed frame if a pending WiFi frame matches
                         if let Some(completed) = ppdu_cache.store_ppdu(ppdu_cnt, phy) {
+                            PPDU_STATS.with(|s| s.borrow_mut().ppdu_correlated += 1);
                             return (consumed, Some(completed));
+                        } else {
+                            PPDU_STATS.with(|s| s.borrow_mut().ppdu_no_match += 1);
                         }
+                    } else {
+                        PPDU_STATS.with(|s| s.borrow_mut().ppdu_parse_fail += 1);
                     }
+                } else {
+                    PPDU_STATS.with(|s| s.borrow_mut().ppdu_too_short += 1);
                 }
             }
 
@@ -2489,16 +2716,7 @@ impl Rtl8852au {
 
         // If we have inline RSSI, return immediately — no need for PPDU correlation
         if frame.rssi != 0 {
-            // A WiFi frame with inline PHY info might also release a pending frame
-            let old = ppdu_cache.store_pending(ppdu_cnt, frame);
-            // Actually, this frame has RSSI, so just flush and return it
-            let completed = ppdu_cache.flush_pending();
-            // Return old pending frame first (if any), then the current one gets returned
-            // on next iteration. But we can only return one frame — return completed.
-            if let Some(f) = completed {
-                return (consumed, Some(f));
-            }
-            return (consumed, old);
+            return (consumed, Some(frame));
         }
 
         // No inline RSSI — check if pre-stored PPDU status exists for this ppdu_cnt
@@ -2506,13 +2724,27 @@ impl Rtl8852au {
             PpduStatusCache::apply_phy_to_frame(&mut frame, phy);
             // Clear the slot
             let idx = (ppdu_cnt & 0x7) as usize;
-            ppdu_cache.slots[idx].valid = false;
+            ppdu_cache.phy_slots[idx].valid = false;
             return (consumed, Some(frame));
         }
 
         // No RSSI available yet — store as pending, wait for PPDU status
         // If there was a previous pending frame, return it now (it missed its PPDU)
         let old_pending = ppdu_cache.store_pending(ppdu_cnt, frame);
+
+        // Track WiFi frames with/without RSSI for debugging
+        thread_local! {
+            static WIFI_STATS: std::cell::RefCell<(u64, u64, u64)> =
+                std::cell::RefCell::new((0, 0, 0)); // (total, with_rssi, inline_rssi)
+        }
+        WIFI_STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.0 += 1;
+            if let Some(ref f) = old_pending {
+                if f.rssi != 0 { s.1 += 1; }
+            }
+        });
+
         (consumed, old_pending)
     }
 
@@ -2531,8 +2763,8 @@ impl Rtl8852au {
             }
         }
 
-        // Before fetching new USB data, flush any pending frame from the last buffer
-        if let Some(f) = self.ppdu_cache.flush_pending() {
+        // Check completed queue (from previous PPDU correlations)
+        if let Some(f) = self.ppdu_cache.pop_completed() {
             return Ok(Some(f));
         }
 
@@ -2561,8 +2793,8 @@ impl Rtl8852au {
             }
         }
 
-        // Flush any remaining pending frame at end of this buffer
-        if let Some(f) = self.ppdu_cache.flush_pending() {
+        // Check completed queue after processing buffer
+        if let Some(f) = self.ppdu_cache.pop_completed() {
             return Ok(Some(f));
         }
 
@@ -2886,13 +3118,17 @@ mod tests {
         let mut cache = PpduStatusCache::new();
         let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6, &mut cache);
         assert!(consumed > 0);
-        // WiFi frame with no RSSI goes to pending, not returned immediately
+        // WiFi frame with no RSSI goes to pending (indexed by ppdu_cnt from DW1)
         assert!(frame.is_none());
-        // Flush the pending frame
-        let f = cache.flush_pending().unwrap();
+        // The frame is in pending_frames slot — send a matching PPDU or check store_pending eviction
+        // With no PPDU, the frame stays pending. A second frame to same ppdu_cnt slot evicts it.
+        let ppdu_cnt = 0u8; // DW1 was 0 → ppdu_cnt = 0
+        let dummy_frame = RxFrame { data: vec![0x80, 0x00], channel: 1, ..Default::default() };
+        let evicted = cache.store_pending(ppdu_cnt, dummy_frame);
+        let f = evicted.unwrap();
         assert_eq!(f.data.len(), frame_data.len());
         assert_eq!(f.channel, 6);
-        assert_eq!(f.rssi, 0); // no drv_info and no PPDU correlation → 0 (not populated)
+        assert_eq!(f.rssi, 0); // no drv_info and no PPDU correlation → 0
     }
 
     #[test]

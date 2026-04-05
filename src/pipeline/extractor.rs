@@ -311,18 +311,21 @@ fn process_beacon(pf: &ParsedFrame, channel: u8, store: &FrameStore) {
 
         if let Some(ap) = aps.get_mut(&bssid) {
             // ── Update existing AP ──
-            ap.rssi = pf.rssi;
-            if pf.rssi > ap.rssi_best {
-                ap.rssi_best = pf.rssi;
+            // Only update RSSI when the frame has a valid value. RSSI=0 means
+            // PPDU correlation failed (RTL8852AU) — don't overwrite a good reading.
+            if pf.rssi != 0 {
+                ap.rssi = pf.rssi;
+                if pf.rssi > ap.rssi_best {
+                    ap.rssi_best = pf.rssi;
+                }
+                if pf.rssi < ap.rssi_worst && pf.rssi < -1 {
+                    ap.rssi_worst = pf.rssi;
+                }
+                if ap.rssi_samples.len() >= crate::store::MAX_RSSI_SAMPLES {
+                    ap.rssi_samples.pop_front();
+                }
+                ap.rssi_samples.push_back((start_time_elapsed, pf.rssi));
             }
-            if pf.rssi < ap.rssi_worst {
-                ap.rssi_worst = pf.rssi;
-            }
-            // RSSI history for sparkline rendering
-            if ap.rssi_samples.len() >= crate::store::MAX_RSSI_SAMPLES {
-                ap.rssi_samples.pop_front();
-            }
-            ap.rssi_samples.push_back((start_time_elapsed, pf.rssi));
             ap.beacon_count += 1;
             ap.last_seen = now;
             ap.channel = ap_channel;
@@ -610,7 +613,9 @@ fn process_probe_req(pf: &ParsedFrame, channel: u8, store: &FrameStore) {
                 .entry(sta_mac)
                 .or_insert_with(|| Station::new(sta_mac, now));
             sta.frame_count += 1;
-            sta.rssi = pf.rssi;
+            if pf.rssi != 0 {
+                sta.rssi = pf.rssi;
+            }
             sta.last_seen = now;
             sta.last_channel = channel;
             sta.probe_ssid_count += 1;
@@ -680,9 +685,11 @@ fn process_data(pf: &ParsedFrame, channel: u8, store: &FrameStore) {
         sta.bssid = Some(bssid_mac);
         sta.is_associated = true;
         sta.frame_count += 1;
-        sta.rssi = pf.rssi;
-        if pf.rssi > sta.rssi_best {
-            sta.rssi_best = pf.rssi;
+        if pf.rssi != 0 {
+            sta.rssi = pf.rssi;
+            if pf.rssi > sta.rssi_best {
+                sta.rssi_best = pf.rssi;
+            }
         }
         sta.last_channel = channel;
         sta.last_seen = now;
