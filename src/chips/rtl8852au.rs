@@ -2403,10 +2403,15 @@ impl Rtl8852au {
 
         buf[WD_BODY_LEN + FWCMD_HDR_LEN..].copy_from_slice(payload);
 
+        eprintln!("  [H2C] cat={} class={} func={} seq={} payload_len={} total_len={}",
+            cat, class, func, seq, payload.len(), buf.len());
+
         match self.handle.write_bulk(self.ep_fw, &buf, Duration::from_secs(2)) {
             Ok(n) => {
+                eprintln!("  [H2C]   → OK ({} bytes)", n);
             }
             Err(e) => {
+                eprintln!("  [H2C]   → FAIL: {}", e);
                 let _ = self.handle.clear_halt(self.ep_fw);
                 return Err(Error::FirmwareError {
                     chip: "RTL8852AU".into(),
@@ -2562,19 +2567,99 @@ impl Rtl8852au {
     /// This is what was missing — without it, firmware accepts USB TX but never
     /// pushes frames to the radio PHY.
     pub fn setup_firmware_role(&mut self) -> Result<()> {
-        // ── NO MAC writes — let firmware/pcap-replay control the MAC ──
-        // The pcap replay sends FWROLE_MAINTAIN + ADDR_CAM with the captured
-        // machine's MAC. We use whatever the firmware reports.
+        // ── Pre-state dump ──
+        let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
+        let ctn_txen = self.read16(0xC348).unwrap_or(0);
+        let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL).unwrap_or(0);
+        eprintln!("  [TX diag] BEFORE: SYS_CFG5=0x{:08X} (TXDMA_EN={} ALLOW={}) CTN_TXEN=0x{:04X} FW_CTRL=0x{:02X} (H2C_RDY={})",
+            sys_cfg5, sys_cfg5 & 1, (sys_cfg5 >> 1) & 1, ctn_txen, fw_ctrl, (fw_ctrl >> 1) & 1);
 
-        // ── Enable the TX scheduler ──
-        // Method 1: H2CREG (firmware-coordinated) — requires correct MASK in DATA1
-        self.send_sch_tx_en(0xFFFF)?;
+        // ── Step 1: FWROLE_MAINTAIN(CREATE, MONITOR) ──
+        eprintln!("  [TX diag] Sending FWROLE_MAINTAIN(CREATE, MONITOR)...");
+        match self.send_fwrole_maintain(0, 7, 0) {
+            Ok(()) => eprintln!("  [TX diag]   OK"),
+            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
+        }
+
+        // ── Step 2: ADDR_CAM — register our MAC with firmware ──
+        let mac = self.mac_addr.0;
+        eprintln!("  [TX diag] Sending ADDR_CAM(MAC={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X})...",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        match self.send_addr_cam(&mac) {
+            Ok(()) => eprintln!("  [TX diag]   OK"),
+            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
+        }
+
+        // ── Step 3: FWROLE_MAINTAIN(CHANGE) ──
+        eprintln!("  [TX diag] Sending FWROLE_MAINTAIN(CHANGE)...");
+        match self.send_fwrole_maintain(0, 7, 1) {
+            Ok(()) => eprintln!("  [TX diag]   OK"),
+            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
+        }
+
+        // ── Step 4: Enable the TX scheduler ──
+        eprintln!("  [TX diag] Sending SCH_TX_EN(0xFFFF)...");
+        match self.send_sch_tx_en(0xFFFF) {
+            Ok(()) => eprintln!("  [TX diag]   OK"),
+            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
+        }
 
         // Method 2: Direct register write to R_AX_CTN_TXEN (0xC348) — fallback
-        // The reference driver uses this when firmware isn't ready (cmac_tx.c:604).
-        // Belt and suspenders: write it directly too in case H2CREG path fails.
         const R_AX_CTN_TXEN: u16 = 0xC348;
         self.write16(R_AX_CTN_TXEN, 0xFFFF)?;
+
+        // ── Step 5: Enable TX DMA ──
+        // In the Linux driver (rtw89), rtw89_mac_enable_txdma() does a direct register
+        // write to R_AX_SYS_CFG5. The firmware does NOT set this — the host must.
+        // Without this, USB bulk writes to EP5 go into a DMA buffer that's never processed.
+        let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
+        eprintln!("  [TX diag] SYS_CFG5 before TXDMA enable: 0x{:08X}", sys_cfg5);
+        // Set bit 0 (FW_CTRL_HCI_TXDMA_EN) + bit 1 (HCI_TXDMA_ALLOW)
+        self.write32(0x0170, sys_cfg5 | 0x03)?;
+        let sys_cfg5_after = self.read32(0x0170).unwrap_or(0);
+        eprintln!("  [TX diag] SYS_CFG5 after TXDMA enable: 0x{:08X} (EN={} ALLOW={})",
+            sys_cfg5_after, sys_cfg5_after & 1, (sys_cfg5_after >> 1) & 1);
+
+        // ── Firmware debug dump — what is the FW telling us? ──
+        let udm0 = self.read32(0x01F0).unwrap_or(0); // FW debug msg 0
+        let udm1 = self.read32(0x01F4).unwrap_or(0); // FW debug msg 1
+        let udm2 = self.read32(0x01F8).unwrap_or(0); // FW debug msg 2
+        let udm3 = self.read32(0x01FC).unwrap_or(0); // FW debug msg 3
+        eprintln!("  [FW DEBUG] UDM0=0x{:08X} UDM1=0x{:08X} UDM2=0x{:08X} UDM3=0x{:08X}", udm0, udm1, udm2, udm3);
+
+        // Error interrupt status registers
+        let dmac_err = self.read32(0x8524).unwrap_or(0); // DMAC_ERR_ISR
+        let cmac_err = self.read32(0xC164).unwrap_or(0); // CMAC_ERR_ISR
+        let ser_dbg = self.read32(0x8424).unwrap_or(0);  // SER_DBG_INFO
+        let boot_dbg = self.read32(0x83F0).unwrap_or(0); // BOOT_DBG
+        eprintln!("  [FW ERROR] DMAC_ERR=0x{:08X} CMAC_ERR=0x{:08X} SER_DBG=0x{:08X} BOOT_DBG=0x{:08X}",
+            dmac_err, cmac_err, ser_dbg, boot_dbg);
+
+        // TX-specific error/debug
+        let txdma_dbg = self.read32(0xC840).unwrap_or(0);   // TXDMA_DBG
+        let mpdu_tx_err = self.read32(0x9BF0).unwrap_or(0); // MPDU_TX_ERR_ISR
+        let sch_err = self.read32(0xC3EC).unwrap_or(0);     // SCHEDULE_ERR_ISR
+        let pktin_err = self.read32(0x9A24).unwrap_or(0);   // PKTIN_ERR_ISR
+        let cpuio_err = self.read32(0x9844).unwrap_or(0);   // CPUIO_ERR_ISR
+        let host_disp_err = self.read32(0x8808).unwrap_or(0); // HOST_DISPATCHER_ERR_ISR
+        let cpu_disp_err = self.read32(0x880C).unwrap_or(0);  // CPU_DISPATCHER_ERR_ISR
+        let wde_err = self.read32(0x8C3C).unwrap_or(0);     // WDE_ERR_ISR
+        let sta_sch_err = self.read32(0x9EF4).unwrap_or(0); // STA_SCHEDULER_ERR_ISR
+        eprintln!("  [TX DEBUG] TXDMA=0x{:08X} MPDU_TX_ERR=0x{:08X} SCH_ERR=0x{:08X} PKTIN_ERR=0x{:08X}",
+            txdma_dbg, mpdu_tx_err, sch_err, pktin_err);
+        eprintln!("  [TX DEBUG] CPUIO_ERR=0x{:08X} HOST_DISP=0x{:08X} CPU_DISP=0x{:08X} WDE_ERR=0x{:08X} STA_SCH=0x{:08X}",
+            cpuio_err, host_disp_err, cpu_disp_err, wde_err, sta_sch_err);
+
+        // DLE/dispatcher status
+        let dle0 = self.read32(0x8430).unwrap_or(0);
+        let dle1 = self.read32(0x8434).unwrap_or(0);
+        let disp_dbg = self.read32(0x8860).unwrap_or(0); // DISPATCHER_DBG_PORT
+        eprintln!("  [TX DEBUG] DLE0=0x{:08X} DLE1=0x{:08X} DISP_DBG=0x{:08X}", dle0, dle1, disp_dbg);
+
+        // Post-state
+        let ctn_txen = self.read16(0xC348).unwrap_or(0);
+        let txcnt = self.read32(0xC62C).unwrap_or(0);
+        eprintln!("  [TX diag] AFTER: CTN_TXEN=0x{:04X} TXCNT=0x{:08X}", ctn_txen, txcnt);
 
         Ok(())
     }
@@ -2784,10 +2869,7 @@ impl Rtl8852au {
     /// Includes BB/PHY, AGC, PPDU status, TX power, SCH_TX_EN — everything.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
         match self.pcap_channel_switch(ch) {
-            Ok(()) => {
-                self.channel.store(ch, Ordering::Relaxed);
-                Ok(())
-            }
+            Ok(()) => {}
             Err(_) => {
                 // Fallback to programmatic for channels not in pcap (e.g., ch14)
                 let _ = self.send_sch_tx_en(0x0000);
@@ -2796,9 +2878,23 @@ impl Rtl8852au {
                 self.write_txagc_power_table(ch)?;
                 let _ = self.send_sch_tx_en(0xFFFF);
                 let _ = self.write16(0xC348, 0xFFFF);
-                Ok(())
             }
         }
+
+        // ── Re-enable TX after channel switch ──
+        // The pcap channel switch ends with SCH_TX_EN=0 (all TX disabled).
+        // Linux driver re-enables after switch returns. We must do the same.
+        let _ = self.send_sch_tx_en(0xFFFF);
+        let _ = self.write16(0xC348, 0xFFFF); // CTN_TXEN
+
+        // Ensure TX DMA stays enabled
+        let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
+        if sys_cfg5 & 0x03 != 0x03 {
+            self.write32(0x0170, sys_cfg5 | 0x03)?;
+        }
+
+        self.channel.store(ch, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Write TX AGC (Automatic Gain Control) power table for the current channel.
@@ -3270,29 +3366,48 @@ impl Rtl8852au {
         });
 
         // ── Replay pcap init ──
-        let (reg_writes, reg_reads, ep7_sent, ep5_sent) = self.replay_pcap_init()?;
-        // Pcap replay stats available from replay_pcap_init() return value
+        let (reg_writes, reg_reads, ep7_sent, ep5_sent, pcap_h2c_seq) = self.replay_pcap_init()?;
+        self.h2c_seq = pcap_h2c_seq; // continue from where pcap replay left off
 
         // ── Stop background drain ──
         drain_running.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = drain_thread.join();
 
         // ── Post-replay: ensure monitor mode + TX scheduler ──
-        // The pcap replay sets these, but re-applying is idempotent and
-        // guarantees correct state regardless of pcap scanning position.
         self.write32(R_AX_RX_FLTR_OPT, 0x031644BFu32)?; // promiscuous monitor
-        self.setup_firmware_role()?; // SCH_TX_EN(0xFFFF) + CTN_TXEN(0xFFFF)
 
-        // ── Read MAC from EFUSE autoload registers ──
+        // ── Clear EP5 halt — might be stale from pcap replay stopping at first TX ──
+        let _ = self.handle.clear_halt(self.ep_out);
+
+        // ── Read MAC BEFORE firmware role setup ──
+        // setup_firmware_role() sends ADDR_CAM with self.mac_addr — must read it first
         self.read_mac_address()?;
         self.channel.store(149, Ordering::Relaxed); // pcap was on ch149
+
+        // ── TX enable — pcap H2C already sent FWROLE + ADDR_CAM + ASSOC_CMAC ──
+        // Don't send our own — they might conflict with the pcap's working setup.
+        // Just ensure SCH_TX_EN and TXDMA are enabled.
+        self.send_sch_tx_en(0xFFFF)?;
+        self.write16(0xC348, 0xFFFF)?; // CTN_TXEN
+        let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
+        if sys_cfg5 & 0x03 != 0x03 {
+            self.write32(0x0170, sys_cfg5 | 0x03)?;
+        }
+
+        // Debug dump
+        let udm0 = self.read32(0x01F0).unwrap_or(0);
+        let dmac_err = self.read32(0x8524).unwrap_or(0);
+        let cmac_err = self.read32(0xC164).unwrap_or(0);
+        let host_disp = self.read32(0x8808).unwrap_or(0);
+        eprintln!("  [FW state] UDM0=0x{:08X} DMAC_ERR=0x{:08X} CMAC_ERR=0x{:08X} HOST_DISP=0x{:08X}",
+            udm0, dmac_err, cmac_err, host_disp);
 
         Ok(())
     }
 
     /// Replay the complete init sequence from the working pcap capture.
-    /// Returns (reg_writes, reg_reads, ep7_sent, ep5_sent).
-    fn replay_pcap_init(&self) -> Result<(u32, u32, u32, u32)> {
+    /// Returns (reg_writes, reg_reads, ep7_sent, ep5_sent, h2c_seq).
+    fn replay_pcap_init(&self) -> Result<(u32, u32, u32, u32, u16)> {
         const PCAP_PATH: &str = "references/captures/rtl8852au_tx_20260404/usb3_gentle_tx.pcap";
         const TARGET_BUS: u8 = 1;
         const TARGET_DEV: u8 = 16;
@@ -3308,6 +3423,7 @@ impl Rtl8852au {
         let mut reg_reads = 0u32;
         let mut ep7_sent = 0u32;
         let mut ep7_fail = 0u32;
+        let mut ep7_seq = 0u16; // fresh seq counter for patched H2C commands
         let mut ep5_sent = 0u32;
 
         while offset + 16 <= pcap_data.len() {
@@ -3395,6 +3511,46 @@ impl Rtl8852au {
             }
             // ── EP7 bulk OUT (firmware + H2C) ──
             else if xfer_type == 3 && !ep_dir_in && ep_num == 7 && !payload.is_empty() {
+                // Check if this is FWDL (DW0 has FWDL_EN = bit 20)
+                // FWDL DW0 = 0x001C0000 (CH_DMA=12<<16, FWDL_EN=1<<20)
+                // Post-FWDL H2C DW0 = 0x000C0000 (CH_DMA=12<<16, no FWDL_EN)
+                let is_fwdl = if payload.len() >= 4 {
+                    let dw0 = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    dw0 & AX_TXD_FWDL_EN != 0 // bit 20
+                } else {
+                    false
+                };
+
+                if !is_fwdl {
+                    // Post-FWDL H2C: replay VERBATIM (no seq patch).
+                    // Fresh firmware boot expects seq from 0, which matches the pcap.
+                    if payload.len() > 27 {
+                        let h2c_dw0 = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
+                        let cat = h2c_dw0 & 0x3;
+                        let class = (h2c_dw0 >> 2) & 0x3F;
+                        let func = (h2c_dw0 >> 8) & 0xFF;
+                        let seq = (h2c_dw0 >> 24) & 0xFF;
+                        eprintln!("  [pcap H2C #{}] cat={} class={} func={} seq={} len={} (verbatim)",
+                            ep7_sent, cat, class, func, seq, payload.len());
+                    }
+
+                    match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
+                        Ok(n) => {
+                            ep7_sent += 1;
+                            if payload.len() > 27 {
+                                eprintln!("    → OK ({} bytes)", n);
+                            }
+                        }
+                        Err(e) => {
+                            ep7_fail += 1;
+                            eprintln!("    → FAIL: {}", e);
+                            let _ = self.handle.clear_halt(self.ep_fw);
+                        }
+                    }
+                    continue;
+                }
+
+                // FWDL chunk — replay verbatim
                 let result = match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
                     Ok(_) => Ok(()),
                     Err(_) => {
@@ -3425,7 +3581,7 @@ impl Rtl8852au {
             // EP7 had failures — may cause H2C processing issues
         }
 
-        Ok((reg_writes, reg_reads, ep7_sent, ep5_sent))
+        Ok((reg_writes, reg_reads, ep7_sent, ep5_sent, ep7_seq))
     }
 
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
@@ -3606,10 +3762,35 @@ impl Rtl8852au {
 
         buf[TX_WD_TOTAL_LEN..].copy_from_slice(frame);
 
+        // Debug: read TX DMA state before and after EP5 write
+        static TX_DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let tx_dbg = TX_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if tx_dbg < 3 {
+            let sys5 = self.read32(0x0170).unwrap_or(0);
+            let txcnt_before = self.read32(0xC62C).unwrap_or(0);
+            let dle0 = self.read32(0x8430).unwrap_or(0);
+            let hfc = self.read32(0x8A00).unwrap_or(0);
+            eprintln!("  [EP5 TX #{}] BEFORE: SYS_CFG5=0x{:08X} TXCNT=0x{:08X} DLE0=0x{:08X} HFC=0x{:08X} ep=0x{:02X} len={}",
+                tx_dbg, sys5, txcnt_before, dle0, hfc, self.ep_out, buf.len());
+            eprintln!("  [EP5 TX #{}] WD DW0={:08X} DW2={:08X} DW3={:08X} | INFO DW0={:08X} DW1={:08X}",
+                tx_dbg,
+                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+                u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+                u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+                u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]));
+        }
+
         // Send via USB bulk OUT EP5
         for retry in 0..opts.retries.max(1) {
             match self.handle.write_bulk(self.ep_out, &buf, USB_BULK_TIMEOUT) {
-                Ok(_) => return Ok(()),
+                Ok(n) => {
+                    if tx_dbg < 3 {
+                        let txcnt_after = self.read32(0xC62C).unwrap_or(0);
+                        eprintln!("  [EP5 TX #{}] AFTER: wrote {} bytes, TXCNT=0x{:08X}", tx_dbg, n, txcnt_after);
+                    }
+                    return Ok(());
+                }
                 Err(e) if retry < opts.retries.saturating_sub(1) => {
                     thread::sleep(Duration::from_millis(1));
                     continue;
@@ -3697,8 +3878,10 @@ impl ChipDriver for Rtl8852au {
         self.mac_addr
     }
 
-    fn set_mac(&mut self, _mac: MacAddress) -> Result<()> {
-        // TEMP: complete no-op to match test_8852au behavior (no set_mac call)
+    fn set_mac(&mut self, mac: MacAddress) -> Result<()> {
+        self.mac_addr = mac;
+        // Update ADDR_CAM so firmware knows our new MAC for TX
+        self.send_addr_cam(&mac.0)?;
         Ok(())
     }
 
@@ -3971,8 +4154,15 @@ fn start_rx_pipeline_8852au(
                                 gate.submit(frame);
                             }
                             crate::core::chip::ParsedPacket::DriverMessage(_) => {}
-                            crate::core::chip::ParsedPacket::TxStatus(_) => {}
-                            crate::core::chip::ParsedPacket::C2hEvent(_) => {}
+                            crate::core::chip::ParsedPacket::TxStatus(ref rpt) => {
+                                eprintln!("  [FW] TX_RPT: pkt_id={} q={} state={} cnt={} acked={} rate=0x{:03X} bw={} airtime={}us",
+                                    rpt.pkt_id, rpt.queue_sel, rpt.tx_state, rpt.tx_cnt,
+                                    rpt.acked, rpt.final_rate, rpt.final_bw, rpt.total_airtime_us);
+                            }
+                            crate::core::chip::ParsedPacket::C2hEvent(ref evt) => {
+                                eprintln!("  [FW] C2H: cat={} class={} func={} seq={} payload_len={}",
+                                    evt.category, evt.class, evt.function, evt.seq, evt.payload.len());
+                            }
                             crate::core::chip::ParsedPacket::ChannelInfo(_) => {}
                             crate::core::chip::ParsedPacket::DfsReport(_) => {}
                             crate::core::chip::ParsedPacket::BbScope(_) => {}
