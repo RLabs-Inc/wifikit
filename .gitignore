@@ -9,10 +9,13 @@
 
 # Capture/test files
 *.kismet
-*.csv
 *.pcap
 *.hccapx
 *.hc22000
+
+# CSVs (except OUI databases needed for build)
+*.csv
+!docs/*.csv
 
 # Third-party references (854M of vendor driver source)
 references/

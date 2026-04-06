@@ -11,7 +11,12 @@ use std::path::Path;
 fn main() {
     let csv_path = Path::new("docs/oui.csv");
     if !csv_path.exists() {
-        // No CSV, skip generation — will use fallback empty table
+        // No CSV — generate empty table so include!() doesn't fail
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let out_path = Path::new(&out_dir).join("oui_db.rs");
+        let mut out = fs::File::create(&out_path).expect("failed to create oui_db.rs");
+        writeln!(out, "// No OUI CSV found — empty fallback table").unwrap();
+        writeln!(out, "static OUI_DB: &[([u8; 3], &str)] = &[];").unwrap();
         return;
     }
 
