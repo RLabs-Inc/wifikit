@@ -71,7 +71,8 @@ struct SharedAdapterInner {
     /// Whether the RX thread should keep running.
     /// Set to false by stop_rx() → thread exits. Set to true by start_rx() → new thread.
     /// Also set to false by shutdown() (permanent death).
-    alive: AtomicBool,
+    /// Arc so drivers with their own RX pipeline can share this flag.
+    alive: Arc<AtomicBool>,
     /// Whether the adapter has been permanently shut down (USB closed).
     /// Unlike `alive` (which toggles for stop_rx/start_rx), this is one-way.
     shut_down: AtomicBool,
@@ -81,8 +82,10 @@ struct SharedAdapterInner {
     lock_holder: Mutex<Option<String>>,
     /// Static adapter info (chip, VID/PID, name) — no lock needed.
     pub info: AdapterInfo,
-    /// MAC address at init time.
+    /// MAC address at init time (randomized by Adapter::init).
     pub mac: MacAddress,
+    /// Hardware MAC from the driver (EFUSE/chip-level, not randomized).
+    pub driver_mac: MacAddress,
 }
 
 impl SharedAdapter {
@@ -114,17 +117,16 @@ impl SharedAdapter {
         on_status("Initializing chip (power on, firmware, PHY)...");
         adapter.init()?;
         let mac = adapter.mac();
-        on_status(&format!("Chip initialized. MAC={}", mac));
+        let driver_mac = adapter.driver.mac();
+        on_status(&format!("Chip initialized. MAC={} (driver={})", mac, driver_mac));
 
         // 3. Enter monitor mode
         on_status("Setting monitor mode...");
         adapter.set_monitor_mode()?;
         on_status("Monitor mode active.");
 
-        // 4. Extract RX handle for the dedicated RX thread
-        let rx_handle = adapter.driver.take_rx_handle();
-
-        // 5. Build the SharedAdapter
+        // 4. Build the SharedAdapter (need alive flag before starting RX)
+        let alive = Arc::new(AtomicBool::new(true));
         let shared = Self {
             inner: Arc::new(SharedAdapterInner {
                 adapter: Mutex::new(adapter),
@@ -132,24 +134,41 @@ impl SharedAdapter {
                 current_channel: AtomicU8::new(0),
                 current_band: AtomicU8::new(0),
                 locked_channel: AtomicU8::new(NO_CHANNEL_LOCK),
-                alive: AtomicBool::new(true),
+                alive: alive.clone(),
                 shut_down: AtomicBool::new(false),
                 rx_thread: Mutex::new(None),
                 lock_holder: Mutex::new(None),
                 info: info.clone(),
                 mac,
+                driver_mac,
             }),
         };
 
-        // 6. Start the RX thread if the driver supports split RX
-        if let Some(rx_handle) = rx_handle {
-            on_status("Starting RX thread (FrameGate)...");
-            let inner_clone = Arc::clone(&shared.inner);
-            let handle = start_rx_thread(rx_handle, gate, inner_clone);
-            *shared.inner.rx_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-            on_status("RX thread active.");
+        // 5. Start RX — driver-managed pipeline first, fall back to shared RX thread
+        let driver_manages_rx = {
+            let mut adapter = shared.inner.adapter.lock()
+                .unwrap_or_else(|e| e.into_inner());
+            adapter.driver.start_rx_pipeline(gate.clone(), alive)
+        };
+
+        if driver_manages_rx {
+            on_status("RX pipeline active (driver-managed).");
         } else {
-            on_status("RX thread not available (driver doesn't support split RX).");
+            // Fall back to shared RX thread via take_rx_handle
+            let rx_handle = {
+                let mut adapter = shared.inner.adapter.lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                adapter.driver.take_rx_handle()
+            };
+            if let Some(rx_handle) = rx_handle {
+                on_status("Starting RX thread (FrameGate)...");
+                let inner_clone = Arc::clone(&shared.inner);
+                let handle = start_rx_thread(rx_handle, gate, inner_clone);
+                *shared.inner.rx_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                on_status("RX thread active.");
+            } else {
+                on_status("RX thread not available (driver doesn't support split RX).");
+            }
         }
 
         Ok(shared)
@@ -318,9 +337,14 @@ impl SharedAdapter {
         })
     }
 
-    /// Get the adapter's MAC address.
+    /// Get the adapter's MAC address (randomized).
     pub fn mac(&self) -> MacAddress {
         self.inner.mac
+    }
+
+    /// Get the driver's hardware MAC (EFUSE/chip-level).
+    pub fn driver_mac(&self) -> MacAddress {
+        self.inner.driver_mac
     }
 
     /// Get static adapter info.
@@ -507,88 +531,28 @@ fn start_rx_thread(
         .spawn(move || {
             let mut buf = vec![0u8; rx_handle.rx_buf_size];
 
-            // Debug logging to /tmp/wifikit_rx.log
-            use std::io::Write;
-            let mut log_file = std::fs::File::create("/tmp/wifikit_rx.log")
-                .ok()
-                .map(|f| std::io::BufWriter::new(f));
-            let mut usb_reads = 0u64;
-            let mut usb_bytes = 0u64;
-            let mut usb_timeouts = 0u64;
-            let mut frames_extracted = 0u64;
-            let mut frames_submitted = 0u64;
-            let log_start = std::time::Instant::now();
-
-            // Timing instrumentation — where does time go?
-            let mut time_in_usb_read = std::time::Duration::ZERO;
-            let mut time_in_parse = std::time::Duration::ZERO;
-            let mut time_in_submit = std::time::Duration::ZERO;
-            let mut last_timing_report = std::time::Instant::now();
-
-            if let Some(ref mut log) = log_file {
-                let _ = writeln!(log, "rx-usb thread started. ep_in={:#04x} buf_size={}",
-                    rx_handle.ep_in, rx_handle.rx_buf_size);
-                let _ = log.flush();
-            }
-
             loop {
                 if !inner.alive.load(Ordering::SeqCst) {
                     break;
                 }
 
                 // Read USB bulk IN — this is the ONLY blocking point
-                let t_usb = std::time::Instant::now();
                 let actual = match rx_handle.device.read_bulk(
                     rx_handle.ep_in,
                     &mut buf,
                     RX_POLL_TIMEOUT,
                 ) {
-                    Ok(n) => {
-                        time_in_usb_read += t_usb.elapsed();
-                        n
-                    }
-                    Err(rusb::Error::Timeout) => {
-                        time_in_usb_read += t_usb.elapsed();
-                        usb_timeouts += 1;
-                        continue;
-                    }
-                    Err(rusb::Error::Interrupted) => {
-                        time_in_usb_read += t_usb.elapsed();
-                        continue;
-                    }
-                    Err(rusb::Error::Overflow) => {
-                        time_in_usb_read += t_usb.elapsed();
-                        continue;
-                    }
-                    Err(e) => {
-                        if let Some(ref mut log) = log_file {
-                            let _ = writeln!(log, "[{:.3}s] FATAL USB error: {:?}",
-                                log_start.elapsed().as_secs_f64(), e);
-                            let _ = log.flush();
-                        }
-                        break;
-                    }
+                    Ok(n) => n,
+                    Err(rusb::Error::Timeout
+                        | rusb::Error::Interrupted
+                        | rusb::Error::Overflow) => continue,
+                    Err(_) => break,
                 };
 
                 if actual == 0 {
                     continue;
                 }
 
-                usb_reads += 1;
-                usb_bytes += actual as u64;
-
-                // Log first few reads and then every 1000th
-                if let Some(ref mut log) = log_file {
-                    if usb_reads <= 5 || usb_reads % 1000 == 0 {
-                        let _ = writeln!(log, "[{:.3}s] USB read #{}: {} bytes, ch={}",
-                            log_start.elapsed().as_secs_f64(),
-                            usb_reads, actual,
-                            inner.current_channel.load(Ordering::Relaxed));
-                        let _ = log.flush();
-                    }
-                }
-
-                // Get current channel for frame tagging
                 let channel = inner.current_channel.load(Ordering::Relaxed);
 
                 // Parse all frames from the USB bulk transfer
@@ -596,10 +560,7 @@ fn start_rx_thread(
                 let mut pos = 0;
                 while pos < actual {
                     let remaining = &buf[pos..actual];
-
-                    let t_parse = std::time::Instant::now();
                     let (consumed, packet) = (rx_handle.parse_fn)(remaining, channel);
-                    time_in_parse += t_parse.elapsed();
 
                     if consumed == 0 {
                         pos += 4;
@@ -607,40 +568,17 @@ fn start_rx_thread(
                     }
 
                     pos += consumed;
-                    frames_extracted += 1;
 
                     match packet {
                         crate::core::chip::ParsedPacket::Frame(frame) => {
-                            // Log first few frames
-                            if frames_submitted < 10 {
-                                if let Some(ref mut log) = log_file {
-                                    let fc = if frame.data.len() >= 2 {
-                                        format!("fc={:#06x}", u16::from_le_bytes([frame.data[0], frame.data[1]]))
-                                    } else {
-                                        "fc=??".to_string()
-                                    };
-                                    let _ = writeln!(log, "  frame #{}: {} bytes, rssi={}, ch={}, {}",
-                                        frames_submitted, frame.data.len(), frame.rssi, frame.channel, fc);
-                                }
-                            }
-
-                            // Submit to FrameGate — gate handles parsing, pcap, distribution
-                            let t_submit = std::time::Instant::now();
                             gate.submit(frame);
-                            time_in_submit += t_submit.elapsed();
-
-                            frames_submitted += 1;
                         }
                         crate::core::chip::ParsedPacket::DriverMessage(msg) => {
-                            // MCU responses go directly to driver — no parsing needed
                             if let Some(ref tx) = rx_handle.driver_msg_tx {
                                 let _ = tx.send(msg);
                             }
                         }
                         crate::core::chip::ParsedPacket::TxStatus(txs) => {
-                            // TX status report — ACK feedback for injected frames.
-                            // Route through driver message channel for now; the driver
-                            // can distinguish TXS from MCU responses by pkt_type in DW0.
                             if let Some(ref tx) = rx_handle.driver_msg_tx {
                                 let _ = tx.send(txs);
                             }
@@ -648,47 +586,6 @@ fn start_rx_thread(
                         crate::core::chip::ParsedPacket::Skip => {}
                     }
                 }
-
-                // Timing report every 5 seconds
-                if last_timing_report.elapsed() >= std::time::Duration::from_secs(5) {
-                    if let Some(ref mut log) = log_file {
-                        let wall = last_timing_report.elapsed().as_secs_f64();
-                        let usb_pct = time_in_usb_read.as_secs_f64() / wall * 100.0;
-                        let parse_pct = time_in_parse.as_secs_f64() / wall * 100.0;
-                        let submit_pct = time_in_submit.as_secs_f64() / wall * 100.0;
-                        let other_pct = 100.0 - usb_pct - parse_pct - submit_pct;
-                        let reads_per_sec = usb_reads as f64 / log_start.elapsed().as_secs_f64();
-                        let frames_per_sec = frames_submitted as f64 / log_start.elapsed().as_secs_f64();
-                        let timeout_pct = if usb_reads + usb_timeouts > 0 {
-                            usb_timeouts as f64 / (usb_reads + usb_timeouts) as f64 * 100.0
-                        } else { 0.0 };
-                        let _ = writeln!(log, "\n═══ TIMING REPORT ({:.1}s wall) ═══", wall);
-                        let _ = writeln!(log, "  USB read:  {:>6.1}% ({:.3}s)  — {} reads, {} timeouts ({:.1}% timeout)",
-                            usb_pct, time_in_usb_read.as_secs_f64(), usb_reads, usb_timeouts, timeout_pct);
-                        let _ = writeln!(log, "  parse_fn:  {:>6.1}% ({:.3}s)  — {} frames extracted",
-                            parse_pct, time_in_parse.as_secs_f64(), frames_extracted);
-                        let _ = writeln!(log, "  gate sub:  {:>6.1}% ({:.3}s)  — {} frames submitted",
-                            submit_pct, time_in_submit.as_secs_f64(), frames_submitted);
-                        let _ = writeln!(log, "  other:     {:>6.1}%           — atomics, logging, alive check",
-                            other_pct);
-                        let _ = writeln!(log, "  RATES: {:.0} reads/s, {:.0} frames/s, {:.3}ms avg/read",
-                            reads_per_sec, frames_per_sec,
-                            if usb_reads > 0 { time_in_usb_read.as_secs_f64() / usb_reads as f64 * 1000.0 } else { 0.0 });
-                        let _ = writeln!(log, "═══════════════════════════════\n");
-                        let _ = log.flush();
-                    }
-                    // Reset timing counters for next window
-                    time_in_usb_read = std::time::Duration::ZERO;
-                    time_in_parse = std::time::Duration::ZERO;
-                    time_in_submit = std::time::Duration::ZERO;
-                    last_timing_report = std::time::Instant::now();
-                }
-            }
-
-            if let Some(ref mut log) = log_file {
-                let _ = writeln!(log, "rx-usb exiting. usb_reads={}, usb_bytes={}, extracted={}, submitted={}",
-                    usb_reads, usb_bytes, frames_extracted, frames_submitted);
-                let _ = log.flush();
             }
         })
         .expect("failed to spawn rx-usb thread")

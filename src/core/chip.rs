@@ -375,6 +375,27 @@ pub trait ChipDriver: Send {
 
     // ── RX split support (pipeline architecture) ──
 
+    /// Start a driver-managed RX pipeline.
+    ///
+    /// Drivers that need custom RX handling (e.g., stream-based USB parsing)
+    /// implement this to spawn their own internal threads. The driver reads
+    /// USB, parses chip-specific packets, and submits clean RxFrames to the
+    /// FrameGate — just like any other driver, but with full control over
+    /// the RX path.
+    ///
+    /// `gate`: submit parsed RxFrames here via gate.submit().
+    /// `alive`: check this flag — stop all threads when it becomes false.
+    ///
+    /// Returns true if the driver took over RX (SharedAdapter skips its own
+    /// RX thread). Returns false to fall back to take_rx_handle().
+    fn start_rx_pipeline(
+        &mut self,
+        _gate: crate::pipeline::FrameGate,
+        _alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        false
+    }
+
     /// Extract the USB device handle for dedicated RX thread use.
     ///
     /// Returns (DeviceHandle as raw ptr, bulk_in endpoint, rx_buf_size).

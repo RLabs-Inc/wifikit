@@ -12,7 +12,6 @@
 //!   - Firmware: single binary with header + sections, downloaded via EP7 bulk OUT
 //!   - H2C commands: via EP7 with WD + FWCMD header, sequence-tracked with REC_ACK
 //!   - Extended register space: addresses > 0xFFFF via wIndex in control transfers
-//!   - PPDU status: RSSI/SNR/LDPC/STBC arrive in separate packets, correlated by ppdu_cnt
 //!
 //! # Init Flow (hybrid: our code + usbmon pcap replay)
 //!
@@ -39,11 +38,6 @@
 //!
 //!   WiFi frames (rpkt_type=0) arrive with drv_info_size=0 — no embedded PHY status.
 //!   RSSI/SNR/LDPC/STBC arrive in PPDU status packets (rpkt_type=1).
-//!   Correlation uses ppdu_cnt (3-bit, 8 slots) from DW1[6:4]:
-//!     1. WiFi frame → store as pending in slot[ppdu_cnt]
-//!     2. PPDU status → parse physts, apply to pending frame if ppdu_cnt matches
-//!     3. If PPDU arrives first → pre-store, applied when WiFi frame appears
-//!   Some frames carry inline physts in drv_info (drv_info_size > 0) — used directly.
 //!
 //! # Channel Switching — Full Programmatic Port
 //!
@@ -64,8 +58,6 @@
 //!     they contain the pcap capture machine's MAC and enable address filtering
 //!   - Background RX drain thread during init prevents PPDU/C2H data from
 //!     backing up and stalling the H2C command path
-//!   - PPDU correlation uses PpduStatusCache with 8 slots — matches PHL_MAX_PPDU_CNT
-//!   - Standalone parse function uses thread_local PpduStatusCache for RxHandle path
 //!   - Board-specific registers (0x0010 SWR_CTRL) are skipped during pcap replay
 //!   - Phase table loader (BB/RF) supports headline selection, IF/ELSE_IF/ELSE/END
 //!     conditional blocks — shared format with all Realtek gen2 chips
@@ -90,6 +82,8 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use std::thread;
 use std::fs;
@@ -360,373 +354,1091 @@ fn ax_rate_to_hw(rate: &TxRate) -> u16 {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PPDU status correlation — MAC AX gen2 architecture
+//  RX packet parsing — MAC AX gen2 with PPDU status correlation
 // ══════════════════════════════════════════════════════════════════════════════
 //
-// WiFi frames arrive with rpkt_type=0 but drv_info_size=0 (no embedded PHY status).
-// RSSI/SNR/LDPC/STBC/noise arrive in separate PPDU status packets (rpkt_type=1).
+// WiFi frames (rpkt_type=0) arrive with no embedded PHY status.
+// RSSI/SNR/EVM/etc arrive in separate PPDU status packets (rpkt_type=1).
 // Correlation is via ppdu_cnt (3-bit counter, 8 slots) in DW1[6:4].
 //
-// Flow (from hal_rx.c):
-//   1. WiFi frame → store metadata in slot[ppdu_cnt], set valid=false
-//   2. PPDU status → parse physts, store in slot[ppdu_cnt], set valid=true
-//   3. Next WiFi frame with same ppdu_cnt picks up the stored PHY info
+// Flow:
+//   1. WiFi frame → extract 802.11 data + RX descriptor metadata, park in slot[ppdu_cnt]
+//   2. PPDU status → parse physts header + all IEs, match slot[ppdu_cnt], deliver complete frame
+//   3. If slot is already occupied when new WiFi frame arrives → evict old frame (rssi=0)
 //
-// Reference: phl_def.h:2365 PHL_MAX_PPDU_CNT=8
+// RX descriptor layout (from hal_trx_8852a.h):
+//   Short RXD = 16 bytes (long_rxd=0): DW0-DW3
+//   Long  RXD = 32 bytes (long_rxd=1): DW0-DW7
+//
+// All 11 rpkt_types are handled — nothing silently dropped.
 
+/// RX packet types (rpkt_type field, DW0[27:24])
+const RPKT_WIFI: u8 = 0;
+const RPKT_PPDU_STATUS: u8 = 1;
+const RPKT_CHANNEL_INFO: u8 = 2;
+const RPKT_BB_SCOPE: u8 = 3;
+const RPKT_F2P_TX_CMD_RPT: u8 = 4;
+const RPKT_SS2FW_RPT: u8 = 5;
+const RPKT_TX_RPT: u8 = 6;
+const RPKT_TX_PD_RELEASE_HOST: u8 = 7;
+const RPKT_DFS_RPT: u8 = 8;
+const RPKT_TX_PD_RELEASE_WLCPU: u8 = 9;
+const RPKT_C2H: u8 = 10;
+
+/// PPDU type (DW1[3:0])
+const PPDU_T_LEGACY: u8 = 0;
+const PPDU_T_HT: u8 = 1;
+const PPDU_T_VHT: u8 = 2;
+const PPDU_T_HE_SU: u8 = 3;
+const PPDU_T_HE_ER_SU: u8 = 4;
+const PPDU_T_HE_MU: u8 = 5;
+const PPDU_T_HE_TB: u8 = 6;
+
+/// PHY status header length (8 bytes)
+const PHYSTS_HDR_LEN: usize = 8;
+
+/// Maximum PPDU correlation slots (ppdu_cnt is 3 bits)
 const PPDU_SLOT_COUNT: usize = 8;
 
-/// RX packet types from rxdesc.h
-const RPKT_TYPE_PPDU: u8 = 1;
-const RPKT_TYPE_CH_INFO: u8 = 2;
-const RPKT_TYPE_BB_SCORE: u8 = 3;
-const RPKT_TYPE_TXCMD_RPT: u8 = 4;
-const RPKT_TYPE_SS2FW_RPT: u8 = 5;
-const RPKT_TYPE_TXRPT: u8 = 6;
-const RPKT_TYPE_C2H: u8 = 10;
+/// IE fixed lengths in 8-byte units (0xFF = variable length)
+const IE_LEN_TABLE: [u8; 32] = [
+    2, 4, 3, 3, 1, 1, 1, 1,           // IE0-7
+    0xFF, 1, 0xFF, 22, 0xFF, 0xFF, 0xFF, 0xFF, // IE8-15
+    0xFF, 0xFF, 2, 3, 0xFF, 0xFF, 0xFF, 0,     // IE16-23
+    3, 3, 3, 3, 4, 4, 4, 4,           // IE24-31
+];
 
-/// PHY status parsed from a PPDU status packet (rpkt_type=1).
-/// Corresponds to physts_hdr_info + IE0 (CCK) or IE1 (OFDM/HT/VHT/HE).
-#[derive(Clone, Copy)]
-struct PpduPhyStatus {
-    valid: bool,
-    rssi_avg: i8,
-    rssi_path: [i8; 4],
-    noise_floor: i8,
-    snr: u8,
-    is_ldpc: bool,
-    is_stbc: bool,
-    is_bf: bool,
+/// Pending WiFi frame stored in a correlation slot.
+/// The frame data (Vec<u8>) is stored here because the USB buffer will be
+/// overwritten by the next bulk read before the PPDU arrives.
+struct PendingFrame {
+    /// The 802.11 frame data (FCS already stripped).
+    data: Vec<u8>,
+    /// Current channel at time of receipt.
+    channel: u8,
+    /// Band index (0=2.4GHz, 1=5GHz).
+    band: u8,
+    /// RX data rate from DW1[24:16].
+    data_rate: u16,
+    /// PPDU type from DW1[3:0] — used to validate PPDU match.
+    ppdu_type: u8,
+    /// Bandwidth from DW1[31:30].
+    bw: u8,
+    /// GI/LTF from DW1[27:25].
+    gi_ltf: u8,
+    /// Freerun counter from DW2 (timestamp).
+    freerun_cnt: u32,
+    /// AMPDU flag from DW3.
+    is_ampdu: bool,
+    /// AMSDU flag from DW3.
+    is_amsdu: bool,
+    /// Whether this slot is occupied.
+    occupied: bool,
 }
 
-impl Default for PpduPhyStatus {
+impl Default for PendingFrame {
     fn default() -> Self {
         Self {
-            valid: false,
-            rssi_avg: 0,
-            rssi_path: [0; 4],
-            noise_floor: 0,
-            snr: 0,
-            is_ldpc: false,
-            is_stbc: false,
-            is_bf: false,
+            data: Vec::new(), channel: 0, band: 0,
+            data_rate: 0, ppdu_type: 0, bw: 0, gi_ltf: 0,
+            freerun_cnt: 0, is_ampdu: false, is_amsdu: false,
+            occupied: false,
         }
     }
 }
 
-/// Debug counters for PPDU status diagnosis — writes to /tmp/wifikit_ppdu_debug.log
-struct PpduDebugStats {
-    total_non_wifi: u64,
-    rpkt_type_counts: [u64; 16],
-    ppdu_received: u64,
-    ppdu_parsed: u64,
-    ppdu_with_rssi: u64,
-    ppdu_correlated: u64,
-    ppdu_no_match: u64,
-    ppdu_parse_fail: u64,
-    ppdu_too_short: u64,
-    last_rssi: i8,
-    /// Raw U(8,1) RSSI byte histogram — shows what firmware actually reports
-    raw_rssi_hist: Vec<u32>,
-    /// Last 10 raw RSSI values (byte3 from physts header)
-    last_raw: [u8; 10],
-    last_raw_idx: usize,
+/// PHY status parsed from a PPDU status packet — all IEs.
+#[derive(Default)]
+struct PhyStatus {
+    // --- Header ---
+    rssi_avg: u8,       // U(8,1) — raw from physts header
+    rssi_path: [u8; 4], // U(8,1) — raw per-path
+    ie_bitmap_select: u8,
+
+    // --- IE0 (CCK) ---
+    ie0_present: bool,
+    ie0_pop_idx: u8,
+    ie0_rpl: u16,           // 9-bit received power level
+    ie0_cca_time: u8,
+    ie0_antwgt_gain_diff: u8,
+    ie0_hw_antsw: [bool; 4],
+    ie0_noise_pwr: u8,
+    ie0_cfo: i16,           // 12-bit signed
+    ie0_coarse_cfo: i16,    // 12-bit signed
+    ie0_evm_hdr: u8,
+    ie0_evm_pld: u8,
+    ie0_sig_len: u16,
+    ie0_antdiv_rslt: [bool; 4],
+    ie0_preamble_type: u8,
+    ie0_sync_mode: u8,
+    ie0_dagc: [u8; 4],      // 5-bit each
+    ie0_rx_path_en: u8,
+
+    // --- IE1 (OFDM/HT/VHT/HE) ---
+    ie1_present: bool,
+    ie1_pop_idx: u8,
+    ie1_rssi_avg_fd: u8,
+    ie1_ch_idx: u8,
+    ie1_rxsc: u8,
+    ie1_rx_path_en: u8,
+    ie1_noise_pwr: u8,
+    ie1_cfo: i16,           // 12-bit signed
+    ie1_cfo_preamble: i16,  // 12-bit signed
+    ie1_snr: u8,            // 6-bit
+    ie1_evm_max: u8,
+    ie1_evm_min: u8,
+    ie1_gi_type: u8,
+    ie1_is_su: bool,
+    ie1_is_ldpc: bool,
+    ie1_is_ndp: bool,
+    ie1_is_stbc: bool,
+    ie1_grant_bt: bool,
+    ie1_bf_gain_max: u8,
+    ie1_is_awgn: bool,
+    ie1_is_bf: bool,
+    ie1_avg_cn: u8,
+    ie1_sigval_below_th_cnt: u8,
+    ie1_cn_excess_th_cnt: u8,
+    ie1_pwr_to_cca: u16,
+    ie1_cca_to_agc: u8,
+    ie1_cca_to_sbd: u8,
+    ie1_edcca_rpt_cnt: u8,
+    ie1_edcca_total_smp_cnt: u8,
+    ie1_edcca_bw_max: u8,
+    ie1_edcca_bw_min: u8,
+    ie1_bw_idx: u8,
+
+    // --- IE2 (HE/AX extended) ---
+    ie2_present: bool,
+    ie2_max_nsts: u8,
+    ie2_midamble: bool,
+    ie2_ltf_type: u8,
+    ie2_gi: u8,
+    ie2_is_mu_mimo: bool,
+    ie2_is_dl_ofdma: bool,
+    ie2_is_dcm: bool,
+    ie2_is_doppler: bool,
+    ie2_pkt_extension: u8,
+    ie2_coarse_cfo_i: i32,
+    ie2_coarse_cfo_q: i32,
+    ie2_fine_cfo_i: i32,
+    ie2_fine_cfo_q: i32,
+    ie2_est_cmped_phase: u8,
+    ie2_n_ltf: u8,
+    ie2_n_sym: u16,
+
+    // --- IE4-7 (per-path) ---
+    ie_path_present: [bool; 4],
+    ie_path_sig_val: [u8; 4],
+    ie_path_rf_gain_idx: [u8; 4],
+    ie_path_tia_gain_idx: [u8; 4],
+    ie_path_snr: [u8; 4],
+    ie_path_evm: [u8; 4],
+    ie_path_ant_weight: [u8; 4],
+    ie_path_dc_re: [u8; 4],
+    ie_path_dc_im: [u8; 4],
 }
 
-impl Default for PpduDebugStats {
-    fn default() -> Self {
-        Self {
-            total_non_wifi: 0, rpkt_type_counts: [0; 16],
-            ppdu_received: 0, ppdu_parsed: 0, ppdu_with_rssi: 0,
-            ppdu_correlated: 0, ppdu_no_match: 0,
-            ppdu_parse_fail: 0, ppdu_too_short: 0, last_rssi: 0,
-            raw_rssi_hist: vec![0; 256], last_raw: [0; 10], last_raw_idx: 0,
-        }
-    }
+/// Thread-local PPDU correlation state.
+/// Each thread (main driver + RxHandle) gets its own independent state.
+struct PpduCorrelation {
+    slots: [PendingFrame; PPDU_SLOT_COUNT],
+    /// Completed frames ready for delivery (evicted from slots without PPDU match).
+    completed: Vec<RxFrame>,
 }
 
-impl PpduDebugStats {
-    fn dump(&self) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).write(true).truncate(true)
-            .open("/tmp/wifikit_ppdu_debug.log")
-        {
-            let _ = writeln!(f, "=== PPDU Debug Stats ===");
-            let _ = writeln!(f, "Non-WiFi packets: {}", self.total_non_wifi);
-            for (i, &count) in self.rpkt_type_counts.iter().enumerate() {
-                if count > 0 {
-                    let name = match i {
-                        0 => "WiFi",
-                        1 => "PPDU_STATUS",
-                        2 => "CH_INFO",
-                        4 => "TX_RPT",
-                        8 => "C2H",
-                        _ => "other",
-                    };
-                    let _ = writeln!(f, "  rpkt_type={}: {} ({})", i, count, name);
-                }
-            }
-            let _ = writeln!(f, "PPDU received: {}", self.ppdu_received);
-            let _ = writeln!(f, "PPDU parsed OK: {}", self.ppdu_parsed);
-            let _ = writeln!(f, "PPDU with RSSI: {}", self.ppdu_with_rssi);
-            let _ = writeln!(f, "PPDU correlated (matched pending frame): {}", self.ppdu_correlated);
-            let _ = writeln!(f, "PPDU no match (no pending frame): {}", self.ppdu_no_match);
-            let _ = writeln!(f, "PPDU parse fail: {}", self.ppdu_parse_fail);
-            let _ = writeln!(f, "PPDU too short: {}", self.ppdu_too_short);
-            let _ = writeln!(f, "Last RSSI: {} dBm", self.last_rssi);
-            let corr_rate = if self.ppdu_received > 0 {
-                self.ppdu_correlated as f64 / self.ppdu_received as f64 * 100.0
-            } else { 0.0 };
-            let _ = writeln!(f, "Correlation rate: {:.1}%", corr_rate);
-            // Raw RSSI histogram — shows the distribution of firmware-reported values
-            let _ = writeln!(f, "\nRaw RSSI byte histogram (top 15):");
-            let mut sorted: Vec<(u8, u32)> = self.raw_rssi_hist.iter().enumerate()
-                .filter(|(_, c)| **c > 0)
-                .map(|(i, c)| (i as u8, *c))
-                .collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
-            for (raw, count) in sorted.iter().take(15) {
-                let dbm = if *raw == 0 { 0i16 } else { (*raw >> 1) as i16 - 110 };
-                let _ = writeln!(f, "  raw=0x{:02X}({:3}) → {:4} dBm : {} times",
-                    raw, raw, dbm, count);
-            }
-            let _ = writeln!(f, "\nLast 10 raw RSSI bytes: {:?}",
-                &self.last_raw[..self.last_raw_idx.min(10)]);
-        }
-    }
-}
-
-/// Cache for PPDU status correlation. 8 slots indexed by ppdu_cnt (3-bit).
-///
-/// Architecture: WiFi frames and PPDU status packets arrive interleaved in the
-/// USB buffer. Either can arrive first. We use two parallel 8-slot arrays:
-///
-///   phy_slots[]:     PPDU status (RSSI/SNR/LDPC/STBC) indexed by ppdu_cnt
-///   pending_frames[]: WiFi frames waiting for their PPDU status, indexed by ppdu_cnt
-///
-/// When a PPDU arrives: store in phy_slots, check pending_frames for match → return with RSSI.
-/// When a WiFi frame arrives: check phy_slots for match → return with RSSI. Else store pending.
-///
-/// Old design had only ONE pending frame slot — at 323fps, different ppdu_cnt values
-/// evicted each other, giving only 28.5% correlation. With 8 pending slots (one per
-/// ppdu_cnt value), frames with different ppdu_cnt no longer interfere.
-///
-/// Completed frames are returned via a small queue (completed_queue) since parse_rx_packet
-/// can only return one frame per call.
-pub(crate) struct PpduStatusCache {
-    /// PHY status from PPDU packets, indexed by ppdu_cnt & 0x7
-    phy_slots: [PpduPhyStatus; PPDU_SLOT_COUNT],
-    /// WiFi frames waiting for their PPDU status, indexed by ppdu_cnt & 0x7
-    pending_frames: [Option<RxFrame>; PPDU_SLOT_COUNT],
-    /// Completed frames ready to return (from PPDU matching a pending frame)
-    completed_queue: Vec<RxFrame>,
-}
-
-impl PpduStatusCache {
+impl PpduCorrelation {
     fn new() -> Self {
         Self {
-            phy_slots: [PpduPhyStatus::default(); PPDU_SLOT_COUNT],
-            pending_frames: Default::default(),
-            completed_queue: Vec::with_capacity(8),
+            slots: Default::default(),
+            completed: Vec::new(),
+        }
+    }
+}
+
+/// Debug logger for RX packet parsing — writes to /tmp/wifikit_rx_parse_debug.log
+struct RxDebugLog {
+    file: Option<std::fs::File>,
+    count: u64,
+    wifi_count: u64,
+    ppdu_count: u64,
+    match_count: u64,
+    evict_count: u64,
+    skip_count: u64,
+}
+
+impl RxDebugLog {
+    fn new() -> Self {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open("/tmp/wifikit_rx_parse_debug.log").ok();
+        if let Some(ref mut f) = file.as_ref() {
+            let _ = writeln!(f as &mut dyn Write, "=== RTL8852AU RX Parse Debug Log ===\n");
+        }
+        Self { file, count: 0, wifi_count: 0, ppdu_count: 0, match_count: 0, evict_count: 0, skip_count: 0 }
+    }
+
+    fn log(&mut self, msg: &str) {
+        use std::io::Write;
+        if let Some(ref mut f) = self.file {
+            let _ = writeln!(f, "{}", msg);
         }
     }
 
-    /// Pop a completed frame from the queue (from previous PPDU correlations).
-    fn pop_completed(&mut self) -> Option<RxFrame> {
-        if self.completed_queue.is_empty() { None } else { Some(self.completed_queue.remove(0)) }
-    }
-
-    /// Store PHY status from a PPDU status packet.
-    /// If there's a pending frame with matching ppdu_cnt, applies the PHY info
-    /// and queues the completed frame.
-    fn store_ppdu(&mut self, ppdu_cnt: u8, phy: PpduPhyStatus) -> Option<RxFrame> {
-        let idx = (ppdu_cnt & 0x7) as usize;
-        self.phy_slots[idx] = phy;
-
-        // Check if a pending frame matches this PPDU status
-        if let Some(mut frame) = self.pending_frames[idx].take() {
-            Self::apply_phy_to_frame(&mut frame, &phy);
-            return Some(frame);
+    fn log_summary(&mut self) {
+        use std::io::Write;
+        if let Some(ref mut f) = self.file {
+            let _ = writeln!(f, "\n--- SUMMARY @ packet #{} ---", self.count);
+            let _ = writeln!(f, "  WiFi frames:  {}", self.wifi_count);
+            let _ = writeln!(f, "  PPDU status:  {}", self.ppdu_count);
+            let _ = writeln!(f, "  Matched:      {} ({:.1}% of WiFi)",
+                self.match_count,
+                if self.wifi_count > 0 { self.match_count as f64 / self.wifi_count as f64 * 100.0 } else { 0.0 });
+            let _ = writeln!(f, "  Evicted:      {} ({:.1}% of WiFi)",
+                self.evict_count,
+                if self.wifi_count > 0 { self.evict_count as f64 / self.wifi_count as f64 * 100.0 } else { 0.0 });
+            let _ = writeln!(f, "  Other/Skip:   {}", self.skip_count);
+            let _ = writeln!(f, "---");
         }
-        None
     }
+}
 
-    /// Store a WiFi frame as pending for PPDU correlation.
-    /// If the slot is already occupied (same ppdu_cnt wrapping), the old frame
-    /// is returned without RSSI (it missed its window).
-    fn store_pending(&mut self, ppdu_cnt: u8, frame: RxFrame) -> Option<RxFrame> {
-        let idx = (ppdu_cnt & 0x7) as usize;
-        let old = self.pending_frames[idx].take();
-        self.pending_frames[idx] = Some(frame);
-        old
-    }
+thread_local! {
+    static PPDU_STATE: std::cell::RefCell<PpduCorrelation> = std::cell::RefCell::new(PpduCorrelation::new());
+    static RX_DEBUG: std::cell::RefCell<RxDebugLog> = std::cell::RefCell::new(RxDebugLog::new());
+}
 
-    /// Look up pre-stored PPDU status for this ppdu_cnt.
-    fn lookup(&self, ppdu_cnt: u8) -> Option<&PpduPhyStatus> {
-        let idx = (ppdu_cnt & 0x7) as usize;
-        if self.phy_slots[idx].valid {
-            Some(&self.phy_slots[idx])
+/// Parse one RX packet from a USB bulk read buffer.
+///
+/// This is the standalone parse function used by both `recv_frame_internal` (driver path)
+/// and the RxHandle (dedicated RX thread). It handles all 11 rpkt_types, correlates
+/// WiFi frames with PPDU status packets via ppdu_cnt, and returns complete frames
+/// with full PHY status populated.
+///
+/// Returns (bytes_consumed, ParsedPacket).
+fn parse_rx_packet_8852au(buf: &[u8], channel: u8) -> (usize, crate::core::chip::ParsedPacket) {
+    use crate::core::chip::ParsedPacket;
+    use crate::core::frame::RxFrame;
+
+    // First check if we have completed frames from previous evictions
+    let evicted = PPDU_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if !s.completed.is_empty() {
+            Some(s.completed.remove(0))
         } else {
             None
         }
+    });
+    if let Some(frame) = evicted {
+        return (0, ParsedPacket::Frame(frame));
     }
 
-    /// Clear all PHY and pending slots — prevents cross-buffer RSSI bleed.
-    fn clear_slots(&mut self) {
-        for slot in &mut self.phy_slots {
-            slot.valid = false;
-        }
-        // Don't clear pending_frames — a WiFi frame from the end of buffer N
-        // might get its PPDU from the start of buffer N+1
+    // Need at least a short RX descriptor
+    if buf.len() < RX_DESC_SHORT {
+        return (0, ParsedPacket::Skip);
     }
 
-    fn apply_phy_to_frame(frame: &mut RxFrame, phy: &PpduPhyStatus) {
-        frame.rssi = phy.rssi_avg;
-        frame.rssi_path = phy.rssi_path;
-        frame.noise_floor = phy.noise_floor;
-        frame.snr = phy.snr;
-        frame.is_ldpc = phy.is_ldpc;
-        frame.is_stbc = phy.is_stbc;
-        frame.is_bf = phy.is_bf;
+    // ── DW0: packet length, type, descriptor format ──
+    let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let pkt_len = (dw0 & 0x3FFF) as usize;
+    let shift = ((dw0 >> 14) & 0x3) as usize;
+    let mac_info_vld = (dw0 >> 23) & 1 != 0;
+    let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
+    let drv_info_size = ((dw0 >> 28) & 0x7) as usize;
+    let long_rxd = (dw0 >> 31) & 1 != 0;
+
+    let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
+    let payload_offset = desc_len + (drv_info_size * 8) + (shift * 2);
+
+    if pkt_len == 0 {
+        return (desc_len, ParsedPacket::Skip);
     }
-}
 
-/// Convert U(8,1) RSSI value to dBm.
-/// From halbb_physts.h:29: TRANS_2_RSSI(X) = (X >> 1)
-/// Then hal_api_bb.c subtracts 110 for dBm offset.
-fn rssi_u81_to_dbm(val: u8) -> i8 {
-    if val == 0 { return 0; }
-    ((val >> 1) as i16 - 110).clamp(-127, 0) as i8
-}
+    // Total consumed bytes for this packet
+    let total_len = payload_offset + pkt_len;
+    // Round up to 8-byte alignment (USB aggregation boundary)
+    let consumed = (total_len + 7) & !7;
 
-/// Parse a PPDU status payload, handling the mac_info header if present.
-///
-/// When `mac_info_vld=1`, the payload structure is:
-///   mac_info header (8 bytes: 2 DWs)
-///   usr_num * 4 bytes (user entries)
-///   4 bytes padding if usr_num is odd (8-byte alignment)
-///   rx_cnt (96 bytes, if rx_cnt_vld set in DW0 bit 29)
-///   plcp (plcp_len * 8 bytes, from DW1[23:16])
-///   physts (remaining bytes)
-///
-/// When `mac_info_vld=0`, the payload IS the physts directly.
-///
-/// Reference: phy_rpt.c:482 mac_parse_ppdu()
-const MAC_AX_RX_CNT_SIZE: usize = 96;
+    if total_len > buf.len() {
+        return (0, ParsedPacket::Skip);
+    }
 
-fn parse_ppdu_payload(data: &[u8], mac_info_vld: bool) -> Option<PpduPhyStatus> {
-    if mac_info_vld {
-        // Skip mac_info header to find physts
-        if data.len() < 8 { return None; }
-
-        let dw0 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let dw1 = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-
-        let usr_num = (dw0 & 0xF) as usize;
-        let rx_cnt_vld = dw0 & (1 << 29) != 0;
-        let plcp_len = ((dw1 >> 16) & 0xFF) as usize;
-        let plcp_size = plcp_len * 8;
-
-        let mut offset: usize = 8; // mac_info header
-        offset += usr_num * 4;     // user entries
-        if usr_num & 1 != 0 { offset += 4; } // 8-byte alignment padding
-        if rx_cnt_vld { offset += MAC_AX_RX_CNT_SIZE; }
-        offset += plcp_size;
-
-        if offset >= data.len() { return None; }
-        parse_physts_header(&data[offset..])
+    // ── DW1: rate/ppdu info (only for WiFi + PPDU types) ──
+    let dw1 = if buf.len() >= 8 {
+        u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])
     } else {
-        parse_physts_header(data)
-    }
-}
-
-/// Parse physts_hdr_info (8 bytes) from the start of a physts buffer.
-/// Layout from halbb_physts_ie_l_endian.h:34-43:
-///   byte 0: ie_bitmap_select(5) | rsvd(1) | null_tb_ppdu(1) | is_valid(1)
-///   byte 1: physts_total_length (unit: 8 bytes)
-///   byte 2: rsvd
-///   byte 3: rssi_avg_td — U(8,1)
-///   bytes 4-7: rssi_td[0..3] — per-path U(8,1)
-fn parse_physts_header(data: &[u8]) -> Option<PpduPhyStatus> {
-    if data.len() < 8 { return None; }
-
-    let is_valid = data[0] & 0x80 != 0;
-    if !is_valid { return None; }
-
-    let ie_bitmap_select = data[0] & 0x1F;
-    let physts_total_length = data[1] as usize * 8;
-    let rssi_avg = rssi_u81_to_dbm(data[3]);
-    let rssi_path = [
-        rssi_u81_to_dbm(data[4]),
-        rssi_u81_to_dbm(data[5]),
-        rssi_u81_to_dbm(data[6]),
-        rssi_u81_to_dbm(data[7]),
-    ];
-
-    let mut phy = PpduPhyStatus {
-        valid: true,
-        rssi_avg,
-        rssi_path,
-        noise_floor: 0,
-        snr: 0,
-        is_ldpc: false,
-        is_stbc: false,
-        is_bf: false,
+        0
     };
 
-    // Parse Information Elements after the 8-byte header
-    let ie_data = &data[8..data.len().min(physts_total_length.max(8))];
+    let ppdu_type_raw = (dw1 & 0xF) as u8;
+    let ppdu_cnt = ((dw1 >> 4) & 0x7) as usize;
+    let rx_rate = ((dw1 >> 16) & 0x1FF) as u16;
+    let gi_ltf = ((dw1 >> 25) & 0x7) as u8;
+    let bw = ((dw1 >> 30) & 0x3) as u8;
 
-    // IE bitmap tells us which IEs are present.
-    // ie_bitmap_select selects which bitmap set (type 1 = 5-bit fixed, type 2 = 12-bit variable).
-    // For our purposes: if bitmap bit 0 set → IE0 (CCK), bit 1 → IE1 (OFDM/HT/VHT/HE)
-    // IE0 and IE1 are mutually exclusive (CCK vs OFDM).
-    if ie_bitmap_select & 0x01 != 0 {
-        // IE0 — CCK (physts_ie_0_info, 16 bytes = 4 DWs)
-        parse_physts_ie0(ie_data, &mut phy);
-    } else if ie_bitmap_select & 0x02 != 0 {
-        // IE1 — OFDM/HT/VHT/HE (physts_ie_1_info, 24 bytes = 6 DWs)
-        parse_physts_ie1(ie_data, &mut phy);
+    // ── DW2: freerun counter (timestamp) ──
+    let dw2 = if buf.len() >= 12 {
+        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+    } else {
+        0
+    };
+
+    // ── DW3: flags (long RXD only, at offset 12) ──
+    let dw3 = if long_rxd && buf.len() >= 16 {
+        u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])
+    } else {
+        0
+    };
+
+    let is_ampdu = (dw3 >> 3) & 1 != 0;
+    let is_amsdu = (dw3 >> 5) & 1 != 0;
+    let crc32_err = (dw3 >> 9) & 1 != 0;
+
+    let band = if channel <= 14 { 0u8 } else { 1u8 };
+
+    // Debug: log every packet's raw descriptor
+    RX_DEBUG.with(|dbg| {
+        let mut d = dbg.borrow_mut();
+        d.count += 1;
+        let pkt_num = d.count;
+        // Log first 200 packets in full detail, then summary every 1000
+        let detailed = pkt_num <= 200;
+        let summary = pkt_num % 1000 == 0;
+
+        if detailed {
+            d.log(&format!(
+                "[PKT #{}] rpkt_type={} pkt_len={} desc_len={} shift={} drv_info_sz={} long_rxd={} mac_info_vld={}",
+                pkt_num, rpkt_type, pkt_len, desc_len, shift, drv_info_size, long_rxd, mac_info_vld));
+            d.log(&format!(
+                "  DW0=0x{:08X} DW1=0x{:08X} DW2=0x{:08X} DW3=0x{:08X}",
+                dw0, dw1, dw2, dw3));
+            d.log(&format!(
+                "  ppdu_cnt={} ppdu_type={} rx_rate=0x{:03X} bw={} gi_ltf={} payload_offset={} consumed={}",
+                ppdu_cnt, ppdu_type_raw, rx_rate, bw, gi_ltf, payload_offset, consumed));
+            // Raw first 48 bytes of packet
+            let hex_len = buf.len().min(48);
+            let hex: String = buf[..hex_len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+            d.log(&format!("  RAW[0..{}]: {}", hex_len, hex));
+        }
+        if summary {
+            d.log_summary();
+        }
+    });
+
+    match rpkt_type {
+        // ═══════════════════════════════════════════════════════════════
+        //  WiFi frame (rpkt_type=0) — park in pending slot
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_WIFI => {
+            // Extra offset for mac_info_vld on non-PPDU packets
+            let extra = if mac_info_vld { 4 } else { 0 };
+            let data_start = payload_offset + extra;
+            // Strip FCS (4 bytes)
+            let frame_len = if pkt_len >= 4 + extra { pkt_len - 4 - extra } else { 0 };
+
+            if frame_len == 0 || data_start + frame_len > buf.len() {
+                return (consumed, ParsedPacket::Skip);
+            }
+
+            // Skip CRC errors
+            if crc32_err {
+                return (consumed, ParsedPacket::Skip);
+            }
+
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                d.wifi_count += 1;
+                if d.wifi_count <= 200 {
+                    // Show frame type from first 2 bytes of 802.11 header
+                    let fc = if data_start + 2 <= buf.len() {
+                        u16::from_le_bytes([buf[data_start], buf[data_start + 1]])
+                    } else { 0 };
+                    let ftype = (fc >> 2) & 0x3;
+                    let fsub = (fc >> 4) & 0xF;
+                    d.log(&format!(
+                        "  → WIFI: frame_len={} fc=0x{:04X} type={} subtype={} ppdu_cnt={} data_start={} ampdu={} amsdu={}",
+                        frame_len, fc, ftype, fsub, ppdu_cnt, data_start, is_ampdu, is_amsdu));
+                    d.log(&format!(
+                        "    ppdu_cnt extraction: DW1_raw=0x{:08X} → bits[6:4]=(0x{:08X} >> 4) & 0x7 = {}",
+                        dw1, dw1, ppdu_cnt));
+                }
+            });
+
+            // Copy frame data now — buffer will be overwritten by next USB read
+            let frame_data = buf[data_start..data_start + frame_len].to_vec();
+
+            PPDU_STATE.with(|state| {
+                let mut s = state.borrow_mut();
+
+                // Evict old frame if slot occupied (PPDU was lost for previous frame)
+                if s.slots[ppdu_cnt].occupied {
+                    let old_rate = s.slots[ppdu_cnt].data_rate;
+                    RX_DEBUG.with(|dbg| {
+                        let mut d = dbg.borrow_mut();
+                        d.evict_count += 1;
+                        if d.count <= 200 {
+                            d.log(&format!("  → EVICT: slot[{}] was occupied (old rate=0x{:03X})",
+                                ppdu_cnt, old_rate));
+                        }
+                    });
+                    let evicted = evict_slot(&mut s.slots[ppdu_cnt]);
+                    s.completed.push(evicted);
+                }
+
+                // Store new frame in slot
+                let slot = &mut s.slots[ppdu_cnt];
+                slot.data = frame_data;
+                slot.channel = channel;
+                slot.band = band;
+                slot.data_rate = rx_rate;
+                slot.ppdu_type = ppdu_type_raw;
+                slot.bw = bw;
+                slot.gi_ltf = gi_ltf;
+                slot.freerun_cnt = dw2;
+                slot.is_ampdu = is_ampdu;
+                slot.is_amsdu = is_amsdu;
+                slot.occupied = true;
+            });
+
+            (consumed, ParsedPacket::Skip)
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  PPDU status (rpkt_type=1) — parse PHY status, match pending frame
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_PPDU_STATUS => {
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                d.ppdu_count += 1;
+            });
+
+            let ppdu_payload = &buf[payload_offset..payload_offset + pkt_len];
+
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                if d.ppdu_count <= 200 {
+                    let hex_len = ppdu_payload.len().min(32);
+                    let hex: String = ppdu_payload[..hex_len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                    d.log(&format!(
+                        "  → PPDU: ppdu_cnt={} mac_info_vld={} payload_len={} payload[0..{}]: {}",
+                        ppdu_cnt, mac_info_vld, ppdu_payload.len(), hex_len, hex));
+                    d.log(&format!(
+                        "    ppdu_cnt extraction: DW1_raw=0x{:08X} → bits[6:4]=(0x{:08X} >> 4) & 0x7 = {}",
+                        dw1, dw1, ppdu_cnt));
+                    // Show what's in each slot right now
+                    PPDU_STATE.with(|state| {
+                        let s = state.borrow();
+                        let mut slot_info = String::from("    slots: ");
+                        for i in 0..8 {
+                            if s.slots[i].occupied {
+                                slot_info.push_str(&format!("[{}:rate=0x{:03X},len={}] ", i, s.slots[i].data_rate, s.slots[i].data.len()));
+                            } else {
+                                slot_info.push_str(&format!("[{}:empty] ", i));
+                            }
+                        }
+                        d.log(&slot_info);
+                    });
+                }
+            });
+
+            // Parse MAC info header if present, then physts.
+            // MAC info struct is 2 DWORDs (8 bytes):
+            //   DW0: usr_num[3:0], lsig_len[27:16], rx_cnt_vld[29]
+            //   DW1: service[15:0], plcp_len[23:16] (in 8-byte units)
+            let physts_data = if mac_info_vld && ppdu_payload.len() >= 8 {
+                let mi_dw0 = u32::from_le_bytes([
+                    ppdu_payload[0], ppdu_payload[1],
+                    ppdu_payload[2], ppdu_payload[3],
+                ]);
+                let mi_dw1 = u32::from_le_bytes([
+                    ppdu_payload[4], ppdu_payload[5],
+                    ppdu_payload[6], ppdu_payload[7],
+                ]);
+                let usr_num = (mi_dw0 & 0xF) as usize;
+                let rx_cnt_vld = mi_dw0 & (1 << 29) != 0;
+                let plcp_len = (((mi_dw1 >> 16) & 0xFF) as usize) * 8; // DW1[23:16] * 8
+
+                // Accumulate size: mac_info header (8B) + per-user (4B each, 8-byte aligned)
+                let mut offset = 8; // sizeof(mac_ax_mac_info_t) = 2 DWORDs = 8 bytes
+                let usr_size = usr_num * 4; // MAC_AX_MAC_INFO_USE_SIZE = 4
+                offset += usr_size;
+                // 8-byte align the user block
+                if usr_num & 1 != 0 { offset += 4; }
+
+                // RX count block (96 bytes if present — MAC_AX_RX_CNT_SIZE=96)
+                if rx_cnt_vld { offset += 96; }
+
+                // PLCP block
+                offset += plcp_len;
+
+                RX_DEBUG.with(|dbg| {
+                    let mut d = dbg.borrow_mut();
+                    if d.ppdu_count <= 200 {
+                        d.log(&format!(
+                            "    MAC_INFO: usr_num={} rx_cnt_vld={} plcp_len={} → physts_offset={} (payload_len={})",
+                            usr_num, rx_cnt_vld, plcp_len, offset, ppdu_payload.len()));
+                    }
+                });
+
+                if offset < ppdu_payload.len() {
+                    &ppdu_payload[offset..]
+                } else {
+                    return (consumed, ParsedPacket::Skip);
+                }
+            } else {
+                // No MAC info — entire payload is physts
+                ppdu_payload
+            };
+
+            if physts_data.len() < PHYSTS_HDR_LEN {
+                return (consumed, ParsedPacket::Skip);
+            }
+
+            // Parse physts header (8 bytes)
+            let mut phy = PhyStatus::default();
+            phy.ie_bitmap_select = physts_data[0] & 0x1F;
+            let is_valid = (physts_data[0] >> 7) & 1 != 0;
+            let total_length = (physts_data[1] as usize) * 8; // in bytes
+            phy.rssi_avg = physts_data[3];
+            phy.rssi_path[0] = physts_data[4];
+            phy.rssi_path[1] = physts_data[5];
+            phy.rssi_path[2] = physts_data[6];
+            phy.rssi_path[3] = physts_data[7];
+
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                if d.ppdu_count <= 200 {
+                    let rssi_dbm = if phy.rssi_avg != 0 { (phy.rssi_avg >> 1) as i16 - 110 } else { 0 };
+                    let hex_len = physts_data.len().min(16);
+                    let hex: String = physts_data[..hex_len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                    d.log(&format!(
+                        "  → PHYSTS HDR: valid={} total_len={} bitmap_sel={} rssi_avg_raw=0x{:02X}({} dBm) rssi_path=[0x{:02X},0x{:02X},0x{:02X},0x{:02X}]",
+                        is_valid, total_length, phy.ie_bitmap_select, phy.rssi_avg, rssi_dbm,
+                        phy.rssi_path[0], phy.rssi_path[1], phy.rssi_path[2], phy.rssi_path[3]));
+                    d.log(&format!("    physts[0..{}]: {}", hex_len, hex));
+                }
+            });
+
+            if !is_valid || total_length == 0 || total_length > physts_data.len() {
+                RX_DEBUG.with(|dbg| {
+                    let mut d = dbg.borrow_mut();
+                    if d.ppdu_count <= 200 {
+                        d.log(&format!("    → SKIP: invalid physts (valid={} total_len={} data_len={})",
+                            is_valid, total_length, physts_data.len()));
+                    }
+                });
+                return deliver_ppdu_match(ppdu_cnt, ppdu_type_raw, rx_rate, &phy, consumed);
+            }
+
+            // Parse IEs — walk from after header to total_length
+            let ie_area = &physts_data[PHYSTS_HDR_LEN..total_length.min(physts_data.len())];
+            parse_physts_ies(ie_area, &mut phy);
+
+            deliver_ppdu_match(ppdu_cnt, ppdu_type_raw, rx_rate, &phy, consumed)
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Channel Info (rpkt_type=2) — raw CSI data
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_CHANNEL_INFO => {
+            // TODO: Parse and expose CSI data for research
+            // For now, skip but don't drop silently
+            (consumed, ParsedPacket::Skip)
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  TX Report (rpkt_type=6) — ACK/NACK for injected frames
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_TX_RPT => {
+            let payload = buf[payload_offset..payload_offset + pkt_len].to_vec();
+            (consumed, ParsedPacket::TxStatus(payload))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  DFS Report (rpkt_type=8) — radar detection
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_DFS_RPT => {
+            // TODO: Parse and expose DFS radar events
+            (consumed, ParsedPacket::Skip)
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  C2H (rpkt_type=10) — firmware command response
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_C2H => {
+            let payload = buf[payload_offset..payload_offset + pkt_len].to_vec();
+            (consumed, ParsedPacket::DriverMessage(payload))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  All other types — count but skip
+        // ═══════════════════════════════════════════════════════════════
+        _ => {
+            // BB_SCOPE(3), F2P_TX_CMD_RPT(4), SS2FW_RPT(5),
+            // TX_PD_RELEASE_HOST(7), TX_PD_RELEASE_WLCPU(9)
+            (consumed, ParsedPacket::Skip)
+        }
     }
-
-    Some(phy)
 }
 
-/// Parse IE0 (CCK) — physts_ie_0_info from halbb_physts_ie_l_endian.h:50-92
-/// 16 bytes (4 DWs).
-fn parse_physts_ie0(data: &[u8], phy: &mut PpduPhyStatus) {
-    if data.len() < 8 { return; }
-    // DW1 byte 0: avg_idle_noise_pwr
-    phy.noise_floor = rssi_u81_to_dbm(data[4]);
-    // CCK doesn't have LDPC/STBC/BF
+/// Match a parsed PPDU to a pending WiFi frame and deliver it.
+fn deliver_ppdu_match(
+    ppdu_cnt: usize,
+    ppdu_type_raw: u8,
+    rx_rate: u16,
+    phy: &PhyStatus,
+    consumed: usize,
+) -> (usize, crate::core::chip::ParsedPacket) {
+    use crate::core::chip::ParsedPacket;
+
+    PPDU_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let slot = &mut s.slots[ppdu_cnt];
+
+        if !slot.occupied {
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                if d.ppdu_count <= 200 {
+                    d.log(&format!("    → NO MATCH: slot[{}] empty (PPDU arrived first)", ppdu_cnt));
+                }
+            });
+            return (consumed, ParsedPacket::Skip);
+        }
+
+        // Build the complete frame — takes ownership of the stored data
+        let data = std::mem::take(&mut slot.data);
+        let mut frame = build_complete_frame(slot, phy);
+        frame.data = data;
+
+        RX_DEBUG.with(|dbg| {
+            let mut d = dbg.borrow_mut();
+            d.match_count += 1;
+            if d.match_count <= 200 {
+                d.log(&format!(
+                    "    → MATCH: slot[{}] → rssi={} dBm, rate=0x{:03X}, frame_len={}",
+                    ppdu_cnt, frame.rssi, frame.data_rate, frame.data.len()));
+            }
+        });
+
+        slot.occupied = false;
+
+        (consumed, ParsedPacket::Frame(frame))
+    })
 }
 
-/// Parse IE1 (OFDM/HT/VHT/HE) — physts_ie_1_info from halbb_physts_ie_l_endian.h:94-144
-/// 24 bytes (6 DWs).
-fn parse_physts_ie1(data: &[u8], phy: &mut PpduPhyStatus) {
+/// Build a complete RxFrame from pending slot + parsed PHY status.
+fn build_complete_frame(slot: &PendingFrame, phy: &PhyStatus) -> RxFrame {
+    use crate::core::frame::*;
+
+    // Convert RSSI: U(8,1) format → dBm = (raw >> 1) - 110
+    let rssi_avg_dbm = if phy.rssi_avg != 0 {
+        ((phy.rssi_avg >> 1) as i16 - 110) as i8
+    } else {
+        0i8
+    };
+    let rssi_path_dbm: [i8; 4] = std::array::from_fn(|i| {
+        if phy.rssi_path[i] != 0 {
+            ((phy.rssi_path[i] >> 1) as i16 - 110) as i8
+        } else {
+            0i8
+        }
+    });
+
+    let is_cck = phy.ie0_present && !phy.ie1_present;
+
+    // Noise floor and SNR depend on CCK vs OFDM path
+    let noise_floor = if is_cck {
+        if phy.ie0_noise_pwr != 0 { (phy.ie0_noise_pwr as i16 - 110) as i8 } else { 0 }
+    } else if phy.ie1_present {
+        if phy.ie1_noise_pwr != 0 { (phy.ie1_noise_pwr as i16 - 110) as i8 } else { 0 }
+    } else {
+        0
+    };
+
+    let snr = if phy.ie1_present { phy.ie1_snr } else { 0 };
+
+    // CFO: 12-bit signed value in the IE
+    let cfo = if phy.ie1_present { phy.ie1_cfo } else if phy.ie0_present { phy.ie0_cfo } else { 0 };
+    let cfo_preamble = if phy.ie1_present { phy.ie1_cfo_preamble } else { 0 };
+
+    // SNR calculations (per Linux driver halbb_physts_rpt_gen)
+    let snr_td_avg = if is_cck {
+        phy.rssi_avg.saturating_sub(phy.ie0_noise_pwr)
+    } else if phy.ie1_present {
+        phy.rssi_avg.saturating_sub(phy.ie1_noise_pwr)
+    } else {
+        0
+    };
+
+    let snr_td: [u8; 4] = std::array::from_fn(|i| {
+        let noise = if is_cck { phy.ie0_noise_pwr } else if phy.ie1_present { phy.ie1_noise_pwr } else { 0 };
+        phy.rssi_path[i].saturating_sub(noise)
+    });
+
+    let snr_fd_avg = if phy.ie1_present { phy.ie1_snr } else { 0 };
+    let snr_fd: [u8; 4] = std::array::from_fn(|i| {
+        if snr_fd_avg > 0 && phy.rssi_avg > 0 && phy.rssi_path[i] > 0 {
+            (((snr_fd_avg as u16) << 1).wrapping_add(phy.rssi_avg as u16).wrapping_sub(phy.rssi_path[i] as u16) >> 1) as u8
+        } else {
+            0
+        }
+    });
+
+    RxFrame {
+        data: Vec::new(), // Will be set by caller (stored separately)
+        rssi: rssi_avg_dbm,
+        channel: slot.channel,
+        band: slot.band,
+        timestamp: Duration::from_micros(slot.freerun_cnt as u64),
+        rssi_path: rssi_path_dbm,
+        noise_floor,
+        snr,
+        data_rate: slot.data_rate,
+        ppdu_type: ppdu_type_from_raw(slot.ppdu_type),
+        bandwidth: RxBandwidth::from_raw(slot.bw),
+        gi_ltf: GuardInterval::from_raw(slot.gi_ltf),
+        is_ldpc: if phy.ie1_present { phy.ie1_is_ldpc } else { false },
+        is_stbc: if phy.ie1_present { phy.ie1_is_stbc } else { false },
+        is_bf: if phy.ie1_present { phy.ie1_is_bf } else { false },
+        is_ampdu: slot.is_ampdu,
+        is_amsdu: slot.is_amsdu,
+        // Extended IE1 fields
+        rssi_fd: if phy.ie1_present { phy.ie1_rssi_avg_fd } else { 0 },
+        evm_max: if phy.ie1_present { phy.ie1_evm_max } else { 0 },
+        evm_min: if phy.ie1_present { phy.ie1_evm_min } else { 0 },
+        cfo,
+        cfo_preamble,
+        rxsc: if phy.ie1_present { phy.ie1_rxsc } else { 0 },
+        rx_path_en: if phy.ie1_present { phy.ie1_rx_path_en } else if phy.ie0_present { phy.ie0_rx_path_en } else { 0 },
+        is_su: if phy.ie1_present { phy.ie1_is_su } else { true },
+        is_ndp: if phy.ie1_present { phy.ie1_is_ndp } else { false },
+        is_awgn: if phy.ie1_present { phy.ie1_is_awgn } else { false },
+        grant_bt: if phy.ie1_present { phy.ie1_grant_bt } else { false },
+        bf_gain_max: if phy.ie1_present { phy.ie1_bf_gain_max } else { 0 },
+        condition_number: if phy.ie1_present { phy.ie1_avg_cn } else { 0 },
+        sigval_below_th_cnt: if phy.ie1_present { phy.ie1_sigval_below_th_cnt } else { 0 },
+        cn_excess_th_cnt: if phy.ie1_present { phy.ie1_cn_excess_th_cnt } else { 0 },
+        pwr_to_cca: if phy.ie1_present { phy.ie1_pwr_to_cca } else { 0 },
+        cca_to_agc: if phy.ie1_present { phy.ie1_cca_to_agc } else { 0 },
+        cca_to_sbd: if phy.ie1_present { phy.ie1_cca_to_sbd } else { 0 },
+        edcca_rpt_cnt: if phy.ie1_present { phy.ie1_edcca_rpt_cnt } else { 0 },
+        edcca_total_smp_cnt: if phy.ie1_present { phy.ie1_edcca_total_smp_cnt } else { 0 },
+        edcca_rpt_bw_max: if phy.ie1_present { phy.ie1_edcca_bw_max } else { 0 },
+        edcca_rpt_bw_min: if phy.ie1_present { phy.ie1_edcca_bw_min } else { 0 },
+        bw_from_phy: if phy.ie1_present { phy.ie1_bw_idx } else { 0 },
+        pop_idx: if phy.ie1_present { phy.ie1_pop_idx } else if phy.ie0_present { phy.ie0_pop_idx } else { 0 },
+        // CCK fields
+        cck_rpl: if phy.ie0_present { phy.ie0_rpl } else { 0 },
+        cck_cca_time: if phy.ie0_present { phy.ie0_cca_time } else { 0 },
+        cck_evm_hdr: if phy.ie0_present { phy.ie0_evm_hdr } else { 0 },
+        cck_evm_pld: if phy.ie0_present { phy.ie0_evm_pld } else { 0 },
+        cck_sig_len: if phy.ie0_present { phy.ie0_sig_len } else { 0 },
+        cck_preamble_type: if phy.ie0_present { phy.ie0_preamble_type } else { 0 },
+        cck_dagc: if phy.ie0_present { phy.ie0_dagc } else { [0; 4] },
+        cck_antdiv_rslt: if phy.ie0_present { phy.ie0_antdiv_rslt } else { [false; 4] },
+        cck_hw_antsw: if phy.ie0_present { phy.ie0_hw_antsw } else { [false; 4] },
+        cck_antwgt_gain_diff: if phy.ie0_present { phy.ie0_antwgt_gain_diff } else { 0 },
+        cck_sync_mode: if phy.ie0_present { phy.ie0_sync_mode } else { 0 },
+        // IE2 HE/AX fields
+        max_nsts: if phy.ie2_present { phy.ie2_max_nsts } else { 0 },
+        midamble: if phy.ie2_present { phy.ie2_midamble } else { false },
+        ltf_type: if phy.ie2_present { phy.ie2_ltf_type } else { 0 },
+        gi_from_phy: if phy.ie2_present { phy.ie2_gi } else { 0 },
+        is_mu_mimo: if phy.ie2_present { phy.ie2_is_mu_mimo } else { false },
+        is_dl_ofdma: if phy.ie2_present { phy.ie2_is_dl_ofdma } else { false },
+        is_dcm: if phy.ie2_present { phy.ie2_is_dcm } else { false },
+        is_doppler: if phy.ie2_present { phy.ie2_is_doppler } else { false },
+        pkt_extension: if phy.ie2_present { phy.ie2_pkt_extension } else { 0 },
+        coarse_cfo_i: if phy.ie2_present { phy.ie2_coarse_cfo_i } else { 0 },
+        coarse_cfo_q: if phy.ie2_present { phy.ie2_coarse_cfo_q } else { 0 },
+        fine_cfo_i: if phy.ie2_present { phy.ie2_fine_cfo_i } else { 0 },
+        fine_cfo_q: if phy.ie2_present { phy.ie2_fine_cfo_q } else { 0 },
+        est_cmped_phase: if phy.ie2_present { phy.ie2_est_cmped_phase } else { 0 },
+        n_ltf: if phy.ie2_present { phy.ie2_n_ltf } else { 0 },
+        n_sym: if phy.ie2_present { phy.ie2_n_sym } else { 0 },
+        // Per-path IE4-7
+        path_sig_val: phy.ie_path_sig_val,
+        path_rf_gain_idx: phy.ie_path_rf_gain_idx,
+        path_tia_gain_idx: phy.ie_path_tia_gain_idx,
+        path_snr: phy.ie_path_snr,
+        path_evm: phy.ie_path_evm,
+        path_ant_weight: phy.ie_path_ant_weight,
+        path_dc_re: phy.ie_path_dc_re,
+        path_dc_im: phy.ie_path_dc_im,
+        // Derived SNR
+        snr_fd_avg,
+        snr_fd,
+        snr_td,
+    }
+}
+
+/// Evict a pending frame from a slot, returning it with rssi=0.
+fn evict_slot(slot: &mut PendingFrame) -> RxFrame {
+    let frame = RxFrame {
+        data: std::mem::take(&mut slot.data),
+        channel: slot.channel,
+        band: slot.band,
+        data_rate: slot.data_rate,
+        ppdu_type: ppdu_type_from_raw(slot.ppdu_type),
+        bandwidth: RxBandwidth::from_raw(slot.bw),
+        gi_ltf: GuardInterval::from_raw(slot.gi_ltf),
+        timestamp: Duration::from_micros(slot.freerun_cnt as u64),
+        is_ampdu: slot.is_ampdu,
+        is_amsdu: slot.is_amsdu,
+        ..Default::default()
+    };
+    slot.occupied = false;
+    frame
+}
+
+/// Convert raw ppdu_type value to PpduType enum.
+fn ppdu_type_from_raw(raw: u8) -> PpduType {
+    match raw {
+        PPDU_T_LEGACY => PpduType::Ofdm,  // Legacy — could be CCK or OFDM, use OFDM as generic
+        PPDU_T_HT => PpduType::HT,
+        PPDU_T_VHT => PpduType::VhtSu,
+        PPDU_T_HE_SU | PPDU_T_HE_ER_SU => PpduType::HeSu,
+        PPDU_T_HE_MU => PpduType::HeMu,
+        PPDU_T_HE_TB => PpduType::HeTb,
+        _ => PpduType::Cck,
+    }
+}
+
+/// Parse all physts IEs from the IE area (after the 8-byte header).
+fn parse_physts_ies(ie_area: &[u8], phy: &mut PhyStatus) {
+    let mut pos = 0;
+    let mut bitmap: u32 = 0;
+
+    while pos < ie_area.len() {
+        let ie_id = ie_area[pos] & 0x1F;
+
+        // Prevent duplicate IEs
+        if bitmap & (1 << ie_id) != 0 { break; }
+
+        // Determine IE length
+        let ie_len = if (ie_id as usize) < IE_LEN_TABLE.len() && IE_LEN_TABLE[ie_id as usize] != 0xFF {
+            // Fixed length (in 8-byte units → bytes)
+            (IE_LEN_TABLE[ie_id as usize] as usize) * 8
+        } else if pos + 1 < ie_area.len() {
+            // Variable length: 12-bit header
+            let hi3 = ((ie_area[pos] >> 5) & 0x7) as usize;
+            let lo4 = ((ie_area[pos + 1]) & 0xF) as usize;
+            ((lo4 << 3) | hi3) * 8
+        } else {
+            break;
+        };
+
+        if ie_len == 0 || pos + ie_len > ie_area.len() { break; }
+
+        let ie_data = &ie_area[pos..pos + ie_len];
+
+        match ie_id {
+            0 => parse_ie0_cck(ie_data, phy),
+            1 => parse_ie1_ofdm(ie_data, phy),
+            2 => parse_ie2_he(ie_data, phy),
+            // IE3: segment 1 (80+80MHz) — skip for now (20MHz only)
+            4..=7 => parse_ie4_7_path(ie_id - 4, ie_data, phy),
+            // IE8-31: parsed structurally but fields stored as-is
+            // These are less common (channel info, PLCP, debug) —
+            // we walk past them correctly but don't extract every field yet.
+            // The data is still consumed so we don't lose sync.
+            _ => {}
+        }
+
+        bitmap |= 1 << ie_id;
+        pos += ie_len;
+    }
+}
+
+/// Parse IE0 — CCK common (16 bytes)
+fn parse_ie0_cck(data: &[u8], phy: &mut PhyStatus) {
     if data.len() < 16 { return; }
-    // DW0:
-    //   byte 1: rssi_avg_fd (frequency-domain RSSI, supplementary to time-domain)
-    //   byte 2: ch_idx_seg0
-    //   byte 3[3:0]: rxsc, byte 3[7:4]: rx_path_en_bitmap
-    // DW1:
-    //   byte 4: avg_idle_noise_pwr
-    phy.noise_floor = rssi_u81_to_dbm(data[4]);
-    // DW2:
-    //   byte 8[5:0]: avg_snr (6-bit unsigned, 0-63 dB)
-    phy.snr = data[8] & 0x3F;
-    //   byte 11[4]: is_ldpc
-    //   byte 11[6]: is_stbc
-    if data.len() >= 12 {
-        phy.is_ldpc = data[11] & 0x10 != 0;
-        phy.is_stbc = data[11] & 0x40 != 0;
+    phy.ie0_present = true;
+
+    // DW0
+    phy.ie0_pop_idx = (data[0] >> 5) & 0x3;
+    let rpl_l = (data[0] >> 7) & 1;
+    let rpl_m = data[1];
+    phy.ie0_rpl = ((rpl_m as u16) << 1) | (rpl_l as u16);
+    phy.ie0_cca_time = data[2];
+    phy.ie0_antwgt_gain_diff = data[3] & 0x1F;
+    phy.ie0_hw_antsw[0] = (data[3] >> 5) & 1 != 0;
+    phy.ie0_hw_antsw[1] = (data[3] >> 6) & 1 != 0;
+    phy.ie0_hw_antsw[2] = (data[3] >> 7) & 1 != 0;
+
+    // DW1
+    phy.ie0_noise_pwr = data[4];
+    let cfo_l = data[5];
+    let cfo_m = data[6] & 0xF;
+    phy.ie0_cfo = sign_extend_12(((cfo_m as u16) << 8) | (cfo_l as u16));
+    let ccfo_l = (data[6] >> 4) & 0xF;
+    let ccfo_m = data[7];
+    phy.ie0_coarse_cfo = sign_extend_12(((ccfo_m as u16) << 4) | (ccfo_l as u16));
+
+    // DW2
+    phy.ie0_evm_hdr = data[8];
+    phy.ie0_evm_pld = data[9];
+    phy.ie0_sig_len = u16::from_le_bytes([data[10], data[11]]);
+
+    // DW3
+    phy.ie0_antdiv_rslt[0] = data[12] & 1 != 0;
+    phy.ie0_antdiv_rslt[1] = (data[12] >> 1) & 1 != 0;
+    phy.ie0_antdiv_rslt[2] = (data[12] >> 2) & 1 != 0;
+    phy.ie0_antdiv_rslt[3] = (data[12] >> 3) & 1 != 0;
+    phy.ie0_preamble_type = (data[12] >> 4) & 1;
+    phy.ie0_sync_mode = (data[12] >> 5) & 1;
+    phy.ie0_hw_antsw[3] = (data[12] >> 7) & 1 != 0;
+
+    let dagc_a = data[13] & 0x1F;
+    let dagc_b = ((data[13] >> 5) & 0x7) | ((data[14] & 0x3) << 3);
+    let dagc_c = (data[14] >> 2) & 0x1F;
+    let dagc_d = ((data[14] >> 7) & 0x1) | ((data[15] & 0xF) << 1);
+    phy.ie0_dagc = [dagc_a, dagc_b, dagc_c, dagc_d];
+    phy.ie0_rx_path_en = (data[15] >> 4) & 0xF;
+}
+
+/// Parse IE1 — OFDM/HT/VHT/HE common (32 bytes)
+fn parse_ie1_ofdm(data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 24 { return; } // minimum for DW0-DW5
+    phy.ie1_present = true;
+
+    // DW0
+    phy.ie1_pop_idx = (data[0] >> 5) & 0x3;
+    phy.ie1_rssi_avg_fd = data[1];
+    phy.ie1_ch_idx = data[2];
+    phy.ie1_rxsc = data[3] & 0xF;
+    phy.ie1_rx_path_en = (data[3] >> 4) & 0xF;
+
+    // DW1
+    phy.ie1_noise_pwr = data[4];
+    let cfo_l = data[5];
+    let cfo_m = data[6] & 0xF;
+    phy.ie1_cfo = sign_extend_12(((cfo_m as u16) << 8) | (cfo_l as u16));
+    let pcfo_l = (data[6] >> 4) & 0xF;
+    let pcfo_m = data[7];
+    phy.ie1_cfo_preamble = sign_extend_12(((pcfo_m as u16) << 4) | (pcfo_l as u16));
+
+    // DW2
+    phy.ie1_snr = data[8] & 0x3F;
+    phy.ie1_evm_max = data[9];
+    phy.ie1_evm_min = data[10];
+    phy.ie1_gi_type = data[11] & 0x7;
+    phy.ie1_is_su = (data[11] >> 3) & 1 != 0;
+    phy.ie1_is_ldpc = (data[11] >> 4) & 1 != 0;
+    phy.ie1_is_ndp = (data[11] >> 5) & 1 != 0;
+    phy.ie1_is_stbc = (data[11] >> 6) & 1 != 0;
+    phy.ie1_grant_bt = (data[11] >> 7) & 1 != 0;
+
+    // DW3
+    phy.ie1_bf_gain_max = data[12] & 0x7F;
+    phy.ie1_is_awgn = (data[12] >> 7) & 1 != 0;
+    phy.ie1_is_bf = data[13] & 1 != 0;
+    phy.ie1_avg_cn = (data[13] >> 1) & 0x7F;
+    phy.ie1_sigval_below_th_cnt = data[14];
+    phy.ie1_cn_excess_th_cnt = data[15];
+
+    // DW4
+    phy.ie1_pwr_to_cca = u16::from_le_bytes([data[16], data[17]]);
+    phy.ie1_cca_to_agc = data[18];
+    phy.ie1_cca_to_sbd = data[19];
+
+    // DW5
+    phy.ie1_edcca_rpt_cnt = (data[20] >> 1) & 0x7F;
+    phy.ie1_edcca_total_smp_cnt = data[21] & 0x7F;
+    let bw_max_l = (data[21] >> 7) & 1;
+    let bw_max_m = data[22] & 0x3F;
+    phy.ie1_edcca_bw_max = (bw_max_m << 1) | bw_max_l;
+    let bw_min_l = (data[22] >> 6) & 0x3;
+    let bw_min_m = data[23] & 0x1F;
+    phy.ie1_edcca_bw_min = (bw_min_m << 2) | bw_min_l;
+    phy.ie1_bw_idx = (data[23] >> 5) & 0x7;
+}
+
+/// Parse IE2 — HE/AX extended (24 bytes)
+fn parse_ie2_he(data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 16 { return; }
+    phy.ie2_present = true;
+
+    // DW0
+    phy.ie2_max_nsts = (data[0] >> 5) & 0x7;
+    phy.ie2_midamble = data[1] & 1 != 0;
+    phy.ie2_ltf_type = (data[1] >> 1) & 0x3;
+    phy.ie2_gi = (data[1] >> 3) & 0x3;
+    phy.ie2_is_mu_mimo = (data[1] >> 5) & 1 != 0;
+    // Coarse CFO I: 18-bit signed spread across bytes 1-3
+    let c_cfo_i_l = ((data[1] >> 6) & 0x3) as u32;
+    let c_cfo_i_m2 = data[2] as u32;
+    let c_cfo_i_m1 = data[3] as u32;
+    let c_cfo_i_raw = (c_cfo_i_m1 << 10) | (c_cfo_i_m2 << 2) | c_cfo_i_l;
+    phy.ie2_coarse_cfo_i = sign_extend_18(c_cfo_i_raw);
+
+    // DW1
+    phy.ie2_is_dl_ofdma = (data[5] >> 5) & 1 != 0;
+    let c_cfo_q_l = ((data[5] >> 6) & 0x3) as u32;
+    let c_cfo_q_m2 = data[6] as u32;
+    let c_cfo_q_m1 = data[7] as u32;
+    let c_cfo_q_raw = (c_cfo_q_m1 << 10) | (c_cfo_q_m2 << 2) | c_cfo_q_l;
+    phy.ie2_coarse_cfo_q = sign_extend_18(c_cfo_q_raw);
+
+    // DW2
+    phy.ie2_est_cmped_phase = data[8];
+    phy.ie2_is_dcm = data[9] & 1 != 0;
+    phy.ie2_is_doppler = (data[9] >> 1) & 1 != 0;
+    phy.ie2_pkt_extension = (data[9] >> 2) & 0x7;
+    let f_cfo_i_l = ((data[9] >> 6) & 0x3) as u32;
+    let f_cfo_i_m2 = data[10] as u32;
+    let f_cfo_i_m1 = data[11] as u32;
+    let f_cfo_i_raw = (f_cfo_i_m1 << 10) | (f_cfo_i_m2 << 2) | f_cfo_i_l;
+    phy.ie2_fine_cfo_i = sign_extend_18(f_cfo_i_raw);
+
+    // DW3
+    phy.ie2_n_ltf = data[12] & 0x7;
+    let n_sym_l = ((data[12] >> 3) & 0x1F) as u16;
+    let n_sym_m = (data[13] & 0x3F) as u16;
+    phy.ie2_n_sym = (n_sym_m << 5) | n_sym_l;
+    let f_cfo_q_l = ((data[13] >> 6) & 0x3) as u32;
+    let f_cfo_q_m2 = data[14] as u32;
+    let f_cfo_q_m1 = data[15] as u32;
+    let f_cfo_q_raw = (f_cfo_q_m1 << 10) | (f_cfo_q_m2 << 2) | f_cfo_q_l;
+    phy.ie2_fine_cfo_q = sign_extend_18(f_cfo_q_raw);
+}
+
+/// Parse IE4-7 — per-path stats (8 bytes each)
+fn parse_ie4_7_path(path: u8, data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 8 { return; }
+    let p = path as usize;
+    if p >= 4 { return; }
+    phy.ie_path_present[p] = true;
+
+    // DW0
+    phy.ie_path_sig_val[p] = data[1];
+    phy.ie_path_rf_gain_idx[p] = data[2];
+    phy.ie_path_tia_gain_idx[p] = data[3] & 1;
+    phy.ie_path_snr[p] = (data[3] >> 2) & 0x3F;
+
+    // DW1
+    phy.ie_path_evm[p] = data[4];
+    phy.ie_path_ant_weight[p] = data[5] & 0x7F;
+    phy.ie_path_dc_re[p] = data[6];
+    phy.ie_path_dc_im[p] = data[7];
+}
+
+/// Sign-extend a 12-bit value to i16.
+fn sign_extend_12(val: u16) -> i16 {
+    if val & 0x800 != 0 {
+        (val | 0xF000) as i16
+    } else {
+        val as i16
     }
-    // DW3:
-    //   byte 12[0]: is_bf (after bf_gain_max[6:0] and is_awgn)
-    //   Actually: byte 13[0]: is_bf, byte 13[7:1]: avg_cn_seg0
-    if data.len() >= 14 {
-        phy.is_bf = data[13] & 0x01 != 0;
+}
+
+/// Sign-extend an 18-bit value to i32.
+fn sign_extend_18(val: u32) -> i32 {
+    if val & 0x20000 != 0 {
+        (val | 0xFFFC0000) as i32
+    } else {
+        val as i32
     }
 }
 
@@ -739,39 +1451,22 @@ pub struct Rtl8852au {
     ep_out: u8,
     ep_in: u8,
     ep_fw: u8,  // EP7 — firmware download bulk OUT
-    channel: u8,
+    /// Current channel — Arc<AtomicU8> so the RX pipeline parser thread
+    /// can read it without locking the driver.
+    channel: Arc<AtomicU8>,
+    /// Stream pipeline stats — shared with pipeline threads, readable from outside.
+    pipeline_stats: Arc<StreamPipelineStats>,
     mac_addr: MacAddress,
     h2c_seq: u16,
     rx_buf: Vec<u8>,
     rx_pos: usize,
     rx_len: usize,
-    rx_queue: Vec<RxFrame>,
-    /// Per-source-MAC RSSI cache — like Linux's STA_UPDATE_MA_RSSI.
-    /// When PPDU correlation succeeds, cache the RSSI by source MAC.
-    /// When correlation fails (rssi=0), fill from cache.
-    rssi_cache: std::collections::HashMap<[u8; 6], i8>,
     channels: Vec<Channel>,
     vid: u16,
     pid: u16,
     fw_version: String,
-    ppdu_cache: PpduStatusCache,
 }
 
-/// Standalone parse function for RxHandle — uses thread-local PPDU cache.
-fn parse_rx_packet_standalone(buf: &[u8], channel: u8) -> (usize, crate::core::chip::ParsedPacket) {
-    thread_local! {
-        static PPDU_CACHE: std::cell::RefCell<PpduStatusCache> =
-            std::cell::RefCell::new(PpduStatusCache::new());
-    }
-    PPDU_CACHE.with(|cache| {
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(buf, channel, &mut cache.borrow_mut());
-        let packet = match frame {
-            Some(f) => crate::core::chip::ParsedPacket::Frame(f),
-            None => crate::core::chip::ParsedPacket::Skip,
-        };
-        (consumed, packet)
-    })
-}
 
 /// RTL8852AU capability flags — WiFi 6 with HE support
 const RTL8852AU_CAPS: ChipCaps = ChipCaps::MONITOR.union(ChipCaps::INJECT)
@@ -781,6 +1476,13 @@ const RTL8852AU_CAPS: ChipCaps = ChipCaps::MONITOR.union(ChipCaps::INJECT)
 
 impl Rtl8852au {
     // ══════════════════════════════════════════════════════════════════════════
+    //  Accessors for diagnostic tools
+    // ══════════════════════════════════════════════════════════════════════════
+
+    pub fn usb_handle(&self) -> Arc<DeviceHandle<GlobalContext>> { Arc::clone(&self.handle) }
+    pub fn bulk_in_ep(&self) -> u8 { self.ep_in }
+    pub fn pipeline_stats(&self) -> Arc<StreamPipelineStats> { Arc::clone(&self.pipeline_stats) }
+
     //  USB open
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -826,19 +1528,17 @@ impl Rtl8852au {
             ep_out,
             ep_in,
             ep_fw,
-            channel: 0,
+            channel: Arc::new(AtomicU8::new(0)),
+            pipeline_stats: Arc::new(StreamPipelineStats::new()),
             mac_addr: MacAddress::ZERO,
             h2c_seq: 0,
             rx_buf: vec![0u8; RX_BUF_SIZE],
             rx_pos: 0,
             rx_len: 0,
-            rx_queue: Vec::with_capacity(64),
-            rssi_cache: std::collections::HashMap::with_capacity(2048),
             channels: build_channel_list(),
             vid,
             pid,
             fw_version: String::new(),
-            ppdu_cache: PpduStatusCache::new(),
         };
 
         Ok((driver, endpoints))
@@ -2074,7 +2774,7 @@ impl Rtl8852au {
         // fully reset and TSSI is re-enabled.
         self.set_reg_bb(0x20FC, 0xFF000000, 0x0)?;
 
-        self.channel = ch;
+        self.channel.store(ch, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2317,7 +3017,7 @@ impl Rtl8852au {
 
         // ── Read MAC from EFUSE autoload registers ──
         self.read_mac_address()?;
-        self.channel = 149; // pcap was on ch149
+        self.channel.store(149, Ordering::Relaxed); // pcap was on ch149
 
         Ok(())
     }
@@ -2460,246 +3160,14 @@ impl Rtl8852au {
         Ok((reg_writes, reg_reads, ep7_sent, ep5_sent))
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  RX frame parsing — MAC AX descriptor format
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// Parse one RX packet from the USB bulk transfer buffer.
-    ///
-    /// Handles all rpkt_type values from rxdesc.h:
-    ///   0 = WiFi frame → returned as RxFrame with PHY info from PPDU correlation
-    ///   1 = PPDU status → parsed and stored in cache for correlation
-    ///   2-14 = other (CH_INFO, TXRPT, C2H, etc.) → consumed and skipped
-    ///
-    /// DW1 fields parsed for WiFi frames: ppdu_type, ppdu_cnt, rx_datarate, rx_gi_ltf, bw.
-    /// DW3 fields parsed: crc32, ampdu, amsdu.
-    pub(crate) fn parse_rx_packet(
-        buf: &[u8],
-        channel: u8,
-        ppdu_cache: &mut PpduStatusCache,
-    ) -> (usize, Option<RxFrame>) {
-        if buf.len() < RX_DESC_SHORT {
-            return (0, None);
-        }
-
-        // ── DW0 ──
-        let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let pkt_len = (dw0 & 0x3FFF) as usize;
-        let shift = ((dw0 >> 14) & 0x3) as usize * 2;
-        let mac_info_vld = (dw0 >> 23) & 1 != 0;
-        let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
-        let drv_info_size = ((dw0 >> 28) & 0x7) as usize * 8;
-        let long_rxd = (dw0 >> 31) & 1 != 0;
-
-        let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
-
-        // ── Non-WiFi packets ──
-        if rpkt_type != RPKT_TYPE_WIFI {
-            // PPDU status packets need special handling for mac_info_extra:
-            // rpkt_type=1 never has mac_info_extra regardless of mac_info_vld
-            let mac_info_extra = if mac_info_vld && rpkt_type != RPKT_TYPE_PPDU { 4 } else { 0 };
-            let total = desc_len + shift + drv_info_size + mac_info_extra + pkt_len;
-            let consumed = if total > 0 { (total + 7) & !7 } else { desc_len };
-            if consumed > buf.len() { return (0, None); }
-
-            // ── PPDU debug counters ──
-            thread_local! {
-                static PPDU_STATS: std::cell::RefCell<PpduDebugStats> =
-                    std::cell::RefCell::new(PpduDebugStats::default());
-            }
-            PPDU_STATS.with(|s| {
-                let mut s = s.borrow_mut();
-                s.total_non_wifi += 1;
-                s.rpkt_type_counts[rpkt_type as usize & 0xF] += 1;
-                if rpkt_type == RPKT_TYPE_PPDU {
-                    s.ppdu_received += 1;
-                }
-                // Dump every 5000 packets
-                if s.total_non_wifi % 5000 == 0 {
-                    s.dump();
-                }
-            });
-
-            // Parse PPDU status packets — this is where RSSI/SNR/LDPC/STBC live
-            if rpkt_type == RPKT_TYPE_PPDU && buf.len() >= desc_len + 4 {
-                // DW1 for ppdu_cnt
-                let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                let ppdu_cnt = ((dw1 >> 4) & 0x7) as u8;
-
-                // The PHY status (physts) is after the descriptor.
-                // For short desc: at offset 16 + shift. For long desc: at offset 32 + shift.
-                // drv_info (if any) comes first, then pkt_len bytes of PPDU payload.
-                let physts_off = desc_len + shift;
-                let physts_len = drv_info_size + pkt_len;
-
-                if physts_len >= 8 && buf.len() >= physts_off + physts_len {
-                    if let Some(phy) = parse_ppdu_payload(
-                        &buf[physts_off..physts_off + physts_len],
-                        mac_info_vld,
-                    ) {
-                        PPDU_STATS.with(|s| {
-                            let mut s = s.borrow_mut();
-                            s.ppdu_parsed += 1;
-                            if phy.rssi_avg != 0 {
-                                s.ppdu_with_rssi += 1;
-                                s.last_rssi = phy.rssi_avg;
-                                // Record raw byte that produced this dBm value
-                                let raw = ((phy.rssi_avg as i16 + 110) * 2).clamp(0, 255) as u8;
-                                s.raw_rssi_hist[raw as usize] += 1;
-                                let idx = s.last_raw_idx % 10;
-                                s.last_raw[idx] = raw;
-                                s.last_raw_idx += 1;
-                            }
-                        });
-                        // store_ppdu may return a completed frame if a pending WiFi frame matches
-                        if let Some(completed) = ppdu_cache.store_ppdu(ppdu_cnt, phy) {
-                            PPDU_STATS.with(|s| s.borrow_mut().ppdu_correlated += 1);
-                            return (consumed, Some(completed));
-                        } else {
-                            PPDU_STATS.with(|s| s.borrow_mut().ppdu_no_match += 1);
-                        }
-                    } else {
-                        PPDU_STATS.with(|s| s.borrow_mut().ppdu_parse_fail += 1);
-                    }
-                } else {
-                    PPDU_STATS.with(|s| s.borrow_mut().ppdu_too_short += 1);
-                }
-            }
-
-            return (consumed, None);
-        }
-
-        // ── WiFi packet (rpkt_type=0) ──
-
-        if buf.len() < desc_len {
-            return (0, None);
-        }
-
-        // ── DW1 — rate/type/bandwidth (free data, just read it) ──
-        let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let ppdu_type_raw = (dw1 & 0xF) as u8;
-        let ppdu_cnt = ((dw1 >> 4) & 0x7) as u8;
-        let data_rate = ((dw1 >> 16) & 0x1FF) as u16;
-        let gi_ltf_raw = ((dw1 >> 25) & 0x7) as u8;
-        let bw_raw = ((dw1 >> 30) & 0x3) as u8;
-
-        // ── DW2 — freerun counter (timestamp) ──
-        let tsfl = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-
-        // ── DW3 — CRC, AMPDU, AMSDU ──
-        let dw3 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let crc_err = (dw3 >> 9) & 1 != 0;
-        let is_ampdu = (dw3 >> 3) & 1 != 0;
-        let is_amsdu = (dw3 >> 5) & 1 != 0;
-
-        // Calculate payload offset
-        let mac_info_extra = if mac_info_vld { 4 } else { 0 };
-        let data_off = desc_len + shift + drv_info_size + mac_info_extra;
-        let total = data_off + pkt_len;
-
-        if pkt_len == 0 || total > buf.len() {
-            return (0, None);
-        }
-
-        let consumed = (total + 7) & !7;
-
-        // Strip FCS (4 bytes)
-        let frame_len = if pkt_len >= 4 { pkt_len - 4 } else { 0 };
-
-        if crc_err || frame_len == 0 {
-            return (consumed, None);
-        }
-
-        let data = buf[data_off..data_off + frame_len].to_vec();
-
-        // ── Build WiFi frame with DW1 fields populated ──
-        let drv_info_off = desc_len + shift;
-        let mut frame = RxFrame {
-            data,
-            rssi: 0, // will be filled by PPDU correlation
-            channel,
-            band: if channel <= 14 { 0 } else { 1 },
-            timestamp: Duration::from_micros(tsfl as u64),
-            data_rate,
-            ppdu_type: PpduType::from_raw(ppdu_type_raw),
-            bandwidth: RxBandwidth::from_raw(bw_raw),
-            gi_ltf: GuardInterval::from_raw(gi_ltf_raw),
-            is_ampdu,
-            is_amsdu,
-            ..Default::default()
-        };
-
-        // Some WiFi frames carry inline physts in drv_info (when drv_info_size > 0)
-        if drv_info_size >= 8 && buf.len() >= drv_info_off + drv_info_size {
-            if let Some(phy) = parse_physts_header(&buf[drv_info_off..drv_info_off + drv_info_size]) {
-                PpduStatusCache::apply_phy_to_frame(&mut frame, &phy);
-            }
-        }
-
-        // If we have inline RSSI, return immediately — no need for PPDU correlation
-        if frame.rssi != 0 {
-            return (consumed, Some(frame));
-        }
-
-        // No inline RSSI — check if pre-stored PPDU status exists for this ppdu_cnt
-        if let Some(phy) = ppdu_cache.lookup(ppdu_cnt) {
-            PpduStatusCache::apply_phy_to_frame(&mut frame, phy);
-            // Clear the slot
-            let idx = (ppdu_cnt & 0x7) as usize;
-            ppdu_cache.phy_slots[idx].valid = false;
-            return (consumed, Some(frame));
-        }
-
-        // No RSSI available yet — store as pending, wait for PPDU status
-        // If there was a previous pending frame, return it now (it missed its PPDU)
-        let old_pending = ppdu_cache.store_pending(ppdu_cnt, frame);
-
-        // Track WiFi frames with/without RSSI for debugging
-        thread_local! {
-            static WIFI_STATS: std::cell::RefCell<(u64, u64, u64)> =
-                std::cell::RefCell::new((0, 0, 0)); // (total, with_rssi, inline_rssi)
-        }
-        WIFI_STATS.with(|s| {
-            let mut s = s.borrow_mut();
-            s.0 += 1;
-            if let Some(ref f) = old_pending {
-                if f.rssi != 0 { s.1 += 1; }
-            }
-        });
-
-        (consumed, old_pending)
-    }
-
-    /// Apply per-source-MAC RSSI cache — like Linux's STA_UPDATE_MA_RSSI.
-    /// If PPDU gave us RSSI → cache it. If RSSI=0 → fill from cache.
-    fn apply_rssi_cache(&mut self, frame: &mut RxFrame) {
-        if frame.data.len() < 16 { return; }
-        // Source MAC is at offset 10 in 802.11 header (addr2)
-        let src = [frame.data[10], frame.data[11], frame.data[12],
-                   frame.data[13], frame.data[14], frame.data[15]];
-        if src == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] { return; }
-
-        if frame.rssi != 0 {
-            // Good RSSI from PPDU — cache it
-            self.rssi_cache.insert(src, frame.rssi);
-        } else if let Some(&cached) = self.rssi_cache.get(&src) {
-            // No RSSI — fill from cache
-            frame.rssi = cached;
-        }
-    }
-
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
-        // Try parsing from existing buffer
+        // Parse from existing buffer
         while self.rx_pos < self.rx_len {
             let remaining = &self.rx_buf[self.rx_pos..self.rx_len];
-            let (consumed, frame) = Self::parse_rx_packet(remaining, self.channel, &mut self.ppdu_cache);
-            if consumed == 0 {
-                self.rx_pos = self.rx_len;
-                break;
-            }
+            let (consumed, packet) = parse_rx_packet_8852au(remaining, self.channel.load(Ordering::Relaxed));
+            if consumed == 0 { self.rx_pos = self.rx_len; break; }
             self.rx_pos += consumed;
-            if let Some(mut f) = frame {
-                self.apply_rssi_cache(&mut f);
+            if let crate::core::chip::ParsedPacket::Frame(f) = packet {
                 return Ok(Some(f));
             }
         }
@@ -2711,24 +3179,15 @@ impl Rtl8852au {
                 rusb::Error::Timeout => Error::RxTimeout,
                 other => Error::Usb(other),
             })?;
-
-        // Clear stale PPDU slots between buffers
-        self.ppdu_cache.clear_slots();
-
         self.rx_len = actual;
         self.rx_pos = 0;
 
-        // Parse packets from new transfer
         while self.rx_pos < self.rx_len {
             let remaining = &self.rx_buf[self.rx_pos..self.rx_len];
-            let (consumed, frame) = Self::parse_rx_packet(remaining, self.channel, &mut self.ppdu_cache);
-            if consumed == 0 {
-                self.rx_pos = self.rx_len;
-                break;
-            }
+            let (consumed, packet) = parse_rx_packet_8852au(remaining, self.channel.load(Ordering::Relaxed));
+            if consumed == 0 { self.rx_pos = self.rx_len; break; }
             self.rx_pos += consumed;
-            if let Some(mut f) = frame {
-                self.apply_rssi_cache(&mut f);
+            if let crate::core::chip::ParsedPacket::Frame(f) = packet {
                 return Ok(Some(f));
             }
         }
@@ -2937,7 +3396,24 @@ impl ChipDriver for Rtl8852au {
 
     fn set_monitor_mode(&mut self) -> Result<()> {
         // Monitor mode is configured by init's pcap replay (RX_FLTR = 0x031644BF).
-        // No additional setup needed — calling the old hand-coded path breaks RX.
+
+        // Read current RXAGG state for diagnostics
+        let before = self.read32(R_AX_RXAGG_0).unwrap_or(0);
+        let rxdma_before = self.read32(R_AX_RXDMA_SETTING).unwrap_or(0);
+        eprintln!("  RXAGG_0 before: 0x{:08X} (agg_en={})", before, (before >> 31) & 1);
+        eprintln!("  RXDMA   before: 0x{:08X}", rxdma_before);
+
+        // Enable RX aggregation — full register set from Linux driver.
+        // 0x8900: RXAGG_EN=1, PKTNUM_TH=32, TIMEOUT=320μs, LEN=8KB
+        self.write32(R_AX_RXAGG_0, 0x80202020)?;
+        // 0x8908: RXDMA — burst settings for aggregation
+        self.write32(R_AX_RXDMA_SETTING, 0x00046F00)?;
+
+        let after = self.read32(R_AX_RXAGG_0).unwrap_or(0);
+        let rxdma_after = self.read32(R_AX_RXDMA_SETTING).unwrap_or(0);
+        eprintln!("  RXAGG_0 after:  0x{:08X} (agg_en={})", after, (after >> 31) & 1);
+        eprintln!("  RXDMA   after:  0x{:08X}", rxdma_after);
+
         Ok(())
     }
 
@@ -2975,15 +3451,271 @@ impl ChipDriver for Rtl8852au {
         Duration::from_millis(10)
     }
 
-    fn take_rx_handle(&mut self) -> Option<crate::core::chip::RxHandle> {
-        Some(crate::core::chip::RxHandle {
-            device: Arc::clone(&self.handle),
-            ep_in: self.ep_in,
-            rx_buf_size: RX_BUF_SIZE,
-            parse_fn: parse_rx_packet_standalone,
-            driver_msg_tx: None,
-        })
+    fn start_rx_pipeline(
+        &mut self,
+        gate: crate::pipeline::FrameGate,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        start_rx_pipeline_8852au(
+            Arc::clone(&self.handle),
+            self.ep_in,
+            Arc::clone(&self.channel),
+            Arc::clone(&self.pipeline_stats),
+            gate,
+            alive,
+        );
+        true
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  RX Pipeline — driver-managed stream parser
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  Two threads:
+//
+//    [rx-usb-reader]  USB bulk IN → raw Vec<u8> chunks → mpsc channel
+//    [rx-stream-parser]  mpsc → VecDeque stream → detect frame boundaries →
+//                         parse_rx_packet_8852au → FrameGate.submit()
+//
+//  The USB reader thread does ONE thing: read bulk IN as fast as possible and
+//  send the raw bytes downstream. No parsing, no interpretation, just read and
+//  forward. This keeps the USB endpoint drained at maximum speed.
+//
+//  The stream parser thread accumulates raw bytes into a VecDeque (the continuous
+//  stream). It reads DW0 of each packet to determine the total length, waits
+//  until enough bytes have accumulated for the complete packet, slices it out,
+//  and feeds it through parse_rx_packet_8852au (which handles all 11 rpkt_types:
+//  WiFi frames, PPDU status, C2H, TX reports, DFS, channel info, etc.).
+//
+//  The parser produces clean RxFrame structs (with RSSI from PPDU correlation)
+//  and submits them to the FrameGate — identical output to any other driver.
+
+/// USB bulk read timeout — long so the controller aggregates data.
+/// The chip delivers frames as they arrive, we just block until there's data.
+const STREAM_USB_TIMEOUT: Duration = Duration::from_millis(100);
+
+use std::sync::atomic::AtomicU64;
+
+/// Counters for the stream RX pipeline — shared between pipeline threads and the driver.
+/// All fields are atomic so they can be read from any thread without locking.
+pub struct StreamPipelineStats {
+    // ── USB reader thread ──
+    /// Total USB bulk reads that returned data.
+    pub usb_reads: AtomicU64,
+    /// Total bytes read from USB.
+    pub usb_bytes: AtomicU64,
+
+    // ── Stream slicer ──
+    /// Complete packets sliced from the stream.
+    pub packets_sliced: AtomicU64,
+    /// Times we waited for more data (packet spanned USB reads).
+    pub incomplete_waits: AtomicU64,
+    /// Empty descriptors skipped (pkt_len == 0).
+    pub empty_descriptors: AtomicU64,
+    /// Peak stream buffer size in bytes.
+    pub peak_stream_bytes: AtomicU64,
+    /// Total DW0 inspections — every time we read a DW0 to check packet size.
+    /// dw0_inspected - packets_sliced - empty_descriptors = incomplete (not enough data).
+    pub dw0_inspected: AtomicU64,
+
+    // ── Parser output by rpkt_type ──
+    /// WiFi frames (rpkt_type=0) seen by parser.
+    pub rpkt_wifi: AtomicU64,
+    /// PPDU status packets (rpkt_type=1).
+    pub rpkt_ppdu: AtomicU64,
+    /// C2H firmware responses (rpkt_type=10).
+    pub rpkt_c2h: AtomicU64,
+    /// TX reports (rpkt_type=6).
+    pub rpkt_tx_rpt: AtomicU64,
+    /// Other rpkt_types (channel info, DFS, etc).
+    pub rpkt_other: AtomicU64,
+
+    // ── Final output ──
+    /// Frames submitted to FrameGate (with RSSI from PPDU match).
+    pub frames_submitted: AtomicU64,
+    /// Frames evicted without PPDU match (rssi=0).
+    pub frames_evicted: AtomicU64,
+    /// Skipped packets (CRC errors, empty, etc).
+    pub skipped: AtomicU64,
+}
+
+/// Global access to the last created pipeline stats (for diagnostic binaries).
+/// Set by start_rx_pipeline, read by test binaries via get_pipeline_stats().
+static PIPELINE_STATS: std::sync::Mutex<Option<Arc<StreamPipelineStats>>> = std::sync::Mutex::new(None);
+
+/// Get the pipeline stats for the currently running 8852AU stream pipeline.
+/// Returns None if no pipeline is active.
+pub fn get_pipeline_stats() -> Option<Arc<StreamPipelineStats>> {
+    PIPELINE_STATS.lock().ok()?.clone()
+}
+
+impl StreamPipelineStats {
+    fn new() -> Self {
+        Self {
+            usb_reads: AtomicU64::new(0),
+            usb_bytes: AtomicU64::new(0),
+            packets_sliced: AtomicU64::new(0),
+            incomplete_waits: AtomicU64::new(0),
+            empty_descriptors: AtomicU64::new(0),
+            peak_stream_bytes: AtomicU64::new(0),
+            dw0_inspected: AtomicU64::new(0),
+            rpkt_wifi: AtomicU64::new(0),
+            rpkt_ppdu: AtomicU64::new(0),
+            rpkt_c2h: AtomicU64::new(0),
+            rpkt_tx_rpt: AtomicU64::new(0),
+            rpkt_other: AtomicU64::new(0),
+            frames_submitted: AtomicU64::new(0),
+            frames_evicted: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Start the driver-managed RX pipeline.
+///
+/// Thread 1: reads USB endpoint, writes raw bytes into a pipe.
+/// Thread 2: reads the pipe as a continuous byte stream, slices frames,
+///           calls the parser, submits results to FrameGate.
+fn start_rx_pipeline_8852au(
+    device: Arc<DeviceHandle<GlobalContext>>,
+    ep_in: u8,
+    channel: Arc<AtomicU8>,
+    stats: Arc<StreamPipelineStats>,
+    gate: crate::pipeline::FrameGate,
+    alive: Arc<AtomicBool>,
+) {
+    if let Ok(mut global) = PIPELINE_STATS.lock() {
+        *global = Some(Arc::clone(&stats));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    // ── Thread 1: USB reader — reads endpoint, sends each read ──
+    let device_clone = Arc::clone(&device);
+    let alive_reader = Arc::clone(&alive);
+    let stats_reader = Arc::clone(&stats);
+    thread::Builder::new()
+        .name("rx-usb-reader".into())
+        .spawn(move || {
+            use std::io::Write;
+            let mut buf = vec![0u8; RX_BUF_SIZE];
+            let mut log = std::fs::OpenOptions::new()
+                .create(true).write(true).truncate(true)
+                .open("/tmp/wifikit_usb_reads.log").ok();
+            let mut read_num = 0u64;
+            const LOG_READS: u64 = 200;
+
+            loop {
+                if !alive_reader.load(Ordering::SeqCst) { break; }
+                let actual = match device_clone.read_bulk(ep_in, &mut buf, STREAM_USB_TIMEOUT) {
+                    Ok(n) if n > 0 => n,
+                    Ok(_) => continue,
+                    Err(rusb::Error::Timeout | rusb::Error::Interrupted) => continue,
+                    Err(_) => break,
+                };
+                read_num += 1;
+                stats_reader.usb_reads.fetch_add(1, Ordering::Relaxed);
+                stats_reader.usb_bytes.fetch_add(actual as u64, Ordering::Relaxed);
+
+                if read_num <= LOG_READS {
+                    if let Some(ref mut f) = log {
+                        let _ = writeln!(f, "\n\u{2550}\u{2550} USB READ #{} \u{2014} {} bytes \u{2550}\u{2550}", read_num, actual);
+                        let mut p = 0;
+                        while p < actual {
+                            let end = (p + 16).min(actual);
+                            let hex: String = buf[p..end].iter()
+                                .map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                            let ascii: String = buf[p..end].iter()
+                                .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '.' })
+                                .collect();
+                            let _ = writeln!(f, "  {:04X}: {:<48} |{}|", p, hex, ascii);
+                            p += 16;
+                        }
+                    }
+                }
+
+                if tx.send(buf[..actual].to_vec()).is_err() { break; }
+            }
+        })
+        .expect("failed to spawn rx-usb-reader thread");
+
+    // ── Thread 2: Per-read parser — each USB read is self-contained ──
+    let stats_parser = Arc::clone(&stats);
+    thread::Builder::new()
+        .name("rx-per-read-parser".into())
+        .spawn(move || {
+            for read_buf in rx.iter() {
+                let actual = read_buf.len();
+                let mut pos = 0;
+
+                while pos + 4 <= actual {
+                    stats_parser.dw0_inspected.fetch_add(1, Ordering::Relaxed);
+                    let dw0 = u32::from_le_bytes([
+                        read_buf[pos], read_buf[pos+1], read_buf[pos+2], read_buf[pos+3],
+                    ]);
+                    let pkt_len = (dw0 & 0x3FFF) as usize;
+                    let shift = ((dw0 >> 14) & 0x3) as usize;
+                    let long_rxd = (dw0 >> 31) & 1 != 0;
+                    let drv_info_size = ((dw0 >> 28) & 0x7) as usize;
+                    let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
+                    let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
+
+                    if pkt_len == 0 {
+                        if pos + desc_len > actual { break; }
+                        stats_parser.empty_descriptors.fetch_add(1, Ordering::Relaxed);
+                        pos += desc_len;
+                        continue;
+                    }
+
+                    let payload_offset = desc_len + (drv_info_size * 8) + (shift * 2);
+                    let total_len = payload_offset + pkt_len;
+                    let consumed = (total_len + 7) & !7;
+
+                    if rpkt_type > 10 || pos + consumed > actual {
+                        // Leftover = padding at end of read, stop
+                        stats_parser.incomplete_waits.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+
+                    let packet = &read_buf[pos..pos + consumed];
+                    stats_parser.packets_sliced.fetch_add(1, Ordering::Relaxed);
+
+                    match rpkt_type {
+                        RPKT_WIFI => stats_parser.rpkt_wifi.fetch_add(1, Ordering::Relaxed),
+                        RPKT_PPDU_STATUS => stats_parser.rpkt_ppdu.fetch_add(1, Ordering::Relaxed),
+                        RPKT_C2H => stats_parser.rpkt_c2h.fetch_add(1, Ordering::Relaxed),
+                        RPKT_TX_RPT => stats_parser.rpkt_tx_rpt.fetch_add(1, Ordering::Relaxed),
+                        _ => stats_parser.rpkt_other.fetch_add(1, Ordering::Relaxed),
+                    };
+
+                    // Parse - retry until parser processes THIS packet
+                    let ch = channel.load(Ordering::Relaxed);
+                    loop {
+                        let (pc, result) = parse_rx_packet_8852au(packet, ch);
+                        match result {
+                            crate::core::chip::ParsedPacket::Frame(frame) => {
+                                if frame.rssi != 0 {
+                                    stats_parser.frames_submitted.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    stats_parser.frames_evicted.fetch_add(1, Ordering::Relaxed);
+                                }
+                                gate.submit(frame);
+                            }
+                            crate::core::chip::ParsedPacket::DriverMessage(_) => {}
+                            crate::core::chip::ParsedPacket::TxStatus(_) => {}
+                            crate::core::chip::ParsedPacket::Skip => {
+                                stats_parser.skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if pc > 0 { break; }
+                    }
+
+                    pos += consumed;
+                }
+            }
+        })
+        .expect("failed to spawn rx-per-read-parser thread");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3017,183 +3749,109 @@ mod tests {
     }
 
     #[test]
-    fn test_rx_descriptor_parsing_short() {
-        // Minimal short RX descriptor (16 bytes) for a non-WiFi packet (C2H)
+    fn test_rx_c2h_returns_driver_message() {
         let mut buf = vec![0u8; 32];
-        // DW0: pkt_len=8, rpkt_type=0xA (C2H), long_rxd=0
-        let dw0: u32 = 8 | (0x0A << 24);
+        let dw0: u32 = 8 | (RPKT_C2H as u32) << 24; // C2H packet, pkt_len=8
+        buf[0..4].copy_from_slice(&dw0.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]); // payload
+        let (consumed, packet) = parse_rx_packet_8852au(&buf, 6);
+        assert!(consumed > 0);
+        assert!(matches!(packet, crate::core::chip::ParsedPacket::DriverMessage(_)));
+    }
+
+    #[test]
+    fn test_rx_bb_scope_returns_skip() {
+        let mut buf = vec![0u8; 32];
+        let dw0: u32 = 8 | (RPKT_BB_SCOPE as u32) << 24; // BB scope, pkt_len=8
         buf[0..4].copy_from_slice(&dw0.to_le_bytes());
         buf.extend_from_slice(&[0u8; 8]);
-        let mut cache = PpduStatusCache::new();
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6, &mut cache);
+        let (consumed, packet) = parse_rx_packet_8852au(&buf, 6);
         assert!(consumed > 0);
-        assert!(frame.is_none()); // C2H should be skipped
+        assert!(matches!(packet, crate::core::chip::ParsedPacket::Skip));
     }
 
     #[test]
-    fn test_rx_descriptor_parsing_wifi_no_drv_info() {
-        // Long RX descriptor (32 bytes) for a WiFi packet, no drv_info
+    fn test_rx_wifi_parks_in_slot() {
+        // WiFi frame should return Skip (parked in slot, waiting for PPDU)
         let frame_data = [
-            0x80, 0x00, // beacon frame control
-            0x00, 0x00, // duration
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // DA (broadcast)
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // SA
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // BSSID
-            0x00, 0x00, // seq ctrl
+            0x80, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00,
         ];
         let pkt_len = frame_data.len() + 4; // +4 for FCS
-
         let mut buf = vec![0u8; 32 + pkt_len];
-        // DW0: pkt_len, rpkt_type=0 (WiFi), drv_info_size=0, long_rxd=1
+        // DW0: pkt_len, long_rxd=1, rpkt_type=0 (WiFi)
         let dw0: u32 = (pkt_len as u32) | (1 << 31);
         buf[0..4].copy_from_slice(&dw0.to_le_bytes());
+        // DW3: no CRC error
         buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        // Frame data at offset 32 (long RXD)
         buf[32..32 + frame_data.len()].copy_from_slice(&frame_data);
 
-        let mut cache = PpduStatusCache::new();
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 6, &mut cache);
+        let (consumed, packet) = parse_rx_packet_8852au(&buf, 6);
         assert!(consumed > 0);
-        // WiFi frame with no RSSI goes to pending (indexed by ppdu_cnt from DW1)
-        assert!(frame.is_none());
-        // The frame is in pending_frames slot — send a matching PPDU or check store_pending eviction
-        // With no PPDU, the frame stays pending. A second frame to same ppdu_cnt slot evicts it.
-        let ppdu_cnt = 0u8; // DW1 was 0 → ppdu_cnt = 0
-        let dummy_frame = RxFrame { data: vec![0x80, 0x00], channel: 1, ..Default::default() };
-        let evicted = cache.store_pending(ppdu_cnt, dummy_frame);
-        let f = evicted.unwrap();
-        assert_eq!(f.data.len(), frame_data.len());
-        assert_eq!(f.channel, 6);
-        assert_eq!(f.rssi, 0); // no drv_info and no PPDU correlation → 0
+        // WiFi frame is parked in slot — returns Skip, awaiting PPDU
+        assert!(matches!(packet, crate::core::chip::ParsedPacket::Skip));
     }
 
     #[test]
-    fn test_rx_rssi_from_physts_header() {
-        // Long RX descriptor (32 bytes) + 8 bytes drv_info (physts header) + WiFi frame
-        // Simulates -30 dBm: rssi_avg_td = (-30 + 110) * 2 = 160 (0xA0)
+    fn test_rx_wifi_then_ppdu_delivers_frame_with_rssi() {
+        // Simulate: WiFi frame (rpkt_type=0) followed by PPDU status (rpkt_type=1)
+        // Both have ppdu_cnt=2
+
+        // --- WiFi frame ---
         let frame_data = [
-            0x80, 0x00, 0x00, 0x00,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x80, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x00, 0x00,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00,
         ];
         let pkt_len = frame_data.len() + 4;
-
-        // drv_info_size field = 1 (1 * 8 = 8 bytes of drv_info)
-        let mut buf = vec![0u8; 32 + 8 + pkt_len];
-        let dw0: u32 = (pkt_len as u32) | (1 << 28) | (1 << 31); // drv_info_size=1, long_rxd=1
-        buf[0..4].copy_from_slice(&dw0.to_le_bytes());
-        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-
-        // physts_hdr_info at offset 32 (right after long RX desc):
-        //   byte 0: is_valid=1 (bit 7) → 0x80
-        //   byte 1: total_length = 1 (8 bytes)
-        //   byte 2: rsvd
-        //   byte 3: rssi_avg_td = 160 (0xA0) → (160 >> 1) - 110 = -30 dBm
-        buf[32] = 0x80; // is_valid = 1
-        buf[33] = 0x01; // total_length = 1 (8 bytes)
-        buf[34] = 0x00; // rsvd
-        buf[35] = 160;  // rssi_avg_td = 160 → -30 dBm
-
-        // Frame data at offset 32 + 8 = 40
-        buf[40..40 + frame_data.len()].copy_from_slice(&frame_data);
-
-        let mut cache = PpduStatusCache::new();
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 36, &mut cache);
-        assert!(consumed > 0);
-        let f = frame.unwrap();
-        assert_eq!(f.rssi, -30);
-        assert_eq!(f.channel, 36);
-    }
-
-    #[test]
-    fn test_rx_rssi_weak_signal() {
-        // Test with weak signal: -85 dBm → rssi_avg_td = (-85 + 110) * 2 = 50
-        let frame_data = [0x80, 0x00, 0x00, 0x00,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x00, 0x00];
-        let pkt_len = frame_data.len() + 4;
-
-        let mut buf = vec![0u8; 32 + 8 + pkt_len];
-        let dw0: u32 = (pkt_len as u32) | (1 << 28) | (1 << 31);
-        buf[0..4].copy_from_slice(&dw0.to_le_bytes());
-        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        buf[32] = 0x80; // is_valid
-        buf[35] = 50;   // rssi_avg_td = 50 → (50 >> 1) - 110 = -85 dBm
-
-        buf[40..40 + frame_data.len()].copy_from_slice(&frame_data);
-
-        let mut cache = PpduStatusCache::new();
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&buf, 1, &mut cache);
-        let f = frame.unwrap();
-        assert_eq!(f.rssi, -85);
-    }
-
-    #[test]
-    fn test_ppdu_correlation() {
-        // Test the full PPDU correlation flow:
-        // 1. Feed a PPDU status packet with ppdu_cnt=3 and RSSI=-45 dBm
-        // 2. Feed a WiFi frame with ppdu_cnt=3 in DW1
-        // 3. Verify the WiFi frame picks up the RSSI from the PPDU status
-
-        let mut cache = PpduStatusCache::new();
-
-        // ── Step 1: Build PPDU status packet (rpkt_type=1) ──
-        // PPDU status: long_rxd, rpkt_type=1, drv_info_size=1 (8 bytes physts)
-        let ppdu_pkt_len: u32 = 0; // PPDU status may have pkt_len=0 payload beyond drv_info
-        let ppdu_dw0: u32 = ppdu_pkt_len | (RPKT_TYPE_PPDU as u32) << 24 | (1 << 28) | (1 << 31);
-        // DW1: ppdu_cnt=3 in bits [6:4]
-        let ppdu_dw1: u32 = 3 << 4;
-
-        let mut ppdu_buf = vec![0u8; 32 + 8]; // desc + 8 bytes drv_info
-        ppdu_buf[0..4].copy_from_slice(&ppdu_dw0.to_le_bytes());
-        ppdu_buf[4..8].copy_from_slice(&ppdu_dw1.to_le_bytes());
-        // physts_hdr_info at offset 32:
-        //   byte 0: is_valid=1 (0x80)
-        //   byte 1: total_length=1 (8 bytes)
-        //   byte 3: rssi_avg_td for -45 dBm = (-45+110)*2 = 130
-        ppdu_buf[32] = 0x80; // is_valid
-        ppdu_buf[33] = 0x01; // total_length
-        ppdu_buf[35] = 130;  // rssi_avg_td → (130>>1)-110 = -45 dBm
-        // Per-path RSSI
-        ppdu_buf[36] = 128;  // path A: (128>>1)-110 = -46 dBm
-        ppdu_buf[37] = 132;  // path B: (132>>1)-110 = -44 dBm
-
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&ppdu_buf, 6, &mut cache);
-        assert!(consumed > 0);
-        assert!(frame.is_none()); // PPDU status doesn't produce a frame
-
-        // ── Step 2: Build WiFi frame with ppdu_cnt=3 in DW1 ──
-        let frame_data = [
-            0x80, 0x00, 0x00, 0x00,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-            0x00, 0x00,
-        ];
-        let wifi_pkt_len = frame_data.len() + 4;
-        let mut wifi_buf = vec![0u8; 32 + wifi_pkt_len];
-        // DW0: rpkt_type=0 (WiFi), no drv_info, long_rxd=1
-        let wifi_dw0: u32 = (wifi_pkt_len as u32) | (1 << 31);
-        // DW1: ppdu_cnt=3, ppdu_type=5 (HE-SU), data_rate=0x80 (HT MCS0), bw=2 (80MHz)
-        let wifi_dw1: u32 = 5 | (3 << 4) | (0x80 << 16) | (2 << 30);
-        wifi_buf[0..4].copy_from_slice(&wifi_dw0.to_le_bytes());
-        wifi_buf[4..8].copy_from_slice(&wifi_dw1.to_le_bytes());
+        let mut wifi_buf = vec![0u8; 32 + pkt_len];
+        let dw0: u32 = (pkt_len as u32) | (1 << 31); // long_rxd=1, rpkt_type=0
+        wifi_buf[0..4].copy_from_slice(&dw0.to_le_bytes());
+        // DW1: ppdu_cnt=2 at bits [6:4]
+        let dw1: u32 = 2 << 4;
+        wifi_buf[4..8].copy_from_slice(&dw1.to_le_bytes());
         wifi_buf[32..32 + frame_data.len()].copy_from_slice(&frame_data);
 
-        let (consumed, frame) = Rtl8852au::parse_rx_packet(&wifi_buf, 6, &mut cache);
+        let (consumed, packet) = parse_rx_packet_8852au(&wifi_buf, 6);
         assert!(consumed > 0);
-        let f = frame.unwrap();
+        assert!(matches!(packet, crate::core::chip::ParsedPacket::Skip));
 
-        // ── Step 3: Verify correlation ──
-        assert_eq!(f.rssi, -45);
-        assert_eq!(f.rssi_path[0], -46);
-        assert_eq!(f.rssi_path[1], -44);
-        assert_eq!(f.ppdu_type, PpduType::HeSu);
-        assert_eq!(f.data_rate, 0x80);
-        assert_eq!(f.bandwidth, RxBandwidth::Bw80);
+        // --- PPDU status ---
+        // physts header: 8 bytes. rssi_avg_td at byte 3.
+        // -40 dBm → raw = ((-40 + 110) * 2) = 140 = 0x8C
+        let rssi_raw: u8 = 140;
+        let mut physts = vec![0u8; 16]; // 8-byte header + 8 bytes padding
+        physts[0] = 0x80; // is_valid=1, ie_bitmap_select=0
+        physts[1] = 2;    // total_length = 2 * 8 = 16 bytes
+        physts[3] = rssi_raw;
+        physts[4] = rssi_raw; // path A
+        physts[5] = rssi_raw; // path B
+
+        let ppdu_pkt_len = physts.len();
+        let mut ppdu_buf = vec![0u8; 16 + ppdu_pkt_len]; // short RXD (16) + payload
+        // DW0: pkt_len, rpkt_type=1 (PPDU), long_rxd=0 (short)
+        let dw0: u32 = (ppdu_pkt_len as u32) | ((RPKT_PPDU_STATUS as u32) << 24);
+        ppdu_buf[0..4].copy_from_slice(&dw0.to_le_bytes());
+        // DW1: ppdu_cnt=2 (must match WiFi frame)
+        let dw1: u32 = 2 << 4;
+        ppdu_buf[4..8].copy_from_slice(&dw1.to_le_bytes());
+        ppdu_buf[16..16 + ppdu_pkt_len].copy_from_slice(&physts);
+
+        let (consumed, packet) = parse_rx_packet_8852au(&ppdu_buf, 6);
+        assert!(consumed > 0);
+        match packet {
+            crate::core::chip::ParsedPacket::Frame(f) => {
+                assert_eq!(f.data.len(), frame_data.len());
+                assert_eq!(f.channel, 6);
+                // RSSI: raw 140 >> 1 = 70, 70 - 110 = -40
+                assert_eq!(f.rssi, -40);
+                assert_eq!(f.rssi_path[0], -40);
+                assert_eq!(f.rssi_path[1], -40);
+            }
+            _ => panic!("expected Frame with RSSI after PPDU match"),
+        }
     }
 
     #[test]

@@ -183,6 +183,146 @@ pub struct RxFrame {
     pub is_ampdu: bool,
     /// AMSDU aggregate flag from DW3.
     pub is_amsdu: bool,
+
+    // --- Extended PHY status (IE1 OFDM/HT/VHT/HE) ---
+
+    /// Frequency-domain RSSI average, U(8,1). Different from time-domain rssi.
+    /// Gives a second RSSI measurement from the FD equalizer path.
+    pub rssi_fd: u8,
+    /// Maximum EVM across subcarriers. U(8,0) dB.
+    pub evm_max: u8,
+    /// Minimum EVM across subcarriers. U(8,0) dB.
+    pub evm_min: u8,
+    /// Carrier frequency offset in kHz (signed). Average over data symbols.
+    pub cfo: i16,
+    /// Preamble CFO in kHz (signed). Measured from preamble only.
+    pub cfo_preamble: i16,
+    /// Sub-channel index (rxsc) — which 20MHz sub-channel within wider BW.
+    pub rxsc: u8,
+    /// RX path enable bitmap. Bit 0=path A, bit 1=path B, etc.
+    pub rx_path_en: u8,
+    /// SU (single-user) packet flag.
+    pub is_su: bool,
+    /// NDP (Null Data Packet) flag.
+    pub is_ndp: bool,
+    /// AWGN (additive white Gaussian noise) channel detected.
+    pub is_awgn: bool,
+    /// Bluetooth grant active during RX (coexistence).
+    pub grant_bt: bool,
+    /// Beamforming gain maximum. 7-bit, U(7,0).
+    pub bf_gain_max: u8,
+    /// Average condition number segment 0. 7-bit. Higher = worse channel.
+    pub condition_number: u8,
+    /// Tones with signal value below threshold.
+    pub sigval_below_th_cnt: u8,
+    /// Tones with condition number exceeding threshold.
+    pub cn_excess_th_cnt: u8,
+    /// Power-to-CCA timing (μs). Time from power detect to CCA.
+    pub pwr_to_cca: u16,
+    /// CCA-to-AGC timing (μs). Time from CCA to AGC settled.
+    pub cca_to_agc: u8,
+    /// CCA-to-SBD timing (μs). Time from CCA to symbol boundary detect.
+    pub cca_to_sbd: u8,
+    /// EDCCA report count.
+    pub edcca_rpt_cnt: u8,
+    /// EDCCA total sample count.
+    pub edcca_total_smp_cnt: u8,
+    /// EDCCA current BW max power.
+    pub edcca_rpt_bw_max: u8,
+    /// EDCCA current BW min power.
+    pub edcca_rpt_bw_min: u8,
+    /// BB-reported bandwidth index (0=5MHz .. 6=80+80MHz).
+    pub bw_from_phy: u8,
+    /// Packet detection index (pop_idx). 2-bit.
+    pub pop_idx: u8,
+
+    // --- IE0 CCK-specific fields ---
+
+    /// Received power level (RPL) from CCK IE0. 9-bit raw.
+    pub cck_rpl: u16,
+    /// CCA time for CCK detection (μs).
+    pub cck_cca_time: u8,
+    /// CCK EVM for header.
+    pub cck_evm_hdr: u8,
+    /// CCK EVM for payload.
+    pub cck_evm_pld: u8,
+    /// CCK signal length (PSDU length from PLCP).
+    pub cck_sig_len: u16,
+    /// CCK preamble type: 0=long, 1=short.
+    pub cck_preamble_type: u8,
+    /// CCK DAGC gain per path [A, B, C, D]. 5-bit each.
+    pub cck_dagc: [u8; 4],
+    /// CCK antenna diversity result per path [A, B, C, D].
+    pub cck_antdiv_rslt: [bool; 4],
+    /// CCK HW antenna switch occurred per path [A, B, C, D].
+    pub cck_hw_antsw: [bool; 4],
+    /// CCK antenna weight gain difference. 5-bit.
+    pub cck_antwgt_gain_diff: u8,
+    /// CCK sync mode.
+    pub cck_sync_mode: u8,
+
+    // --- IE2 HE/AX extended fields ---
+
+    /// Maximum spatial streams (NSTS).
+    pub max_nsts: u8,
+    /// Midamble present flag.
+    pub midamble: bool,
+    /// LTF type from PHY (not descriptor). 2-bit.
+    pub ltf_type: u8,
+    /// Guard interval from PHY (not descriptor). 2-bit.
+    pub gi_from_phy: u8,
+    /// MU-MIMO flag.
+    pub is_mu_mimo: bool,
+    /// Downlink OFDMA flag.
+    pub is_dl_ofdma: bool,
+    /// Dual carrier modulation (HE-specific).
+    pub is_dcm: bool,
+    /// Doppler detected.
+    pub is_doppler: bool,
+    /// Packet extension. 3-bit.
+    pub pkt_extension: u8,
+    /// Coarse CFO I component (signed 18-bit).
+    pub coarse_cfo_i: i32,
+    /// Coarse CFO Q component (signed 18-bit).
+    pub coarse_cfo_q: i32,
+    /// Fine CFO I component (signed 18-bit).
+    pub fine_cfo_i: i32,
+    /// Fine CFO Q component (signed 18-bit).
+    pub fine_cfo_q: i32,
+    /// Estimated compensated phase. 8-bit.
+    pub est_cmped_phase: u8,
+    /// Number of LTF symbols.
+    pub n_ltf: u8,
+    /// Number of OFDM symbols.
+    pub n_sym: u16,
+
+    // --- IE4-7 per-path detailed stats [path A, B, C, D] ---
+
+    /// Per-path signal value. U(8,0).
+    pub path_sig_val: [u8; 4],
+    /// Per-path RF gain index.
+    pub path_rf_gain_idx: [u8; 4],
+    /// Per-path TIA gain index.
+    pub path_tia_gain_idx: [u8; 4],
+    /// Per-path SNR. 6-bit unsigned.
+    pub path_snr: [u8; 4],
+    /// Per-path EVM per spatial stream.
+    pub path_evm: [u8; 4],
+    /// Per-path antenna weight. 7-bit.
+    pub path_ant_weight: [u8; 4],
+    /// Per-path DC offset estimate (real component).
+    pub path_dc_re: [u8; 4],
+    /// Per-path DC offset estimate (imaginary component).
+    pub path_dc_im: [u8; 4],
+
+    // --- Frequency-domain SNR (derived from IE1 + header) ---
+
+    /// Frequency-domain SNR average. U(8,0) dB. OFDM only.
+    pub snr_fd_avg: u8,
+    /// Per-path frequency-domain SNR. Derived from snr_fd_avg + rssi_avg - rssi[i].
+    pub snr_fd: [u8; 4],
+    /// Per-path time-domain SNR. Derived from rssi[i] - idle_noise_pwr.
+    pub snr_td: [u8; 4],
 }
 
 impl Default for RxFrame {
@@ -205,6 +345,68 @@ impl Default for RxFrame {
             is_bf: false,
             is_ampdu: false,
             is_amsdu: false,
+            rssi_fd: 0,
+            evm_max: 0,
+            evm_min: 0,
+            cfo: 0,
+            cfo_preamble: 0,
+            rxsc: 0,
+            rx_path_en: 0,
+            is_su: false,
+            is_ndp: false,
+            is_awgn: false,
+            grant_bt: false,
+            bf_gain_max: 0,
+            condition_number: 0,
+            sigval_below_th_cnt: 0,
+            cn_excess_th_cnt: 0,
+            pwr_to_cca: 0,
+            cca_to_agc: 0,
+            cca_to_sbd: 0,
+            edcca_rpt_cnt: 0,
+            edcca_total_smp_cnt: 0,
+            edcca_rpt_bw_max: 0,
+            edcca_rpt_bw_min: 0,
+            bw_from_phy: 0,
+            pop_idx: 0,
+            cck_rpl: 0,
+            cck_cca_time: 0,
+            cck_evm_hdr: 0,
+            cck_evm_pld: 0,
+            cck_sig_len: 0,
+            cck_preamble_type: 0,
+            cck_dagc: [0; 4],
+            cck_antdiv_rslt: [false; 4],
+            cck_hw_antsw: [false; 4],
+            cck_antwgt_gain_diff: 0,
+            cck_sync_mode: 0,
+            max_nsts: 0,
+            midamble: false,
+            ltf_type: 0,
+            gi_from_phy: 0,
+            is_mu_mimo: false,
+            is_dl_ofdma: false,
+            is_dcm: false,
+            is_doppler: false,
+            pkt_extension: 0,
+            coarse_cfo_i: 0,
+            coarse_cfo_q: 0,
+            fine_cfo_i: 0,
+            fine_cfo_q: 0,
+            est_cmped_phase: 0,
+            n_ltf: 0,
+            n_sym: 0,
+            path_sig_val: [0; 4],
+            path_rf_gain_idx: [0; 4],
+            path_tia_gain_idx: [0; 4],
+            path_snr: [0; 4],
+            path_evm: [0; 4],
+            path_ant_weight: [0; 4],
+            path_dc_re: [0; 4],
+            path_dc_im: [0; 4],
+            snr_fd_avg: 0,
+            snr_fd: [0; 4],
+            snr_td: [0; 4],
         }
     }
 }
