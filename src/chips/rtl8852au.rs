@@ -940,43 +940,308 @@ fn parse_rx_packet_8852au(buf: &[u8], channel: u8) -> (usize, crate::core::chip:
 
         // ═══════════════════════════════════════════════════════════════
         //  Channel Info (rpkt_type=2) — raw CSI data
+        //  Format: DW0 header + CSI matrix (I/Q per subcarrier per ant pair)
+        //  RTL8852A: 2x2 MIMO, up to 256 subcarriers (80MHz)
         // ═══════════════════════════════════════════════════════════════
         RPKT_CHANNEL_INFO => {
-            // TODO: Parse and expose CSI data for research
-            // For now, skip but don't drop silently
-            (consumed, ParsedPacket::Skip)
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // CSI header: first 4 bytes contain metadata
+            // DW0[1:0] = bandwidth (0=20, 1=40, 2=80, 3=160)
+            // DW0[3:2] = Nr (RX chains - 1)
+            // DW0[5:4] = Nc (TX chains - 1)
+            // DW0[15:8] = num_sc (number of subcarriers / 4)
+            let (bw, nr, nc, num_sc) = if payload.len() >= 4 {
+                let hdr = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let bw = (hdr & 0x3) as u8;
+                let nr = (((hdr >> 2) & 0x3) + 1) as u8;
+                let nc = (((hdr >> 4) & 0x3) + 1) as u8;
+                let num_sc = (((hdr >> 8) & 0xFF) as u16) * 4;
+                (bw, nr, nc, num_sc)
+            } else {
+                (0, 2, 2, 0)
+            };
+
+            // Parse I/Q pairs from payload after header
+            let iq_offset = 4;
+            let mut csi_raw = Vec::new();
+            if payload.len() > iq_offset {
+                let iq_data = &payload[iq_offset..];
+                // Each I/Q value is 16-bit signed, packed as [I_lo, I_hi, Q_lo, Q_hi]
+                let mut i = 0;
+                while i + 3 < iq_data.len() {
+                    let real = i16::from_le_bytes([iq_data[i], iq_data[i + 1]]);
+                    let imag = i16::from_le_bytes([iq_data[i + 2], iq_data[i + 3]]);
+                    csi_raw.push(real);
+                    csi_raw.push(imag);
+                    i += 4;
+                }
+            }
+
+            (consumed, ParsedPacket::ChannelInfo(crate::core::chip::ChannelInfo {
+                channel,
+                bandwidth: bw,
+                nr,
+                nc,
+                num_subcarriers: num_sc,
+                csi_raw,
+                timestamp: dw2,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  BB Scope (rpkt_type=3) — raw baseband I/Q waveform
+        //  Digital samples straight from the ADC. Spectrum analyzer gold.
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_BB_SCOPE => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // BB scope header: sample_rate_idx in first byte
+            let sample_rate_idx = if !payload.is_empty() { payload[0] } else { 0 };
+
+            // Parse I/Q sample pairs after 4-byte header
+            let sample_offset = 4;
+            let mut samples_iq = Vec::new();
+            if payload.len() > sample_offset {
+                let sample_data = &payload[sample_offset..];
+                let mut i = 0;
+                while i + 3 < sample_data.len() {
+                    let ii = i16::from_le_bytes([sample_data[i], sample_data[i + 1]]);
+                    let qq = i16::from_le_bytes([sample_data[i + 2], sample_data[i + 3]]);
+                    samples_iq.push((ii, qq));
+                    i += 4;
+                }
+            }
+
+            (consumed, ParsedPacket::BbScope(crate::core::chip::BbScope {
+                channel,
+                sample_rate_idx,
+                samples_iq,
+                timestamp: dw2,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  F2P TX Command Report (rpkt_type=4) — firmware TX scheduling
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_F2P_TX_CMD_RPT => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // DW0[7:0] = mac_id, DW0[11:8] = queue_sel
+            let (mac_id, queue_sel) = if payload.len() >= 4 {
+                let dw = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                ((dw & 0xFF) as u8, ((dw >> 8) & 0xF) as u8)
+            } else {
+                (0, 0)
+            };
+
+            (consumed, ParsedPacket::F2pTxCmdReport(crate::core::chip::F2pTxCmdReport {
+                mac_id,
+                queue_sel,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  SS2FW Report (rpkt_type=5) — spatial sounding / beamforming
+        //  Contains V-matrix feedback from beamforming sounding frames.
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_SS2FW_RPT => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // Sounding report header:
+            // Bytes [0..6] = initiator MAC address
+            // Byte [6] = NSS
+            // Byte [7] = BW
+            let mut initiator = [0u8; 6];
+            let (nss, ss_bw) = if payload.len() >= 8 {
+                initiator.copy_from_slice(&payload[0..6]);
+                (payload[6], payload[7])
+            } else if payload.len() >= 6 {
+                initiator.copy_from_slice(&payload[0..6]);
+                (0, 0)
+            } else {
+                (0, 0)
+            };
+
+            (consumed, ParsedPacket::SpatialSounding(crate::core::chip::SpatialSoundingReport {
+                initiator,
+                nss,
+                bandwidth: ss_bw,
+                raw,
+            }))
         }
 
         // ═══════════════════════════════════════════════════════════════
         //  TX Report (rpkt_type=6) — ACK/NACK for injected frames
+        //  MAC AX TX status format (RTL8852A):
+        //  DW0: pkt_id[15:0], queue_sel[20:16], tx_state[23:21], tx_cnt[26:24]
+        //  DW1: mac_id[7:0], final_rate[24:16], final_bw[29:28], final_gi_ltf[31:30]
+        //  DW2: timestamp[31:0]
+        //  DW3: total_airtime[15:0]
         // ═══════════════════════════════════════════════════════════════
         RPKT_TX_RPT => {
-            let payload = buf[payload_offset..payload_offset + pkt_len].to_vec();
-            (consumed, ParsedPacket::TxStatus(payload))
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let txs_dw0 = if payload.len() >= 4 {
+                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+            } else { 0 };
+            let txs_dw1 = if payload.len() >= 8 {
+                u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+            } else { 0 };
+            let txs_dw2 = if payload.len() >= 12 {
+                u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+            } else { 0 };
+            let txs_dw3 = if payload.len() >= 16 {
+                u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]])
+            } else { 0 };
+
+            let pkt_id = (txs_dw0 & 0xFFFF) as u16;
+            let queue_sel = ((txs_dw0 >> 16) & 0x1F) as u8;
+            let tx_state = ((txs_dw0 >> 21) & 0x7) as u8;
+            let tx_cnt = ((txs_dw0 >> 24) & 0x7) as u8;
+            let acked = tx_state == 0;
+
+            let mac_id = (txs_dw1 & 0xFF) as u8;
+            let final_rate = ((txs_dw1 >> 16) & 0x1FF) as u16;
+            let final_bw = ((txs_dw1 >> 28) & 0x3) as u8;
+            let final_gi_ltf = ((txs_dw1 >> 30) & 0x3) as u8;
+
+            let timestamp = txs_dw2;
+            let total_airtime_us = (txs_dw3 & 0xFFFF) as u16;
+
+            (consumed, ParsedPacket::TxStatus(crate::core::chip::TxReport {
+                pkt_id,
+                queue_sel,
+                tx_state,
+                tx_cnt,
+                acked,
+                final_rate,
+                final_bw,
+                final_gi_ltf,
+                mac_id,
+                timestamp,
+                total_airtime_us,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  TX PD Release Host (rpkt_type=7) — buffer release notification
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_TX_PD_RELEASE_HOST => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // Each PD ID is 2 bytes
+            let mut pd_ids = Vec::new();
+            let mut i = 0;
+            while i + 1 < payload.len() {
+                pd_ids.push(u16::from_le_bytes([payload[i], payload[i + 1]]));
+                i += 2;
+            }
+
+            (consumed, ParsedPacket::TxPdRelease(crate::core::chip::TxPdRelease {
+                release_type: 7,
+                pd_ids,
+                raw,
+            }))
         }
 
         // ═══════════════════════════════════════════════════════════════
         //  DFS Report (rpkt_type=8) — radar detection
+        //  DW0: pulse_width[15:0], pri[31:16]
+        //  DW1: pulse_count[7:0], radar_type[11:8], timestamp[31:16]
         // ═══════════════════════════════════════════════════════════════
         RPKT_DFS_RPT => {
-            // TODO: Parse and expose DFS radar events
-            (consumed, ParsedPacket::Skip)
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let dfs_dw0 = if payload.len() >= 4 {
+                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+            } else { 0 };
+            let dfs_dw1 = if payload.len() >= 8 {
+                u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+            } else { 0 };
+
+            let pulse_width_us = (dfs_dw0 & 0xFFFF) as u16;
+            let pri_us = ((dfs_dw0 >> 16) & 0xFFFF) as u16;
+            let pulse_count = (dfs_dw1 & 0xFF) as u8;
+            let radar_type = ((dfs_dw1 >> 8) & 0xF) as u8;
+
+            (consumed, ParsedPacket::DfsReport(crate::core::chip::DfsReport {
+                channel,
+                band,
+                pulse_width_us,
+                pri_us,
+                pulse_count,
+                radar_type,
+                timestamp: dw2,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  TX PD Release WLCPU (rpkt_type=9) — same as type 7 but WLCPU path
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_TX_PD_RELEASE_WLCPU => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let mut pd_ids = Vec::new();
+            let mut i = 0;
+            while i + 1 < payload.len() {
+                pd_ids.push(u16::from_le_bytes([payload[i], payload[i + 1]]));
+                i += 2;
+            }
+
+            (consumed, ParsedPacket::TxPdRelease(crate::core::chip::TxPdRelease {
+                release_type: 9,
+                pd_ids,
+                raw,
+            }))
         }
 
         // ═══════════════════════════════════════════════════════════════
         //  C2H (rpkt_type=10) — firmware command response
+        //  MAC AX C2H format:
+        //  Byte 0: category (0=MAC, 1=BB, 2=RF, 3=BT, 4=FW)
+        //  Byte 1: class
+        //  Byte 2: function
+        //  Byte 3: seq
+        //  Byte 4+: payload
         // ═══════════════════════════════════════════════════════════════
         RPKT_C2H => {
-            let payload = buf[payload_offset..payload_offset + pkt_len].to_vec();
-            (consumed, ParsedPacket::DriverMessage(payload))
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let category = if !payload.is_empty() { payload[0] } else { 0 };
+            let class = if payload.len() > 1 { payload[1] } else { 0 };
+            let function = if payload.len() > 2 { payload[2] } else { 0 };
+            let seq = if payload.len() > 3 { payload[3] } else { 0 };
+            let c2h_payload = if payload.len() > 4 { payload[4..].to_vec() } else { Vec::new() };
+
+            (consumed, ParsedPacket::C2hEvent(crate::core::chip::C2hEvent {
+                category,
+                class,
+                function,
+                seq,
+                payload: c2h_payload,
+                raw,
+            }))
         }
 
         // ═══════════════════════════════════════════════════════════════
-        //  All other types — count but skip
+        //  Unknown rpkt_type — preserve raw data, don't discard
         // ═══════════════════════════════════════════════════════════════
         _ => {
-            // BB_SCOPE(3), F2P_TX_CMD_RPT(4), SS2FW_RPT(5),
-            // TX_PD_RELEASE_HOST(7), TX_PD_RELEASE_WLCPU(9)
             (consumed, ParsedPacket::Skip)
         }
     }
@@ -2519,7 +2784,10 @@ impl Rtl8852au {
     /// Includes BB/PHY, AGC, PPDU status, TX power, SCH_TX_EN — everything.
     fn set_channel_internal(&mut self, ch: u8) -> Result<()> {
         match self.pcap_channel_switch(ch) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.channel.store(ch, Ordering::Relaxed);
+                Ok(())
+            }
             Err(_) => {
                 // Fallback to programmatic for channels not in pcap (e.g., ch14)
                 let _ = self.send_sch_tx_en(0x0000);
@@ -3704,6 +3972,13 @@ fn start_rx_pipeline_8852au(
                             }
                             crate::core::chip::ParsedPacket::DriverMessage(_) => {}
                             crate::core::chip::ParsedPacket::TxStatus(_) => {}
+                            crate::core::chip::ParsedPacket::C2hEvent(_) => {}
+                            crate::core::chip::ParsedPacket::ChannelInfo(_) => {}
+                            crate::core::chip::ParsedPacket::DfsReport(_) => {}
+                            crate::core::chip::ParsedPacket::BbScope(_) => {}
+                            crate::core::chip::ParsedPacket::SpatialSounding(_) => {}
+                            crate::core::chip::ParsedPacket::F2pTxCmdReport(_) => {}
+                            crate::core::chip::ParsedPacket::TxPdRelease(_) => {}
                             crate::core::chip::ParsedPacket::Skip => {
                                 stats_parser.skipped.fetch_add(1, Ordering::Relaxed);
                             }
@@ -3756,18 +4031,18 @@ mod tests {
         buf.extend_from_slice(&[0u8; 8]); // payload
         let (consumed, packet) = parse_rx_packet_8852au(&buf, 6);
         assert!(consumed > 0);
-        assert!(matches!(packet, crate::core::chip::ParsedPacket::DriverMessage(_)));
+        assert!(matches!(packet, crate::core::chip::ParsedPacket::C2hEvent(_)));
     }
 
     #[test]
-    fn test_rx_bb_scope_returns_skip() {
+    fn test_rx_bb_scope_returns_bb_scope() {
         let mut buf = vec![0u8; 32];
         let dw0: u32 = 8 | (RPKT_BB_SCOPE as u32) << 24; // BB scope, pkt_len=8
         buf[0..4].copy_from_slice(&dw0.to_le_bytes());
         buf.extend_from_slice(&[0u8; 8]);
         let (consumed, packet) = parse_rx_packet_8852au(&buf, 6);
         assert!(consumed > 0);
-        assert!(matches!(packet, crate::core::chip::ParsedPacket::Skip));
+        assert!(matches!(packet, crate::core::chip::ParsedPacket::BbScope(_)));
     }
 
     #[test]

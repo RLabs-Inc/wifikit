@@ -18,7 +18,7 @@
 //!   3. Attack calls unlock_channel() → scanner resumes hopping
 //!   4. RX thread doesn't care — it reads whatever arrives, always
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -32,6 +32,43 @@ use crate::pipeline::FrameGate;
 
 /// Channel value meaning "no channel locked" (channel 0 is not a valid WiFi channel).
 const NO_CHANNEL_LOCK: u8 = 0;
+
+/// RX thread diagnostic counters — shared via Arc, readable from outside.
+#[derive(Default)]
+pub struct RxThreadStats {
+    /// USB bulk reads performed.
+    pub usb_reads: AtomicU32,
+    /// Total bytes received from USB.
+    pub usb_bytes: AtomicU64,
+    /// Packets successfully parsed (consumed > 0).
+    pub packets_parsed: AtomicU32,
+    /// Frames submitted to FrameGate.
+    pub frames_submitted: AtomicU32,
+    /// DriverMessage packets forwarded.
+    pub driver_messages: AtomicU32,
+    /// TxStatus reports received.
+    pub tx_status: AtomicU32,
+    /// C2H/MCU events received.
+    pub c2h_events: AtomicU32,
+    /// ChannelInfo (CSI) packets received.
+    pub channel_info: AtomicU32,
+    /// DFS radar reports received.
+    pub dfs_reports: AtomicU32,
+    /// BbScope (I/Q) packets received.
+    pub bb_scope: AtomicU32,
+    /// SpatialSounding reports received.
+    pub spatial_sounding: AtomicU32,
+    /// F2P/TxPdRelease/other non-frame packets.
+    pub other_packets: AtomicU32,
+    /// Packets skipped (ParsedPacket::Skip).
+    pub skipped: AtomicU32,
+    /// Times consumed==0 was returned (partial/corrupt packet).
+    pub consumed_zero: AtomicU32,
+    /// Largest single USB read size (bytes).
+    pub max_read_size: AtomicU32,
+    /// Number of USB reads with multiple frames (aggregation working).
+    pub multi_frame_reads: AtomicU32,
+}
 
 /// RX thread poll timeout — how long to wait for USB data before checking alive flag.
 // Short timeout for USB bulk reads. With MT7921AU returning 1 frame per read
@@ -86,6 +123,8 @@ struct SharedAdapterInner {
     pub mac: MacAddress,
     /// Hardware MAC from the driver (EFUSE/chip-level, not randomized).
     pub driver_mac: MacAddress,
+    /// RX thread diagnostic counters.
+    pub rx_stats: Arc<RxThreadStats>,
 }
 
 impl SharedAdapter {
@@ -141,6 +180,7 @@ impl SharedAdapter {
                 info: info.clone(),
                 mac,
                 driver_mac,
+                rx_stats: Arc::new(RxThreadStats::default()),
             }),
         };
 
@@ -352,6 +392,11 @@ impl SharedAdapter {
         &self.inner.info
     }
 
+    /// Get RX thread diagnostic stats.
+    pub fn rx_stats(&self) -> Arc<RxThreadStats> {
+        Arc::clone(&self.inner.rx_stats)
+    }
+
     /// Check if the adapter is still alive.
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::SeqCst)
@@ -526,10 +571,25 @@ fn start_rx_thread(
     gate: FrameGate,
     inner: Arc<SharedAdapterInner>,
 ) -> thread::JoinHandle<()> {
+    let stats = Arc::clone(&inner.rx_stats);
     thread::Builder::new()
         .name("rx-usb".into())
         .spawn(move || {
             let mut buf = vec![0u8; rx_handle.rx_buf_size];
+            let mut read_num = 0u64;
+            const READS_PER_CHANNEL: u64 = 5; // log 5 reads per channel change
+            let mut reads_this_channel = 0u64;
+            let mut last_log_channel = 0u8;
+            let mut log = {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true).write(true).truncate(true)
+                    .open("/tmp/wifikit_shared_usb_reads.log").ok();
+                if let Some(ref mut f) = f {
+                    let _ = writeln!(f, "=== Shared RX Thread USB Reads ({} per channel) ===\n", READS_PER_CHANNEL);
+                }
+                f
+            };
 
             loop {
                 if !inner.alive.load(Ordering::SeqCst) {
@@ -553,38 +613,115 @@ fn start_rx_thread(
                     continue;
                 }
 
+                read_num += 1;
+                stats.usb_reads.fetch_add(1, Ordering::Relaxed);
+                stats.usb_bytes.fetch_add(actual as u64, Ordering::Relaxed);
+                // Track max read size
+                let prev_max = stats.max_read_size.load(Ordering::Relaxed);
+                if actual as u32 > prev_max {
+                    stats.max_read_size.store(actual as u32, Ordering::Relaxed);
+                }
+
                 let channel = inner.current_channel.load(Ordering::Relaxed);
+
+                // Dump a few USB reads per channel for diagnostics
+                if channel != last_log_channel {
+                    last_log_channel = channel;
+                    reads_this_channel = 0;
+                    if let Some(ref mut f) = log {
+                        use std::io::Write;
+                        let _ = writeln!(f, "\n{}", "=".repeat(60));
+                        let _ = writeln!(f, "  CHANNEL {} (band={})", channel,
+                            if channel <= 14 { "2.4GHz" } else { "5GHz" });
+                        let _ = writeln!(f, "{}", "=".repeat(60));
+                    }
+                }
+                reads_this_channel += 1;
+                if reads_this_channel <= READS_PER_CHANNEL {
+                    if let Some(ref mut f) = log {
+                        use std::io::Write;
+                        let _ = writeln!(f, "\n══ USB READ #{} (ch{} read #{}) — {} bytes ══",
+                            read_num, channel, reads_this_channel, actual);
+                        let mut p = 0;
+                        while p < actual {
+                            let end = (p + 16).min(actual);
+                            let hex: String = buf[p..end].iter()
+                                .map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                            let ascii: String = buf[p..end].iter()
+                                .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '.' })
+                                .collect();
+                            let _ = writeln!(f, "  {:04X}: {:<48} |{}|", p, hex, ascii);
+                            p += 16;
+                        }
+                    }
+                }
 
                 // Parse all frames from the USB bulk transfer
                 // (USB aggregation means one transfer can contain multiple frames)
                 let mut pos = 0;
+                let mut frames_this_read = 0u32;
                 while pos < actual {
                     let remaining = &buf[pos..actual];
                     let (consumed, packet) = (rx_handle.parse_fn)(remaining, channel);
 
                     if consumed == 0 {
-                        pos += 4;
-                        continue;
+                        stats.consumed_zero.fetch_add(1, Ordering::Relaxed);
+                        break; // Don't skip — leftover bytes are partial packet
                     }
 
                     pos += consumed;
+                    stats.packets_parsed.fetch_add(1, Ordering::Relaxed);
 
                     match packet {
                         crate::core::chip::ParsedPacket::Frame(frame) => {
+                            frames_this_read += 1;
+                            stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
                             gate.submit(frame);
                         }
                         crate::core::chip::ParsedPacket::DriverMessage(msg) => {
+                            stats.driver_messages.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref tx) = rx_handle.driver_msg_tx {
                                 let _ = tx.send(msg);
                             }
                         }
-                        crate::core::chip::ParsedPacket::TxStatus(txs) => {
+                        crate::core::chip::ParsedPacket::TxStatus(rpt) => {
+                            stats.tx_status.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref tx) = rx_handle.driver_msg_tx {
-                                let _ = tx.send(txs);
+                                let _ = tx.send(rpt.raw);
                             }
                         }
-                        crate::core::chip::ParsedPacket::Skip => {}
+                        crate::core::chip::ParsedPacket::C2hEvent(evt) => {
+                            stats.c2h_events.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref tx) = rx_handle.driver_msg_tx {
+                                let _ = tx.send(evt.raw);
+                            }
+                        }
+                        // TODO: Route CSI, DFS, BB scope, spatial sounding to
+                        // FrameStore/subscribers once consumers exist (spectrum
+                        // analyzer, positioning, radar detection views).
+                        crate::core::chip::ParsedPacket::ChannelInfo(_) => {
+                            stats.channel_info.fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::core::chip::ParsedPacket::DfsReport(_) => {
+                            stats.dfs_reports.fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::core::chip::ParsedPacket::BbScope(_) => {
+                            stats.bb_scope.fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::core::chip::ParsedPacket::SpatialSounding(_) => {
+                            stats.spatial_sounding.fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::core::chip::ParsedPacket::F2pTxCmdReport(_) |
+                        crate::core::chip::ParsedPacket::TxPdRelease(_) => {
+                            stats.other_packets.fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::core::chip::ParsedPacket::Skip => {
+                            stats.skipped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
+                }
+                if frames_this_read > 1 {
+                    stats.multi_frame_reads.fetch_add(1, Ordering::Relaxed);
                 }
             }
         })

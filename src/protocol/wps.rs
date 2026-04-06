@@ -1635,6 +1635,11 @@ pub fn patch_authenticator(body: &mut [u8], authenticator: &[u8; 8]) -> bool {
     false
 }
 
+/// Patch the authenticator value at a known offset (avoids re-scanning TLVs).
+pub fn patch_authenticator_at(body: &mut [u8], value_offset: usize, authenticator: &[u8; 8]) {
+    body[value_offset..value_offset + 8].copy_from_slice(authenticator);
+}
+
 /// Build a WPS vendor-specific IE for association requests.
 ///
 /// Returns the complete IE: tag(1) + length(1) + OUI(4) + WPS_TLVs.

@@ -217,7 +217,11 @@ impl Scanner {
         // would persist when switching to RTL8812BU).
         store.clear_channel_stats();
 
-        let mac = shared.mac();
+        // Use the driver's hardware MAC for TX frames (probe requests).
+        // The randomized MAC (shared.mac()) hasn't been written to the hardware
+        // via ADDR_CAM on some chipsets (RTL8852AU), so TX with a mismatched SA
+        // can crash the firmware's TX path and kill RX.
+        let mac = shared.driver_mac();
 
         // Track the previous channel's band for proper end_dwell keying.
         let mut prev_band_idx: u8 = 0;

@@ -29,6 +29,15 @@ fn main() {
             },
             "RTL8812BU (standard RX)",
         ),
+        "7921" | "mt7921" | "fenvi" | "comfast" => (
+            AdapterInfo {
+                vid: 0x3574, pid: 0x6211,
+                chip: ChipId::Mt7921au,
+                name: "COMFAST CF-952AX (MT7921AU)",
+                bus: 0, address: 0,
+            },
+            "MT7921AU (WiFi 6)",
+        ),
         _ => (
             AdapterInfo {
                 vid: 0x2357, pid: 0x013F,
@@ -192,6 +201,58 @@ fn main() {
     eprintln!("  Frame types:      {} mgmt, {} data, {} ctrl",
         grand.mgmt, grand.data, grand.ctrl);
     eprintln!("  Unique BSSIDs:    {}", grand.bssids.len());
+
+    // RX thread stats (all adapters)
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let rs = shared.rx_stats();
+        let reads = rs.usb_reads.load(Relaxed);
+        let bytes = rs.usb_bytes.load(Relaxed);
+        let parsed = rs.packets_parsed.load(Relaxed);
+        let frames = rs.frames_submitted.load(Relaxed);
+        let driver_msg = rs.driver_messages.load(Relaxed);
+        let tx_st = rs.tx_status.load(Relaxed);
+        let c2h = rs.c2h_events.load(Relaxed);
+        let ch_info = rs.channel_info.load(Relaxed);
+        let dfs = rs.dfs_reports.load(Relaxed);
+        let bb = rs.bb_scope.load(Relaxed);
+        let ss = rs.spatial_sounding.load(Relaxed);
+        let other = rs.other_packets.load(Relaxed);
+        let skipped = rs.skipped.load(Relaxed);
+        let consumed_zero = rs.consumed_zero.load(Relaxed);
+        let max_read = rs.max_read_size.load(Relaxed);
+        let multi = rs.multi_frame_reads.load(Relaxed);
+
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("  RX THREAD STATS ({})", label);
+        eprintln!("{}", "=".repeat(70));
+        eprintln!("\n  USB:");
+        eprintln!("    Reads:              {}", reads);
+        eprintln!("    Bytes:              {} ({:.1} MB)", bytes, bytes as f64 / 1_048_576.0);
+        eprintln!("    Avg read size:      {} bytes", if reads > 0 { bytes / reads as u64 } else { 0 });
+        eprintln!("    Max read size:      {} bytes", max_read);
+        eprintln!("    Multi-frame reads:  {} ({:.1}% of reads)",
+            multi, if reads > 0 { multi as f64 / reads as f64 * 100.0 } else { 0.0 });
+
+        eprintln!("\n  Parsing:");
+        eprintln!("    Packets parsed:     {}", parsed);
+        eprintln!("    Consumed==0 (partial/corrupt): {}", consumed_zero);
+        eprintln!("    Frames → FrameGate: {}", frames);
+        eprintln!("    DriverMessages:     {}", driver_msg);
+        eprintln!("    TxStatus reports:   {}", tx_st);
+        eprintln!("    C2H/MCU events:     {}", c2h);
+        eprintln!("    ChannelInfo (CSI):  {}", ch_info);
+        eprintln!("    DFS radar:          {}", dfs);
+        eprintln!("    BB scope (I/Q):     {}", bb);
+        eprintln!("    Spatial sounding:   {}", ss);
+        eprintln!("    Other:              {}", other);
+        eprintln!("    Skipped:            {}", skipped);
+        let total_pkt = frames + driver_msg + tx_st + c2h + ch_info + dfs + bb + ss + other + skipped;
+        if total_pkt > 0 {
+            eprintln!("    Frame yield:        {:.1}% ({} frames / {} packets)",
+                frames as f64 / total_pkt as f64 * 100.0, frames, total_pkt);
+        }
+    }
 
     // 8852AU stream pipeline internal stats
     if info.chip == ChipId::Rtl8852au {

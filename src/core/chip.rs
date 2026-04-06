@@ -416,18 +416,178 @@ pub trait ChipDriver: Send {
 /// Adapters return different variants depending on what the packet contains:
 /// - Register-based chips (RTL): only Frame and Skip
 /// - MCU-based chips (MediaTek): Frame, DriverMessage, TxStatus, and Skip
+// ── TX Status Report ──
+// Structured TX completion feedback from firmware.
+
+#[derive(Debug, Clone)]
+pub struct TxReport {
+    /// Packet ID assigned at TX time.
+    pub pkt_id: u16,
+    /// Queue that transmitted this frame (0=BE, 1=BK, 2=VI, 3=VO, 4+=special).
+    pub queue_sel: u8,
+    /// TX result: 0=success (ACKed), 1=retry limit, 2=lifetime expired, etc.
+    pub tx_state: u8,
+    /// Number of TX attempts (1 = succeeded first try).
+    pub tx_cnt: u8,
+    /// Whether the frame was ACKed by the receiver.
+    pub acked: bool,
+    /// Final data rate used (after any fallback). Same encoding as RxFrame.data_rate.
+    pub final_rate: u16,
+    /// Final bandwidth used.
+    pub final_bw: u8,
+    /// Final GI/LTF type.
+    pub final_gi_ltf: u8,
+    /// MAC ID of the peer.
+    pub mac_id: u8,
+    /// Timestamp from firmware (freerun counter).
+    pub timestamp: u32,
+    /// Total airtime consumed (μs) including retries.
+    pub total_airtime_us: u16,
+    /// Raw payload for driver-specific extended parsing.
+    pub raw: Vec<u8>,
+}
+
+// ── Channel State Information (CSI) ──
+// Raw channel frequency response per subcarrier per antenna pair.
+
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    /// Channel number this CSI was measured on.
+    pub channel: u8,
+    /// Bandwidth: 0=20MHz, 1=40MHz, 2=80MHz, 3=160MHz.
+    pub bandwidth: u8,
+    /// Number of RX chains (Nr).
+    pub nr: u8,
+    /// Number of TX chains (Nc) — from the sender's perspective.
+    pub nc: u8,
+    /// Number of subcarriers in the CSI matrix.
+    pub num_subcarriers: u16,
+    /// Raw CSI matrix: I/Q pairs per subcarrier per antenna pair.
+    /// Layout: [subcarrier_0_ant_pair_0_I, _Q, subcarrier_0_ant_pair_1_I, _Q, ...]
+    pub csi_raw: Vec<i16>,
+    /// Timestamp from firmware (freerun counter).
+    pub timestamp: u32,
+    /// Raw payload for extended parsing.
+    pub raw: Vec<u8>,
+}
+
+// ── DFS Radar Detection Report ──
+
+#[derive(Debug, Clone)]
+pub struct DfsReport {
+    /// Channel the radar was detected on.
+    pub channel: u8,
+    /// Band index (0=2.4GHz, 1=5GHz).
+    pub band: u8,
+    /// Radar pulse width in μs.
+    pub pulse_width_us: u16,
+    /// Pulse repetition interval in μs.
+    pub pri_us: u16,
+    /// Number of pulses in this detection window.
+    pub pulse_count: u8,
+    /// Radar type classification (chipset-specific).
+    pub radar_type: u8,
+    /// Timestamp from firmware.
+    pub timestamp: u32,
+    /// Raw payload for extended analysis.
+    pub raw: Vec<u8>,
+}
+
+// ── C2H (Command-to-Host) Firmware Event ──
+
+#[derive(Debug, Clone)]
+pub struct C2hEvent {
+    /// Category: 0=MAC, 1=BB, 2=RF, 3=BT, 4=FW, etc.
+    pub category: u8,
+    /// Class within category.
+    pub class: u8,
+    /// Function within class.
+    pub function: u8,
+    /// Sequence number for matching request/response.
+    pub seq: u8,
+    /// Payload data (after header).
+    pub payload: Vec<u8>,
+    /// Raw packet including header.
+    pub raw: Vec<u8>,
+}
+
+// ── BB Scope (Baseband I/Q Samples) ──
+
+#[derive(Debug, Clone)]
+pub struct BbScope {
+    /// Channel this capture was taken on.
+    pub channel: u8,
+    /// Sample rate index (chipset-specific).
+    pub sample_rate_idx: u8,
+    /// I/Q sample pairs. Each pair is (I, Q) as signed 16-bit.
+    pub samples_iq: Vec<(i16, i16)>,
+    /// Timestamp from firmware.
+    pub timestamp: u32,
+    /// Raw payload.
+    pub raw: Vec<u8>,
+}
+
+// ── Spatial Sounding Report (Beamforming) ──
+
+#[derive(Debug, Clone)]
+pub struct SpatialSoundingReport {
+    /// MAC address of the sounding initiator (usually an AP).
+    pub initiator: [u8; 6],
+    /// Number of spatial streams.
+    pub nss: u8,
+    /// Channel bandwidth.
+    pub bandwidth: u8,
+    /// Raw sounding feedback data (V-matrix compressed).
+    pub raw: Vec<u8>,
+}
+
+// ── TX PD Release ──
+
+#[derive(Debug, Clone)]
+pub struct TxPdRelease {
+    /// Which release path: Host (7) or WLCPU (9).
+    pub release_type: u8,
+    /// Packet descriptor IDs being released.
+    pub pd_ids: Vec<u16>,
+    /// Raw payload.
+    pub raw: Vec<u8>,
+}
+
+// ── F2P TX Command Report ──
+
+#[derive(Debug, Clone)]
+pub struct F2pTxCmdReport {
+    /// MAC ID.
+    pub mac_id: u8,
+    /// Queue selection.
+    pub queue_sel: u8,
+    /// Raw payload.
+    pub raw: Vec<u8>,
+}
+
 pub enum ParsedPacket {
     /// A valid 802.11 frame — feed to the FramePipeline.
     Frame(RxFrame),
     /// A driver-internal message (MCU response, firmware event, etc.).
     /// The RX thread forwards this to the driver via `driver_msg_tx`.
-    /// Only MCU-based adapters produce this variant.
     DriverMessage(Vec<u8>),
-    /// TX status report — tells whether an injected frame was ACKed.
-    /// Firmware reports this for every transmitted frame when REPORTS_TX_ACK_STATUS is set.
-    /// Contains the raw TXS packet for driver-specific parsing.
-    TxStatus(Vec<u8>),
-    /// Uninteresting packet (TX/RX vector, timer report, etc.) — drop silently.
+    /// Structured TX completion report — ACK/NACK, retry count, final rate.
+    TxStatus(TxReport),
+    /// Raw channel state information — subcarrier-level I/Q response.
+    ChannelInfo(ChannelInfo),
+    /// DFS radar detection event.
+    DfsReport(DfsReport),
+    /// Firmware C2H (command-to-host) structured event.
+    C2hEvent(C2hEvent),
+    /// Raw baseband I/Q waveform capture.
+    BbScope(BbScope),
+    /// Beamforming spatial sounding measurement report.
+    SpatialSounding(SpatialSoundingReport),
+    /// F2P TX scheduling report from firmware.
+    F2pTxCmdReport(F2pTxCmdReport),
+    /// TX packet descriptor release notification.
+    TxPdRelease(TxPdRelease),
+    /// Uninteresting packet — drop silently.
     Skip,
 }
 

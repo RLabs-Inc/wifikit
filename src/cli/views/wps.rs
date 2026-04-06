@@ -38,6 +38,7 @@ fn phase_label(phase: WpsPhase) -> &'static str {
         WpsPhase::BruteForcePhase1 => "brute force (half 1)",
         WpsPhase::BruteForcePhase2 => "brute force (half 2)",
         WpsPhase::LockoutWait => "lockout wait",
+        WpsPhase::NullPin => "null PIN",
         WpsPhase::Done => "done",
     }
 }
@@ -61,6 +62,7 @@ fn phase_ordinal(phase: WpsPhase) -> u8 {
         WpsPhase::PixieCracking => 11,
         WpsPhase::BruteForcePhase1 | WpsPhase::BruteForcePhase2 => 12,
         WpsPhase::LockoutWait => 12,
+        WpsPhase::NullPin => 12,
         WpsPhase::Done => 99,
     }
 }
@@ -262,6 +264,9 @@ pub fn format_event(event: &WpsEvent) -> String {
             format!("  [{}] {} WPS attack complete: {} {} — {} attempts in {:.1}s",
                 ts_styled, s().bold().paint("DONE"),
                 icon, s().dim().paint(label), attempts, elapsed.as_secs_f64())
+        }
+        WpsEventKind::NullPinFailed => {
+            format!("  [{}] {} Null PIN (00000000) rejected", ts_styled, s().dim().paint("NULL"))
         }
         WpsEventKind::Error { message } => {
             format!("  [{}] {} {}", ts_styled, s().red().bold().paint("ERROR"), message)

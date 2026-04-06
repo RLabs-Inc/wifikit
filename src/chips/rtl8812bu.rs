@@ -1809,7 +1809,14 @@ impl Rtl8812bu {
         // 0x010C bit 2 = RX AGG enable. Init has 0xA1 (off), monitor sets 0xA5 (on)
         let v = self.read8(0x010C)?;
         self.write8(0x010C, v | (1 << 2))?; // Enable RX AGG
-        self.write16(0x0280, 0x0100)?; // AGG threshold (from usbmon)
+        // AGG page threshold: 0x0280 = timeout<<8 | size_pages
+        // RTL8812AU uses 0x0608 (timeout=6, size=8 pages=1KB).
+        // Previous value 0x0100 (timeout=1, size=0) gave zero aggregation.
+        // Use size=6 pages (~768B min aggregate) with timeout=8 ticks
+        // to batch multiple frames per USB read.
+        self.write16(0x0280, 0x0806)?;
+        // AGG timeout register — allow the DMA to wait for more frames
+        self.write8(0x0283, 0x08)?;
 
         // BB TX path enable — Linux writes 0x0CBD = 0x01 before injection
         // Without this, TX path may be partially disabled

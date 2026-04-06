@@ -3986,8 +3986,93 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
     //   anything else                  → Skip
     match pkt_type {
         2 | 3 => {} // PKT_TYPE_NORMAL + DUP_RFB — parse as 802.11 frame below
-        0 => return (consumed, ParsedPacket::TxStatus(rxd.to_vec())), // TXS — TX ACK feedback
-        7 | 8 | 0x0C => return (consumed, ParsedPacket::DriverMessage(rxd.to_vec())),
+        0 => {
+            // MT7921 TXS format: DW0-DW6 with TX status fields
+            // DW0[14:12] = tx_state, DW0[19:16] = tx_cnt
+            // DW1[7:0] = mac_id, DW1[24:16] = final_rate
+            let raw = rxd.to_vec();
+            let txs_dw0 = if rxd.len() >= 4 {
+                u32::from_le_bytes([rxd[0], rxd[1], rxd[2], rxd[3]])
+            } else { 0 };
+            let txs_dw1 = if rxd.len() >= 8 {
+                u32::from_le_bytes([rxd[4], rxd[5], rxd[6], rxd[7]])
+            } else { 0 };
+            let tx_state = ((txs_dw0 >> 12) & 0x7) as u8;
+            let tx_cnt = ((txs_dw0 >> 16) & 0xF) as u8;
+            let mac_id = (txs_dw1 & 0xFF) as u8;
+            let final_rate = ((txs_dw1 >> 16) & 0x1FF) as u16;
+            return (consumed, ParsedPacket::TxStatus(crate::core::chip::TxReport {
+                pkt_id: 0,
+                queue_sel: 0,
+                tx_state,
+                tx_cnt,
+                acked: tx_state == 0,
+                final_rate,
+                final_bw: 0,
+                final_gi_ltf: 0,
+                mac_id,
+                timestamp: 0,
+                total_airtime_us: 0,
+                raw,
+            }));
+        }
+        1 => {
+            // PKT_TYPE_TXRXV — TX/RX vector with full PHY metadata.
+            // Contains the same rate/MCS/BW fields as P-RXV but for TX completions.
+            // Raw payload preserved for future detailed parsing.
+            let raw = rxd.to_vec();
+            return (consumed, ParsedPacket::DriverMessage(raw));
+        }
+        4 => {
+            // PKT_TYPE_TMR — timing measurement report (Fine Timing Measurement / 802.11mc).
+            // Contains TOA/TOD timestamps for WiFi ranging/positioning.
+            let raw = rxd.to_vec();
+            return (consumed, ParsedPacket::DriverMessage(raw));
+        }
+        5 => {
+            // PKT_TYPE_RETRIEVE — buffer retrieval from firmware.
+            let raw = rxd.to_vec();
+            return (consumed, ParsedPacket::TxPdRelease(crate::core::chip::TxPdRelease {
+                release_type: 5,
+                pd_ids: Vec::new(),
+                raw,
+            }));
+        }
+        6 => {
+            // PKT_TYPE_TXRX_NOTIFY — TX free notification.
+            // Firmware telling us TX buffers are released.
+            let raw = rxd.to_vec();
+            return (consumed, ParsedPacket::TxPdRelease(crate::core::chip::TxPdRelease {
+                release_type: 6,
+                pd_ids: Vec::new(),
+                raw,
+            }));
+        }
+        7 | 8 => {
+            // PKT_TYPE_RX_EVENT (7) / PKT_TYPE_NORMAL_MCU (8) — MCU responses.
+            // Structure: similar to C2H — category/class/function in MCU header.
+            let raw = rxd.to_vec();
+            // MCU event header at RXD offset: cid at byte 4, ext_cid at byte 5
+            let (category, class, function, seq) = if rxd.len() >= 32 {
+                (rxd[24], rxd[25], rxd[26], rxd[27])
+            } else {
+                (0, 0, 0, 0)
+            };
+            let payload = if rxd.len() > 32 { rxd[32..].to_vec() } else { Vec::new() };
+            return (consumed, ParsedPacket::C2hEvent(crate::core::chip::C2hEvent {
+                category,
+                class,
+                function,
+                seq,
+                payload,
+                raw,
+            }));
+        }
+        0x0C => {
+            // PKT_TYPE_FW_MONITOR — firmware debug trace output.
+            let raw = rxd.to_vec();
+            return (consumed, ParsedPacket::DriverMessage(raw));
+        }
         _ => return (consumed, ParsedPacket::Skip),
     }
 
@@ -4028,48 +4113,224 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
     let rxd_dw3 = u32::from_le_bytes([rxd[12], rxd[13], rxd[14], rxd[15]]);
     let ch_freq = ((rxd_dw3 >> 8) & 0xFF) as u8;
 
-    // Calculate RXD total size
+    // ── Walk RXD groups in order: Group4 → Group1 → Group2 → Group3 [→ Group5] ──
+    // Each group is present only if its flag is set in DW1.
+    // Order is fixed by the hardware — matches Linux mt7921/mac.c:262.
+    use crate::core::frame::*;
+
     let base_rxd = 24;
-    let mut extra = 0usize;
-    if has_group4 { extra += 16; }
-    if has_group1 { extra += 16; }
-    if has_group2 { extra += 8; }
-    if has_group3 {
-        extra += 8;
-        if has_group5 { extra += 72; }
+    let mut off = base_rxd;
+
+    // ── Group 4 (16B): Frame Control, Seq Ctrl, QoS ──
+    let mut _fc = 0u16;
+    let mut _seq_ctrl = 0u16;
+    let mut _qos_ctl = 0u8;
+    let mut is_ampdu = false;
+    if has_group4 {
+        if off + 16 <= pkt_len {
+            let g4_dw0 = u32::from_le_bytes([rxd[off], rxd[off+1], rxd[off+2], rxd[off+3]]);
+            let g4_dw2 = u32::from_le_bytes([rxd[off+8], rxd[off+9], rxd[off+10], rxd[off+11]]);
+            _fc = (g4_dw0 & 0xFFFF) as u16;
+            _seq_ctrl = (g4_dw2 & 0xFFFF) as u16;
+            _qos_ctl = ((g4_dw2 >> 16) & 0xFF) as u8;
+        }
+        off += 16;
     }
-    let rxd_total = base_rxd + extra;
 
-    // RSSI from Group 3 (P-RXV)
+    // ── Group 1 (16B): IV/PN for decrypted frames ──
+    if has_group1 {
+        // IV bytes at off[0..5] — useful for crypto analysis but we don't
+        // need them for monitor mode. Available in raw RXD if needed.
+        off += 16;
+    }
+
+    // ── Group 2 (8B): Timestamp + AMPDU ──
+    let mut rx_timestamp = Duration::ZERO;
+    if has_group2 {
+        if off + 8 <= pkt_len {
+            let ts = u32::from_le_bytes([rxd[off], rxd[off+1], rxd[off+2], rxd[off+3]]);
+            rx_timestamp = Duration::from_micros(ts as u64);
+            // Non-AMPDU flag in RXD2
+            is_ampdu = (rxd_dw2 & (1 << 15)) == 0; // MT_RXD2_NORMAL_NON_AMPDU
+        }
+        off += 8;
+    }
+
+    // ── Group 3 (8B): P-RXV — rate/MCS/BW/GI/STBC/LDPC/NSTS + RCPI ──
+    // This is the richest PHY information source for MT7921.
+    // Fields from mt76_connac2_mac.h: MT_PRXV_*
     let mut rssi: i8 = -80;
+    let mut rssi_path: [i8; 4] = [0; 4];
+    let mut data_rate: u16 = 0;
+    let mut ppdu_type = PpduType::Ofdm;
+    let mut bandwidth = RxBandwidth::Bw20;
+    let mut gi_ltf = GuardInterval::Gi800ns;
+    let mut is_ldpc = false;
+    let mut is_stbc = false;
+    let mut is_bf = false;
+    let mut nss: u8 = 1;
+    let mut is_dcm = false;
+    let mut rx_path_en: u8 = 0;
+
+    let g3_off = off; // save for Group 5 RCPI override
     if has_group3 {
-        let mut g3_off = base_rxd;
-        if has_group4 { g3_off += 16; }
-        if has_group1 { g3_off += 16; }
-        if has_group2 { g3_off += 8; }
+        if off + 8 <= pkt_len {
+            let prxv0 = u32::from_le_bytes([rxd[off], rxd[off+1], rxd[off+2], rxd[off+3]]);
+            let prxv1 = u32::from_le_bytes([rxd[off+4], rxd[off+5], rxd[off+6], rxd[off+7]]);
 
-        let rcpi_val = if has_group5 {
-            let g5_off = g3_off + 8 + 24;
-            if g5_off + 4 <= pkt_len {
-                u32::from_le_bytes([rxd[g5_off], rxd[g5_off+1], rxd[g5_off+2], rxd[g5_off+3]])
-            } else { 0 }
-        } else if g3_off + 8 <= pkt_len {
-            u32::from_le_bytes([rxd[g3_off+4], rxd[g3_off+5], rxd[g3_off+6], rxd[g3_off+7]])
-        } else { 0 };
+            // P-RXV DW0 fields (MT_PRXV_* from mt76_connac2_mac.h)
+            let tx_rate = (prxv0 & 0x7F) as u8;          // bits[6:0]
+            is_dcm = (prxv0 & (1 << 4)) != 0;             // MT_PRXV_TX_DCM
+            nss = (((prxv0 >> 7) & 0x7) + 1) as u8;       // bits[9:7] + 1
+            is_bf = (prxv0 & (1 << 10)) != 0;              // MT_PRXV_TXBF
+            is_ldpc = (prxv0 & (1 << 11)) != 0;            // MT_PRXV_HT_AD_CODE
+            let bw_raw = ((prxv0 >> 12) & 0x7) as u8;      // bits[14:12] FRAME_MODE
+            let gi_raw = ((prxv0 >> 15) & 0x3) as u8;      // bits[16:15] HT_SGI
+            let stbc_raw = ((prxv0 >> 22) & 0x3) as u8;    // bits[23:22] HT_STBC
+            let tx_mode = ((prxv0 >> 24) & 0xF) as u8;     // bits[27:24] TX_MODE
 
-        if rcpi_val != 0 {
-            let max_rcpi = [rcpi_val & 0xFF, (rcpi_val >> 8) & 0xFF,
-                           (rcpi_val >> 16) & 0xFF, (rcpi_val >> 24) & 0xFF]
-                .iter().copied()
-                .filter(|&r| r > 0 && r < 255)
-                .max().unwrap_or(0);
-            if max_rcpi > 0 {
-                rssi = ((max_rcpi as i16 - 220) / 2) as i8;
+            is_stbc = stbc_raw > 0;
+
+            // Map tx_mode to PpduType (MT_PHY_TYPE_* from mt76.h)
+            ppdu_type = match tx_mode {
+                0 => PpduType::Cck,
+                1 => PpduType::Ofdm,
+                2 | 3 => PpduType::HT,
+                4 => PpduType::VhtSu,
+                8 => PpduType::HeSu,
+                9 => PpduType::HeSu,    // HE_EXT_SU maps to HeSu
+                10 => PpduType::HeMu,
+                11 => PpduType::HeTb,
+                _ => PpduType::Ofdm,
+            };
+
+            // Map bandwidth
+            bandwidth = match bw_raw {
+                0 => RxBandwidth::Bw20,
+                1 => RxBandwidth::Bw40,
+                2 => RxBandwidth::Bw80,
+                3 => RxBandwidth::Bw160,
+                _ => RxBandwidth::Bw20,
+            };
+
+            // Map guard interval
+            gi_ltf = match tx_mode {
+                8..=11 => match gi_raw { // HE modes: 0=0.8μs, 1=1.6μs, 2=3.2μs
+                    0 => GuardInterval::Gi800ns,
+                    1 => GuardInterval::Gi1600ns,
+                    2 => GuardInterval::Gi3200ns,
+                    _ => GuardInterval::Gi800ns,
+                },
+                _ => if gi_raw > 0 { GuardInterval::Gi400ns } else { GuardInterval::Gi800ns },
+            };
+
+            // Encode data_rate matching RxFrame convention:
+            // Legacy: index, HT: 0x80+MCS, VHT/HE: (NSS<<4)|MCS
+            data_rate = match tx_mode {
+                0 | 1 => tx_rate as u16,
+                2 | 3 => 0x80 + tx_rate as u16,
+                _ => ((nss as u16 - 1) << 4) | (tx_rate as u16 & 0xF),
+            };
+
+            // P-RXV DW1: RCPI per path (same layout as Group 5 but from P-RXV)
+            let rcpi = [
+                (prxv1 & 0xFF) as u8,
+                ((prxv1 >> 8) & 0xFF) as u8,
+                ((prxv1 >> 16) & 0xFF) as u8,
+                ((prxv1 >> 24) & 0xFF) as u8,
+            ];
+
+            // Convert RCPI to dBm: rssi = (rcpi - 220) / 2
+            for i in 0..4 {
+                if rcpi[i] > 0 && rcpi[i] < 255 {
+                    rssi_path[i] = ((rcpi[i] as i16 - 220) / 2) as i8;
+                    rx_path_en |= 1 << i;
+                }
             }
+            // Best path RSSI
+            rssi = rssi_path.iter().copied()
+                .filter(|&r| r < 0)
+                .max().unwrap_or(-80);
+        }
+        off += 8;
+
+        // ── Group 5 (72B): C-RXV extended — only present with Group 3 ──
+        // Contains HE-specific fields and monitor-mode RCPI override.
+        if has_group5 {
+            if off + 72 <= pkt_len {
+                // C-RXV starts at off, first 6 DWORDs (24B) are C-RXV fields
+                // Then 12 DWORDs (48B) are extended monitor info
+                // RCPI override is at the monitor section: off + 24, DW0
+                let crxv_off = off;
+
+                // C-RXV DW0 (at crxv_off): HE-specific fields
+                let crxv0 = u32::from_le_bytes([
+                    rxd[crxv_off], rxd[crxv_off+1], rxd[crxv_off+2], rxd[crxv_off+3]]);
+                let _he_stbc = crxv0 & 0x3;                // bits[1:0]
+                let _he_tx_mode = (crxv0 >> 4) & 0xF;      // bits[7:4]
+                let _he_bw = (crxv0 >> 8) & 0x7;            // bits[10:8]
+                let _he_sgi = (crxv0 >> 13) & 0x3;          // bits[14:13]
+                let _he_ltf_size = (crxv0 >> 17) & 0x3;     // bits[18:17]
+                let _he_ldpc_ext = (crxv0 >> 20) & 1;       // bit 20
+                let _he_pe_disambig = (crxv0 >> 23) & 1;    // bit 23
+                let _he_num_user = (crxv0 >> 24) & 0x7F;    // bits[30:24]
+                let _he_uplink = (crxv0 >> 31) & 1;         // bit 31
+
+                // C-RXV DW1: RU allocation
+                let crxv1 = u32::from_le_bytes([
+                    rxd[crxv_off+4], rxd[crxv_off+5], rxd[crxv_off+6], rxd[crxv_off+7]]);
+                let _he_ru0 = (crxv1 & 0xFF) as u8;
+                let _he_ru1 = ((crxv1 >> 8) & 0xFF) as u8;
+                let _he_ru2 = ((crxv1 >> 16) & 0xFF) as u8;
+                let _he_ru3 = ((crxv1 >> 24) & 0xFF) as u8;
+
+                // C-RXV DW4: BSS color, TXOP duration, beam change, Doppler
+                if crxv_off + 20 <= pkt_len {
+                    let crxv4 = u32::from_le_bytes([
+                        rxd[crxv_off+16], rxd[crxv_off+17], rxd[crxv_off+18], rxd[crxv_off+19]]);
+                    let _bss_color = (crxv4 & 0x3F) as u8;
+                    let _txop_dur = ((crxv4 >> 6) & 0x7F) as u8;
+                    let _beam_chng = (crxv4 >> 13) & 1 != 0;
+                    let _doppler = (crxv4 >> 16) & 1 != 0;
+                }
+
+                // Monitor-mode RCPI override: 6 DWORDs after C-RXV header (off + 24)
+                // Linux: rxv = rxd; v1 = le32_to_cpu(rxv[0]); after rxd += 6
+                let mon_off = crxv_off + 24; // skip 6 DWORDs of C-RXV
+                if mon_off + 4 <= pkt_len {
+                    let mon_rcpi = u32::from_le_bytes([
+                        rxd[mon_off], rxd[mon_off+1], rxd[mon_off+2], rxd[mon_off+3]]);
+                    if mon_rcpi != 0 {
+                        let rcpi = [
+                            (mon_rcpi & 0xFF) as u8,
+                            ((mon_rcpi >> 8) & 0xFF) as u8,
+                            ((mon_rcpi >> 16) & 0xFF) as u8,
+                            ((mon_rcpi >> 24) & 0xFF) as u8,
+                        ];
+                        // Override with monitor-mode RCPI (more accurate)
+                        rx_path_en = 0;
+                        for i in 0..4 {
+                            if rcpi[i] > 0 && rcpi[i] < 255 {
+                                rssi_path[i] = ((rcpi[i] as i16 - 220) / 2) as i8;
+                                rx_path_en |= 1 << i;
+                            }
+                        }
+                        rssi = rssi_path.iter().copied()
+                            .filter(|&r| r < 0)
+                            .max().unwrap_or(-80);
+                    }
+                }
+            }
+            off += 72;
         }
     }
 
-    let frame_start = rxd_total + hdr_offset;
+    // ── AMSDU info from DW4 ──
+    let rxd_dw4 = u32::from_le_bytes([rxd[16], rxd[17], rxd[18], rxd[19]]);
+    let amsdu_info = ((rxd_dw4 >> 0) & 0x3) as u8; // MT_RXD4_NORMAL_PAYLOAD_FORMAT
+    let is_amsdu = amsdu_info != 0;
+
+    let frame_start = off + hdr_offset;
     if frame_start >= pkt_len {
         return (consumed, ParsedPacket::Skip);
     }
@@ -4099,7 +4360,19 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         rssi,
         channel: rx_channel,
         band: rx_band,
-        timestamp: Duration::ZERO,
+        timestamp: rx_timestamp,
+        rssi_path,
+        data_rate,
+        ppdu_type,
+        bandwidth,
+        gi_ltf,
+        is_ldpc,
+        is_stbc,
+        is_bf,
+        is_ampdu,
+        is_amsdu,
+        rx_path_en,
+        is_dcm,
         ..Default::default()
     }))
 }
