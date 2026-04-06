@@ -2,7 +2,7 @@
 name = "wifikit"
 version = "0.2.0"
 edition = "2024"
-description = "Professional WiFi pentesting toolkit"
+description = "WiFi pentesting toolkit for macOS and Linux*"
 license = "MIT"
 
 [dependencies]
