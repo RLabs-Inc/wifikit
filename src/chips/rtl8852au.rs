@@ -1723,6 +1723,7 @@ pub struct Rtl8852au {
     pipeline_stats: Arc<StreamPipelineStats>,
     mac_addr: MacAddress,
     h2c_seq: u16,
+    tx_power_dbm: i8,
     rx_buf: Vec<u8>,
     rx_pos: usize,
     rx_len: usize,
@@ -1797,6 +1798,7 @@ impl Rtl8852au {
             pipeline_stats: Arc::new(StreamPipelineStats::new()),
             mac_addr: MacAddress::ZERO,
             h2c_seq: 0,
+            tx_power_dbm: 20,
             rx_buf: vec![0u8; RX_BUF_SIZE],
             rx_pos: 0,
             rx_len: 0,
@@ -2823,18 +2825,24 @@ impl Rtl8852au {
     /// channel switch. Using 5GHz default power (0x28 = 20 dBm per rate entry).
     fn write_txagc_power_table(&self, _ch: u8) -> Result<()> {
         // Per-rate TX power index table (0xD2C0-0xD368)
-        // Each byte is a power index: 0x28 = 40 half-dBm = 20 dBm
-        // From usbmon 5GHz channel switch (matches all 5GHz channels in capture):
-        self.write32(0xD2C0, 0x28282828)?; // CCK 1/2/5.5/11
-        self.write32(0xD2C4, 0x28282828)?; // OFDM 6/9/12/18
-        self.write32(0xD2C8, 0x24262828)?; // OFDM 24/36/48/54
-        self.write32(0xD2CC, 0x28282828)?; // HT MCS0-3
-        self.write32(0xD2D0, 0x22242628)?; // HT MCS4-7
-        self.write32(0xD2D4, 0x1A1C1E20)?; // HT MCS8-11
-        self.write32(0xD2D8, 0x28282828)?; // VHT NSS1 MCS0-3
-        self.write32(0xD2DC, 0x28282828)?; // VHT NSS1 MCS4-7
-        self.write32(0xD2E0, 0x22242628)?; // VHT NSS2/HE
-        self.write32(0xD2E4, 0x1A1C1E20)?; // HE high MCS
+        // Use configured tx_power_dbm, scaled per rate for PA linearity
+        let idx = (self.tx_power_dbm as u8) * 2;
+        let hi = idx;
+        let mid = (idx as u16 * 85 / 100).min(0x3E) as u8;
+        let lo = (idx as u16 * 70 / 100).min(0x3E) as u8;
+        let vlo = (idx as u16 * 60 / 100).min(0x3E) as u8;
+        let p4 = |v: u8| u32::from_le_bytes([v, v, v, v]);
+
+        self.write32(0xD2C0, p4(hi))?;   // CCK
+        self.write32(0xD2C4, p4(hi))?;   // OFDM low
+        self.write32(0xD2C8, u32::from_le_bytes([mid, mid, hi, hi]))?;  // OFDM high
+        self.write32(0xD2CC, p4(hi))?;   // HT MCS0-3
+        self.write32(0xD2D0, u32::from_le_bytes([lo, mid, mid, hi]))?;  // HT MCS4-7
+        self.write32(0xD2D4, u32::from_le_bytes([vlo, vlo, lo, lo]))?;  // HT MCS8-11
+        self.write32(0xD2D8, p4(hi))?;   // VHT NSS1 low
+        self.write32(0xD2DC, p4(hi))?;   // VHT NSS1 high
+        self.write32(0xD2E0, u32::from_le_bytes([lo, mid, mid, hi]))?;  // VHT NSS2
+        self.write32(0xD2E4, u32::from_le_bytes([vlo, vlo, lo, lo]))?;  // HE high
 
         // Remaining power entries (VHT/HE extended rates)
         self.write32(0xD2E8, 0x28282828)?;
@@ -3299,14 +3307,15 @@ impl Rtl8852au {
         self.channel.store(149, Ordering::Relaxed); // pcap was on ch149
 
         // ── TX enable — pcap H2C already sent FWROLE + ADDR_CAM + ASSOC_CMAC ──
-        // Don't send our own — they might conflict with the pcap's working setup.
-        // Just ensure SCH_TX_EN and TXDMA are enabled.
         self.send_sch_tx_en(0xFFFF)?;
         self.write16(0xC348, 0xFFFF)?; // CTN_TXEN
         let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
         if sys_cfg5 & 0x03 != 0x03 {
             self.write32(0x0170, sys_cfg5 | 0x03)?;
         }
+
+        // ── Max TX power — crank it to 31 dBm for maximum injection range ──
+        self.set_tx_power(31)?;
 
 
 
@@ -3736,11 +3745,37 @@ impl ChipDriver for Rtl8852au {
     }
 
     fn tx_power(&self) -> i8 {
-        20 // default
+        self.tx_power_dbm
     }
 
-    fn set_tx_power(&mut self, _dbm: i8) -> Result<()> {
-        // TODO: implement via EFUSE calibrated power
+    fn set_tx_power(&mut self, dbm: i8) -> Result<()> {
+        // TXAGC index: 2 units per dBm. Clamp to hardware max (31 dBm = 0x3E).
+        let dbm = dbm.clamp(0, 31);
+        let idx = (dbm as u8) * 2;
+
+        // Scale all rates proportionally. Base rate (OFDM 6M) gets full power.
+        // Higher MCS rates get proportionally less (PA linearity limits).
+        // idx_hi = idx for low rates, idx_lo = idx * 0.65 for high MCS
+        let hi = idx;
+        let mid = (idx as u16 * 85 / 100).min(0x3E) as u8; // ~85% for mid MCS
+        let lo = (idx as u16 * 70 / 100).min(0x3E) as u8;  // ~70% for high MCS
+        let vlo = (idx as u16 * 60 / 100).min(0x3E) as u8;  // ~60% for HE high MCS
+
+        let p4 = |v: u8| u32::from_le_bytes([v, v, v, v]);
+
+        self.write32(0xD2C0, p4(hi))?;   // CCK
+        self.write32(0xD2C4, p4(hi))?;   // OFDM low
+        self.write32(0xD2C8, u32::from_le_bytes([mid, mid, hi, hi]))?;  // OFDM high
+        self.write32(0xD2CC, p4(hi))?;   // HT MCS0-3
+        self.write32(0xD2D0, u32::from_le_bytes([lo, mid, mid, hi]))?;  // HT MCS4-7
+        self.write32(0xD2D4, u32::from_le_bytes([vlo, vlo, lo, lo]))?;  // HT MCS8-11
+        self.write32(0xD2D8, p4(hi))?;   // VHT NSS1 low
+        self.write32(0xD2DC, p4(hi))?;   // VHT NSS1 high
+        self.write32(0xD2E0, u32::from_le_bytes([lo, mid, mid, hi]))?;  // VHT NSS2
+        self.write32(0xD2E4, u32::from_le_bytes([vlo, vlo, lo, lo]))?;  // HE high
+        self.write32(0xD2E8, p4(hi))?;   // Extended
+
+        self.tx_power_dbm = dbm;
         Ok(())
     }
 
