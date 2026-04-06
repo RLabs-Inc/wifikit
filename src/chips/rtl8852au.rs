@@ -2403,15 +2403,9 @@ impl Rtl8852au {
 
         buf[WD_BODY_LEN + FWCMD_HDR_LEN..].copy_from_slice(payload);
 
-        eprintln!("  [H2C] cat={} class={} func={} seq={} payload_len={} total_len={}",
-            cat, class, func, seq, payload.len(), buf.len());
-
         match self.handle.write_bulk(self.ep_fw, &buf, Duration::from_secs(2)) {
-            Ok(n) => {
-                eprintln!("  [H2C]   → OK ({} bytes)", n);
-            }
+            Ok(_) => {}
             Err(e) => {
-                eprintln!("  [H2C]   → FAIL: {}", e);
                 let _ = self.handle.clear_halt(self.ep_fw);
                 return Err(Error::FirmwareError {
                     chip: "RTL8852AU".into(),
@@ -2567,99 +2561,19 @@ impl Rtl8852au {
     /// This is what was missing — without it, firmware accepts USB TX but never
     /// pushes frames to the radio PHY.
     pub fn setup_firmware_role(&mut self) -> Result<()> {
-        // ── Pre-state dump ──
-        let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
-        let ctn_txen = self.read16(0xC348).unwrap_or(0);
-        let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL).unwrap_or(0);
-        eprintln!("  [TX diag] BEFORE: SYS_CFG5=0x{:08X} (TXDMA_EN={} ALLOW={}) CTN_TXEN=0x{:04X} FW_CTRL=0x{:02X} (H2C_RDY={})",
-            sys_cfg5, sys_cfg5 & 1, (sys_cfg5 >> 1) & 1, ctn_txen, fw_ctrl, (fw_ctrl >> 1) & 1);
-
-        // ── Step 1: FWROLE_MAINTAIN(CREATE, MONITOR) ──
-        eprintln!("  [TX diag] Sending FWROLE_MAINTAIN(CREATE, MONITOR)...");
-        match self.send_fwrole_maintain(0, 7, 0) {
-            Ok(()) => eprintln!("  [TX diag]   OK"),
-            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
-        }
-
-        // ── Step 2: ADDR_CAM — register our MAC with firmware ──
+        // FWROLE_MAINTAIN(CREATE, MONITOR) + ADDR_CAM + FWROLE_MAINTAIN(CHANGE)
+        let _ = self.send_fwrole_maintain(0, 7, 0);
         let mac = self.mac_addr.0;
-        eprintln!("  [TX diag] Sending ADDR_CAM(MAC={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X})...",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        match self.send_addr_cam(&mac) {
-            Ok(()) => eprintln!("  [TX diag]   OK"),
-            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
-        }
+        let _ = self.send_addr_cam(&mac);
+        let _ = self.send_fwrole_maintain(0, 7, 1);
 
-        // ── Step 3: FWROLE_MAINTAIN(CHANGE) ──
-        eprintln!("  [TX diag] Sending FWROLE_MAINTAIN(CHANGE)...");
-        match self.send_fwrole_maintain(0, 7, 1) {
-            Ok(()) => eprintln!("  [TX diag]   OK"),
-            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
-        }
+        // Enable TX scheduler + direct register fallback
+        let _ = self.send_sch_tx_en(0xFFFF);
+        self.write16(0xC348, 0xFFFF)?; // CTN_TXEN
 
-        // ── Step 4: Enable the TX scheduler ──
-        eprintln!("  [TX diag] Sending SCH_TX_EN(0xFFFF)...");
-        match self.send_sch_tx_en(0xFFFF) {
-            Ok(()) => eprintln!("  [TX diag]   OK"),
-            Err(e) => eprintln!("  [TX diag]   FAILED: {}", e),
-        }
-
-        // Method 2: Direct register write to R_AX_CTN_TXEN (0xC348) — fallback
-        const R_AX_CTN_TXEN: u16 = 0xC348;
-        self.write16(R_AX_CTN_TXEN, 0xFFFF)?;
-
-        // ── Step 5: Enable TX DMA ──
-        // In the Linux driver (rtw89), rtw89_mac_enable_txdma() does a direct register
-        // write to R_AX_SYS_CFG5. The firmware does NOT set this — the host must.
-        // Without this, USB bulk writes to EP5 go into a DMA buffer that's never processed.
+        // Enable TX DMA (host must set this, firmware doesn't)
         let sys_cfg5 = self.read32(0x0170).unwrap_or(0);
-        eprintln!("  [TX diag] SYS_CFG5 before TXDMA enable: 0x{:08X}", sys_cfg5);
-        // Set bit 0 (FW_CTRL_HCI_TXDMA_EN) + bit 1 (HCI_TXDMA_ALLOW)
         self.write32(0x0170, sys_cfg5 | 0x03)?;
-        let sys_cfg5_after = self.read32(0x0170).unwrap_or(0);
-        eprintln!("  [TX diag] SYS_CFG5 after TXDMA enable: 0x{:08X} (EN={} ALLOW={})",
-            sys_cfg5_after, sys_cfg5_after & 1, (sys_cfg5_after >> 1) & 1);
-
-        // ── Firmware debug dump — what is the FW telling us? ──
-        let udm0 = self.read32(0x01F0).unwrap_or(0); // FW debug msg 0
-        let udm1 = self.read32(0x01F4).unwrap_or(0); // FW debug msg 1
-        let udm2 = self.read32(0x01F8).unwrap_or(0); // FW debug msg 2
-        let udm3 = self.read32(0x01FC).unwrap_or(0); // FW debug msg 3
-        eprintln!("  [FW DEBUG] UDM0=0x{:08X} UDM1=0x{:08X} UDM2=0x{:08X} UDM3=0x{:08X}", udm0, udm1, udm2, udm3);
-
-        // Error interrupt status registers
-        let dmac_err = self.read32(0x8524).unwrap_or(0); // DMAC_ERR_ISR
-        let cmac_err = self.read32(0xC164).unwrap_or(0); // CMAC_ERR_ISR
-        let ser_dbg = self.read32(0x8424).unwrap_or(0);  // SER_DBG_INFO
-        let boot_dbg = self.read32(0x83F0).unwrap_or(0); // BOOT_DBG
-        eprintln!("  [FW ERROR] DMAC_ERR=0x{:08X} CMAC_ERR=0x{:08X} SER_DBG=0x{:08X} BOOT_DBG=0x{:08X}",
-            dmac_err, cmac_err, ser_dbg, boot_dbg);
-
-        // TX-specific error/debug
-        let txdma_dbg = self.read32(0xC840).unwrap_or(0);   // TXDMA_DBG
-        let mpdu_tx_err = self.read32(0x9BF0).unwrap_or(0); // MPDU_TX_ERR_ISR
-        let sch_err = self.read32(0xC3EC).unwrap_or(0);     // SCHEDULE_ERR_ISR
-        let pktin_err = self.read32(0x9A24).unwrap_or(0);   // PKTIN_ERR_ISR
-        let cpuio_err = self.read32(0x9844).unwrap_or(0);   // CPUIO_ERR_ISR
-        let host_disp_err = self.read32(0x8808).unwrap_or(0); // HOST_DISPATCHER_ERR_ISR
-        let cpu_disp_err = self.read32(0x880C).unwrap_or(0);  // CPU_DISPATCHER_ERR_ISR
-        let wde_err = self.read32(0x8C3C).unwrap_or(0);     // WDE_ERR_ISR
-        let sta_sch_err = self.read32(0x9EF4).unwrap_or(0); // STA_SCHEDULER_ERR_ISR
-        eprintln!("  [TX DEBUG] TXDMA=0x{:08X} MPDU_TX_ERR=0x{:08X} SCH_ERR=0x{:08X} PKTIN_ERR=0x{:08X}",
-            txdma_dbg, mpdu_tx_err, sch_err, pktin_err);
-        eprintln!("  [TX DEBUG] CPUIO_ERR=0x{:08X} HOST_DISP=0x{:08X} CPU_DISP=0x{:08X} WDE_ERR=0x{:08X} STA_SCH=0x{:08X}",
-            cpuio_err, host_disp_err, cpu_disp_err, wde_err, sta_sch_err);
-
-        // DLE/dispatcher status
-        let dle0 = self.read32(0x8430).unwrap_or(0);
-        let dle1 = self.read32(0x8434).unwrap_or(0);
-        let disp_dbg = self.read32(0x8860).unwrap_or(0); // DISPATCHER_DBG_PORT
-        eprintln!("  [TX DEBUG] DLE0=0x{:08X} DLE1=0x{:08X} DISP_DBG=0x{:08X}", dle0, dle1, disp_dbg);
-
-        // Post-state
-        let ctn_txen = self.read16(0xC348).unwrap_or(0);
-        let txcnt = self.read32(0xC62C).unwrap_or(0);
-        eprintln!("  [TX diag] AFTER: CTN_TXEN=0x{:04X} TXCNT=0x{:08X}", ctn_txen, txcnt);
 
         Ok(())
     }
@@ -3394,13 +3308,7 @@ impl Rtl8852au {
             self.write32(0x0170, sys_cfg5 | 0x03)?;
         }
 
-        // Debug dump
-        let udm0 = self.read32(0x01F0).unwrap_or(0);
-        let dmac_err = self.read32(0x8524).unwrap_or(0);
-        let cmac_err = self.read32(0xC164).unwrap_or(0);
-        let host_disp = self.read32(0x8808).unwrap_or(0);
-        eprintln!("  [FW state] UDM0=0x{:08X} DMAC_ERR=0x{:08X} CMAC_ERR=0x{:08X} HOST_DISP=0x{:08X}",
-            udm0, dmac_err, cmac_err, host_disp);
+
 
         Ok(())
     }
@@ -3423,7 +3331,6 @@ impl Rtl8852au {
         let mut reg_reads = 0u32;
         let mut ep7_sent = 0u32;
         let mut ep7_fail = 0u32;
-        let mut ep7_seq = 0u16; // fresh seq counter for patched H2C commands
         let mut ep5_sent = 0u32;
 
         while offset + 16 <= pcap_data.len() {
@@ -3522,28 +3429,11 @@ impl Rtl8852au {
                 };
 
                 if !is_fwdl {
-                    // Post-FWDL H2C: replay VERBATIM (no seq patch).
-                    // Fresh firmware boot expects seq from 0, which matches the pcap.
-                    if payload.len() > 27 {
-                        let h2c_dw0 = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
-                        let cat = h2c_dw0 & 0x3;
-                        let class = (h2c_dw0 >> 2) & 0x3F;
-                        let func = (h2c_dw0 >> 8) & 0xFF;
-                        let seq = (h2c_dw0 >> 24) & 0xFF;
-                        eprintln!("  [pcap H2C #{}] cat={} class={} func={} seq={} len={} (verbatim)",
-                            ep7_sent, cat, class, func, seq, payload.len());
-                    }
-
+                    // Post-FWDL H2C: replay verbatim. Fresh firmware expects seq from 0.
                     match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
-                        Ok(n) => {
-                            ep7_sent += 1;
-                            if payload.len() > 27 {
-                                eprintln!("    → OK ({} bytes)", n);
-                            }
-                        }
-                        Err(e) => {
+                        Ok(_) => { ep7_sent += 1; }
+                        Err(_) => {
                             ep7_fail += 1;
-                            eprintln!("    → FAIL: {}", e);
                             let _ = self.handle.clear_halt(self.ep_fw);
                         }
                     }
@@ -3581,7 +3471,7 @@ impl Rtl8852au {
             // EP7 had failures — may cause H2C processing issues
         }
 
-        Ok((reg_writes, reg_reads, ep7_sent, ep5_sent, ep7_seq))
+        Ok((reg_writes, reg_reads, ep7_sent, ep5_sent, 0u16))
     }
 
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
@@ -3762,35 +3652,10 @@ impl Rtl8852au {
 
         buf[TX_WD_TOTAL_LEN..].copy_from_slice(frame);
 
-        // Debug: read TX DMA state before and after EP5 write
-        static TX_DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let tx_dbg = TX_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if tx_dbg < 3 {
-            let sys5 = self.read32(0x0170).unwrap_or(0);
-            let txcnt_before = self.read32(0xC62C).unwrap_or(0);
-            let dle0 = self.read32(0x8430).unwrap_or(0);
-            let hfc = self.read32(0x8A00).unwrap_or(0);
-            eprintln!("  [EP5 TX #{}] BEFORE: SYS_CFG5=0x{:08X} TXCNT=0x{:08X} DLE0=0x{:08X} HFC=0x{:08X} ep=0x{:02X} len={}",
-                tx_dbg, sys5, txcnt_before, dle0, hfc, self.ep_out, buf.len());
-            eprintln!("  [EP5 TX #{}] WD DW0={:08X} DW2={:08X} DW3={:08X} | INFO DW0={:08X} DW1={:08X}",
-                tx_dbg,
-                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-                u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-                u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-                u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
-                u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]));
-        }
-
         // Send via USB bulk OUT EP5
         for retry in 0..opts.retries.max(1) {
             match self.handle.write_bulk(self.ep_out, &buf, USB_BULK_TIMEOUT) {
-                Ok(n) => {
-                    if tx_dbg < 3 {
-                        let txcnt_after = self.read32(0xC62C).unwrap_or(0);
-                        eprintln!("  [EP5 TX #{}] AFTER: wrote {} bytes, TXCNT=0x{:08X}", tx_dbg, n, txcnt_after);
-                    }
-                    return Ok(());
-                }
+                Ok(_) => return Ok(()),
                 Err(e) if retry < opts.retries.saturating_sub(1) => {
                     thread::sleep(Duration::from_millis(1));
                     continue;
@@ -3845,24 +3710,9 @@ impl ChipDriver for Rtl8852au {
 
     fn set_monitor_mode(&mut self) -> Result<()> {
         // Monitor mode is configured by init's pcap replay (RX_FLTR = 0x031644BF).
-
-        // Read current RXAGG state for diagnostics
-        let before = self.read32(R_AX_RXAGG_0).unwrap_or(0);
-        let rxdma_before = self.read32(R_AX_RXDMA_SETTING).unwrap_or(0);
-        eprintln!("  RXAGG_0 before: 0x{:08X} (agg_en={})", before, (before >> 31) & 1);
-        eprintln!("  RXDMA   before: 0x{:08X}", rxdma_before);
-
-        // Enable RX aggregation — full register set from Linux driver.
-        // 0x8900: RXAGG_EN=1, PKTNUM_TH=32, TIMEOUT=320μs, LEN=8KB
+        // Enable RX aggregation for throughput.
         self.write32(R_AX_RXAGG_0, 0x80202020)?;
-        // 0x8908: RXDMA — burst settings for aggregation
         self.write32(R_AX_RXDMA_SETTING, 0x00046F00)?;
-
-        let after = self.read32(R_AX_RXAGG_0).unwrap_or(0);
-        let rxdma_after = self.read32(R_AX_RXDMA_SETTING).unwrap_or(0);
-        eprintln!("  RXAGG_0 after:  0x{:08X} (agg_en={})", after, (after >> 31) & 1);
-        eprintln!("  RXDMA   after:  0x{:08X}", rxdma_after);
-
         Ok(())
     }
 
@@ -4154,15 +4004,8 @@ fn start_rx_pipeline_8852au(
                                 gate.submit(frame);
                             }
                             crate::core::chip::ParsedPacket::DriverMessage(_) => {}
-                            crate::core::chip::ParsedPacket::TxStatus(ref rpt) => {
-                                eprintln!("  [FW] TX_RPT: pkt_id={} q={} state={} cnt={} acked={} rate=0x{:03X} bw={} airtime={}us",
-                                    rpt.pkt_id, rpt.queue_sel, rpt.tx_state, rpt.tx_cnt,
-                                    rpt.acked, rpt.final_rate, rpt.final_bw, rpt.total_airtime_us);
-                            }
-                            crate::core::chip::ParsedPacket::C2hEvent(ref evt) => {
-                                eprintln!("  [FW] C2H: cat={} class={} func={} seq={} payload_len={}",
-                                    evt.category, evt.class, evt.function, evt.seq, evt.payload.len());
-                            }
+                            crate::core::chip::ParsedPacket::TxStatus(_) => {}
+                            crate::core::chip::ParsedPacket::C2hEvent(_) => {}
                             crate::core::chip::ParsedPacket::ChannelInfo(_) => {}
                             crate::core::chip::ParsedPacket::DfsReport(_) => {}
                             crate::core::chip::ParsedPacket::BbScope(_) => {}
