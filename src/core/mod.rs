@@ -13,10 +13,10 @@ pub mod taxonomy;
 
 pub use error::{Error, Result, InitStage, FirmwareErrorKind, ExportFormat, ExportOp};
 pub use adapter::{Adapter, AdapterInfo};
-pub use chip::{ChipDriver, ChipId, ChipCaps, AdapterState};
+pub use chip::{ChipDriver, ChipId, ChipCaps, AdapterState, TxFeedback, TxFeedbackSnapshot, TxReport};
 pub use channel::{Channel, Band, Bandwidth};
 pub use mac::MacAddress;
-pub use frame::{RxFrame, TxOptions, TxFlags, PpduType, GuardInterval, RxBandwidth};
+pub use frame::{RxFrame, TxOptions, TxFlags, TxRate, PpduType, GuardInterval, RxBandwidth};
 pub use event::EventRing;
 pub use parsed_frame::ParsedFrame;
 pub use taxonomy::{AttackType, Category, Status, Capability, ALL_ATTACKS};

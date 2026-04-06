@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::core::adapter::{Adapter, AdapterInfo};
 use crate::core::channel::Channel;
-use crate::core::chip::RxHandle;
+use crate::core::chip::{RxHandle, TxFeedback};
 use crate::core::mac::MacAddress;
 use crate::core::Result;
 use crate::pipeline::FrameGate;
@@ -125,6 +125,8 @@ struct SharedAdapterInner {
     pub driver_mac: MacAddress,
     /// RX thread diagnostic counters.
     pub rx_stats: Arc<RxThreadStats>,
+    /// Aggregate TX feedback from firmware ACK/NACK reports.
+    pub tx_feedback: Arc<TxFeedback>,
 }
 
 impl SharedAdapter {
@@ -181,6 +183,7 @@ impl SharedAdapter {
                 mac,
                 driver_mac,
                 rx_stats: Arc::new(RxThreadStats::default()),
+                tx_feedback: Arc::new(TxFeedback::default()),
             }),
         };
 
@@ -188,7 +191,7 @@ impl SharedAdapter {
         let driver_manages_rx = {
             let mut adapter = shared.inner.adapter.lock()
                 .unwrap_or_else(|e| e.into_inner());
-            adapter.driver.start_rx_pipeline(gate.clone(), alive)
+            adapter.driver.start_rx_pipeline(gate.clone(), alive, Arc::clone(&shared.inner.tx_feedback))
         };
 
         if driver_manages_rx {
@@ -397,6 +400,11 @@ impl SharedAdapter {
         Arc::clone(&self.inner.rx_stats)
     }
 
+    /// Get aggregate TX feedback counters (ACK/NACK/retries from firmware reports).
+    pub fn tx_feedback(&self) -> Arc<TxFeedback> {
+        Arc::clone(&self.inner.tx_feedback)
+    }
+
     /// Check if the adapter is still alive.
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::SeqCst)
@@ -572,6 +580,7 @@ fn start_rx_thread(
     inner: Arc<SharedAdapterInner>,
 ) -> thread::JoinHandle<()> {
     let stats = Arc::clone(&inner.rx_stats);
+    let tx_feedback = Arc::clone(&inner.tx_feedback);
     thread::Builder::new()
         .name("rx-usb".into())
         .spawn(move || {
@@ -686,6 +695,7 @@ fn start_rx_thread(
                         }
                         crate::core::chip::ParsedPacket::TxStatus(rpt) => {
                             stats.tx_status.fetch_add(1, Ordering::Relaxed);
+                            tx_feedback.record(&rpt);
                             if let Some(ref tx) = rx_handle.driver_msg_tx {
                                 let _ = tx.send(rpt.raw);
                             }

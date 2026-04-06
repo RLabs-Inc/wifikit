@@ -262,13 +262,21 @@ pub fn render_eap_view(info: &EapInfo, width: u16) -> Vec<String> {
         // Frame counters + method offered
         let fps_str = format!("{} fps", prism::format_compact(info.frames_per_sec as u64));
         let method_str = info.offered_method.map(|m| format!("  method: {:?}", m)).unwrap_or_default();
-        let stats2 = format!("{} TX  {} RX  {}  {} beacons  {} deauths{}",
+        let mut stats2 = format!("{} TX  {} RX  {}  {} beacons  {} deauths{}",
             s().dim().paint(&prism::format_number(info.frames_sent)),
             s().dim().paint(&prism::format_number(info.frames_received)),
             s().yellow().paint(&fps_str),
             prism::format_compact(info.beacons_sent),
             prism::format_compact(info.deauths_sent),
             s().dim().paint(&method_str));
+        if info.tx_feedback.total_reports > 0 {
+            stats2.push_str(&format!("  {} ack  {} nack",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+            if let Some(pct) = info.tx_feedback.delivery_pct() {
+                stats2.push_str(&format!("  {}%", pct as u64));
+            }
+        }
         lines.push(vline(&stats2, inner_w));
 
         // Last captured credential (live indicator)
@@ -400,6 +408,10 @@ pub fn status_segments(info: &EapInfo) -> Vec<StatusSegment> {
 
     if info.clients_total > 0 {
         segs.push(StatusSegment::new(format!("{} clients", info.clients_total), SegmentStyle::Cyan));
+    }
+
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
 
     let elapsed_secs = info.start_time.elapsed().as_secs_f64();

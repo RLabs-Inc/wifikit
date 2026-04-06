@@ -236,11 +236,19 @@ pub fn render_wpa3_view(info: &Wpa3Info, width: u16, _height: u16, scroll_offset
 
         // Stats line
         let elapsed = info.start_time.elapsed().as_secs_f64();
-        let stats = format!("{} sent  {} recv  {:.0} fps  {:.1}s",
+        let mut stats = format!("{} sent  {} recv  {:.0} fps  {:.1}s",
             prism::format_number(info.commits_sent),
             prism::format_number(info.commits_received),
             info.frames_per_sec,
             elapsed);
+        if info.tx_feedback.total_reports > 0 {
+            stats.push_str(&format!("  {} ack  {} nack",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+            if let Some(pct) = info.tx_feedback.delivery_pct() {
+                stats.push_str(&format!("  {}%", pct as u64));
+            }
+        }
         lines.push(vline(&s().dim().paint(&stats), inner_w));
 
         // Current mode indicator
@@ -371,6 +379,9 @@ pub fn status_segments(info: &Wpa3Info) -> Vec<StatusSegment> {
     }
     if info.mode_total > 0 {
         segs.push(StatusSegment::new(format!("{}/{}", info.mode_index, info.mode_total), SegmentStyle::Dim));
+    }
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
     segs.push(StatusSegment::new(
         format!("{:.1}s", info.start_time.elapsed().as_secs_f64()),

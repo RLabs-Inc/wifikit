@@ -1939,8 +1939,8 @@ impl Rtl8812bu {
 
         // IGI (Initial Gain Index) — per-band tuning from usbmon analysis
         // 5GHz: 0x20 (32) — lower gain avoids ADC saturation, 12% noise vs 44%
-        // 2.4GHz: 0x2A (42) — higher gain for weaker signals + noisier band
-        let igi = if channel <= 14 { 0x2A } else { 0x20 };
+        // 2.4GHz: 0x2E (46) — higher gain for weaker signals, +3dB vs default 0x2A
+        let igi = if channel <= 14 { 0x2E } else { 0x20 };
         self.set_bb_reg(0x0C50, 0x7F, igi)?;
         self.set_bb_reg(0x0E50, 0x7F, igi)?;
         self.igi_toggle()?;
@@ -2189,6 +2189,14 @@ impl Rtl8812bu {
 
         // DW5: RTY_LMT_EN + retry limit
         buf[0x12] = (1 << 1) | ((retries & 0x3F) << 2); // RTY_LMT_EN + limit
+
+        // DW5: STBC + LDPC (byte 0x17)
+        if opts.flags.contains(TxFlags::STBC) {
+            buf[0x17] |= 1 << 4; // DATA_STBC = 1 (single stream)
+        }
+        if opts.flags.contains(TxFlags::LDPC) {
+            buf[0x17] |= 1; // DATA_LDPC
+        }
 
         // DW6: SW sequence number (Linux uses SW_SEQ, not HWSEQ_EN)
         let seq = self.tx_seq.wrapping_add(1);

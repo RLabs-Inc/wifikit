@@ -275,6 +275,7 @@ const AX_TXD_DISDATAFB: u32   = 1 << 10;  // disable data rate fallback
 const AX_TXD_DATA_TXCNT_LMT_SH: u32  = 25;  // max TX count [30:25], 6-bit
 const AX_TXD_DATA_TXCNT_LMT_SEL: u32 = 1 << 31; // enable TX count limit
 const AX_TXD_BMC: u32         = 1 << 11;  // broadcast/multicast
+const AX_TXD_SPE_RPT: u32     = 1 << 10;  // DW9 (INFO DW3): request TX status report from firmware
 const AX_TXD_NAVUSEHDR: u32   = 1 << 10;  // use NAV from 802.11 header
 
 // WD_INFO DW4 (at WD offset 40) — protection
@@ -2131,6 +2132,11 @@ impl Rtl8852au {
         let _ = self.read32(0x8A00)?;
         self.write32(0x8A00, 0x00000408)?;
 
+        // NOTE: HFC per-channel page control (0x8A10-0x8A3C) is handled by
+        // pcap replay in chip_init(). The pcap writes all 12 registers correctly
+        // (verified via dump_8852au_hfc: ACH0=0x01920016, etc.). This function
+        // (dmac_pre_init_and_enable_cpu) is not called — kept as reference only.
+
         // ── USB IO mode + clear TX/RX reset (from usb_pre_init_8852a) ──
         // R_AX_USB_HOST_REQUEST_2 (0x1078): set USBIO_MODE
         let v = self.read32(0x1078)?;
@@ -2822,7 +2828,7 @@ impl Rtl8852au {
     /// R_AX_PWR_RATE_OFST_CTRL (0xD204) = power rate offset control.
     ///
     /// Values from usbmon (full_capture_bus4.pcap) — Linux writes these on every
-    /// channel switch. Using 5GHz default power (0x28 = 20 dBm per rate entry).
+    /// channel switch. Per-rate power AND power limits scale with configured TX power.
     fn write_txagc_power_table(&self, _ch: u8) -> Result<()> {
         // Per-rate TX power index table (0xD2C0-0xD368)
         // Use configured tx_power_dbm, scaled per rate for PA linearity
@@ -2845,13 +2851,13 @@ impl Rtl8852au {
         self.write32(0xD2E4, u32::from_le_bytes([vlo, vlo, lo, lo]))?;  // HE high
 
         // Remaining power entries (VHT/HE extended rates)
-        self.write32(0xD2E8, 0x28282828)?;
+        self.write32(0xD2E8, p4(lo))?;   // VHT/HE extended rates
 
         // Power rate offset control
         self.write32(0xD204, 0x00000000)?;
 
-        // Power limit/reference registers
-        self.write32(0xD2EC, 0x00000026)?;
+        // Power limit/reference registers — scale with configured TX power
+        self.write32(0xD2EC, idx as u32)?;
         self.write32(0xD2F0, 0x00210021)?;
         self.write32(0xD2F4, 0x00000000)?;
         self.write32(0xD2F8, 0x00000000)?;
@@ -2861,8 +2867,8 @@ impl Rtl8852au {
         self.write32(0xD308, 0x00000000)?;
         self.write32(0xD30C, 0x00000000)?;
         self.write32(0xD310, 0x00000000)?;
-        self.write32(0xD314, 0x00000025)?;
-        self.write32(0xD318, 0x1F1F001F)?;
+        self.write32(0xD314, idx as u32)?;
+        self.write32(0xD318, u32::from_le_bytes([idx, 0x00, idx, idx]))?;
         self.write32(0xD31C, 0x00000000)?;
         self.write32(0xD320, 0x00000000)?;
         self.write32(0xD324, 0x00000000)?;
@@ -2871,17 +2877,17 @@ impl Rtl8852au {
         self.write32(0xD330, 0x00000000)?;
         self.write32(0xD334, 0x00000000)?;
         self.write32(0xD338, 0x00000000)?;
-        self.write32(0xD33C, 0x00000023)?;
+        self.write32(0xD33C, idx as u32)?;
         self.write32(0xD340, 0x00000000)?;
-        self.write32(0xD344, 0x00000024)?;
+        self.write32(0xD344, idx as u32)?;
         self.write32(0xD348, 0x00000000)?;
-        self.write32(0xD34C, 0x00000026)?;
+        self.write32(0xD34C, idx as u32)?;
         self.write32(0xD350, 0x00000000)?;
-        self.write32(0xD354, 0x00000020)?;
+        self.write32(0xD354, idx as u32)?;
         self.write32(0xD358, 0x00000000)?;
-        self.write32(0xD35C, 0x00000021)?;
+        self.write32(0xD35C, idx as u32)?;
         self.write32(0xD360, 0x00000000)?;
-        self.write32(0xD364, 0x00000022)?;
+        self.write32(0xD364, idx as u32)?;
         self.write32(0xD368, 0x00000000)?;
 
         Ok(())
@@ -3558,26 +3564,19 @@ impl Rtl8852au {
         // Management → B0MG (DMA ch 8) + MG0_SEL queue
         // Control → B0MG + MG0_SEL (highest priority, same as management)
         // Data → WMM AC queue from QoS TID
-        let (dma_ch, qsel) = match frame_type {
-            0 | 1 => (MAC_AX_DMA_B0MG, MAC_AX_MG0_SEL),
-            2 => {
-                // Data: extract QoS TID for WMM AC mapping
-                let tid = if _frame_subtype & 0x8 != 0 && frame.len() >= 26 {
-                    (frame[24] & 0x0F) as u32
-                } else {
-                    0
-                };
-                // WMM TID→AC: {1,2}→BK(1), {0,3}→BE(0), {4,5}→VI(2), {6,7}→VO(3)
-                match tid {
-                    1 | 2 => (MAC_AX_DMA_ACH1, (0u32 << 2) | 1), // WMM0 AC_BK
-                    0 | 3 => (MAC_AX_DMA_ACH0, (0u32 << 2) | 0), // WMM0 AC_BE
-                    4 | 5 => (MAC_AX_DMA_ACH2, (0u32 << 2) | 2), // WMM0 AC_VI
-                    6 | 7 => (MAC_AX_DMA_ACH3, (0u32 << 2) | 3), // WMM0 AC_VO
-                    _     => (MAC_AX_DMA_ACH0, (0u32 << 2) | 0), // default BE
-                }
-            }
-            _ => (MAC_AX_DMA_B0MG, MAC_AX_MG0_SEL),
-        };
+        // Route ALL injected frames through the management queue (B0MG + MG0_SEL).
+        //
+        // In monitor mode there's no association state or QoS scheduling — the
+        // Linux driver also uses the management queue for all injected frames.
+        // The ACH data queues (ACH0-ACH3) ARE properly initialized (verified via
+        // dump_8852au_hfc), and data frames through ACH0 work in isolation. But
+        // when the RX pipeline threads are running concurrent USB bulk reads,
+        // data frames through ACH0 cause firmware DMA contention that permanently
+        // kills RX (bulk IN returns only timeouts). B0MG doesn't have this issue.
+        //
+        // If we ever need WMM QoS (AP mode, associated STA mode), the ACH queues
+        // are available — just need to solve the concurrent RX contention first.
+        let (dma_ch, qsel) = (MAC_AX_DMA_B0MG, MAC_AX_MG0_SEL);
 
         // Rate encoding for DATARATE field (9-bit)
         let hw_rate = ax_rate_to_hw(&opts.rate) as u32;
@@ -3645,7 +3644,12 @@ impl Rtl8852au {
         }
         buf[28..32].copy_from_slice(&info_dw1.to_le_bytes());
 
-        // INFO DW2, DW3 = 0 (no security, no SIFS_TX, no sounding)
+        // INFO DW2 = 0 (no security)
+
+        // INFO DW3 (= overall DW9): SPE_RPT requests firmware TX completion report.
+        // Without this, firmware never generates rpkt_type=6 (TX_RPT) packets.
+        let info_dw3: u32 = AX_TXD_SPE_RPT;
+        buf[36..40].copy_from_slice(&info_dw3.to_le_bytes());
 
         // INFO DW4: RTS/CTS protection
         if opts.flags.contains(TxFlags::PROTECT) {
@@ -3791,6 +3795,7 @@ impl ChipDriver for Rtl8852au {
         &mut self,
         gate: crate::pipeline::FrameGate,
         alive: Arc<std::sync::atomic::AtomicBool>,
+        tx_feedback: Arc<crate::core::chip::TxFeedback>,
     ) -> bool {
         start_rx_pipeline_8852au(
             Arc::clone(&self.handle),
@@ -3799,6 +3804,7 @@ impl ChipDriver for Rtl8852au {
             Arc::clone(&self.pipeline_stats),
             gate,
             alive,
+            tx_feedback,
         );
         true
     }
@@ -3920,6 +3926,7 @@ fn start_rx_pipeline_8852au(
     stats: Arc<StreamPipelineStats>,
     gate: crate::pipeline::FrameGate,
     alive: Arc<AtomicBool>,
+    tx_feedback: Arc<crate::core::chip::TxFeedback>,
 ) {
     if let Ok(mut global) = PIPELINE_STATS.lock() {
         *global = Some(Arc::clone(&stats));
@@ -3939,16 +3946,77 @@ fn start_rx_pipeline_8852au(
             let mut log = std::fs::OpenOptions::new()
                 .create(true).write(true).truncate(true)
                 .open("/tmp/wifikit_usb_reads.log").ok();
+            // Separate log for RX thread lifecycle events — never truncated by hex dumps
+            let mut rx_log = std::fs::OpenOptions::new()
+                .create(true).write(true).truncate(true)
+                .open("/tmp/wifikit_rx_thread.log").ok();
             let mut read_num = 0u64;
+            let mut timeout_streak = 0u64;
             const LOG_READS: u64 = 200;
 
+            if let Some(ref mut f) = rx_log {
+                let _ = writeln!(f, "RX thread started, ep_in=0x{:02X}", ep_in);
+            }
+
+            let mut consecutive_errors = 0u32;
             loop {
-                if !alive_reader.load(Ordering::SeqCst) { break; }
+                if !alive_reader.load(Ordering::SeqCst) {
+                    if let Some(ref mut f) = rx_log {
+                        let _ = writeln!(f, "RX thread exit: alive=false (read_num={})", read_num);
+                    }
+                    break;
+                }
                 let actual = match device_clone.read_bulk(ep_in, &mut buf, STREAM_USB_TIMEOUT) {
-                    Ok(n) if n > 0 => n,
+                    Ok(n) if n > 0 => {
+                        consecutive_errors = 0;
+                        if timeout_streak > 0 {
+                            if let Some(ref mut f) = rx_log {
+                                let _ = writeln!(f, "read#{}: data resumed ({} bytes) after {} timeouts",
+                                    read_num + 1, n, timeout_streak);
+                            }
+                            timeout_streak = 0;
+                        }
+                        n
+                    }
                     Ok(_) => continue,
-                    Err(rusb::Error::Timeout | rusb::Error::Interrupted) => continue,
-                    Err(_) => break,
+                    Err(rusb::Error::Timeout) => {
+                        timeout_streak += 1;
+                        // Log every 10th timeout so we can see the silence
+                        if timeout_streak == 1 || timeout_streak % 10 == 0 {
+                            if let Some(ref mut f) = rx_log {
+                                let _ = writeln!(f, "read#{}: timeout streak={} ({}ms each)",
+                                    read_num, timeout_streak, STREAM_USB_TIMEOUT.as_millis());
+                            }
+                        }
+                        continue;
+                    }
+                    Err(rusb::Error::Interrupted) => continue,
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if let Some(ref mut f) = rx_log {
+                            let _ = writeln!(f, "read#{}: USB ERROR {:?} (consecutive={})",
+                                read_num, e, consecutive_errors);
+                        }
+                        match e {
+                            rusb::Error::Pipe => {
+                                let _ = device_clone.clear_halt(ep_in);
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            rusb::Error::Overflow | rusb::Error::Busy => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            _ => {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                        if consecutive_errors >= 50 {
+                            if let Some(ref mut f) = rx_log {
+                                let _ = writeln!(f, "FATAL: 50 consecutive USB errors, RX thread exiting");
+                            }
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 read_num += 1;
                 stats_reader.usb_reads.fetch_add(1, Ordering::Relaxed);
@@ -4039,7 +4107,9 @@ fn start_rx_pipeline_8852au(
                                 gate.submit(frame);
                             }
                             crate::core::chip::ParsedPacket::DriverMessage(_) => {}
-                            crate::core::chip::ParsedPacket::TxStatus(_) => {}
+                            crate::core::chip::ParsedPacket::TxStatus(ref rpt) => {
+                                tx_feedback.record(rpt);
+                            }
                             crate::core::chip::ParsedPacket::C2hEvent(_) => {}
                             crate::core::chip::ParsedPacket::ChannelInfo(_) => {}
                             crate::core::chip::ParsedPacket::DfsReport(_) => {}

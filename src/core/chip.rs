@@ -392,6 +392,7 @@ pub trait ChipDriver: Send {
         &mut self,
         _gate: crate::pipeline::FrameGate,
         _alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _tx_feedback: std::sync::Arc<TxFeedback>,
     ) -> bool {
         false
     }
@@ -416,6 +417,81 @@ pub trait ChipDriver: Send {
 /// Adapters return different variants depending on what the packet contains:
 /// - Register-based chips (RTL): only Frame and Skip
 /// - MCU-based chips (MediaTek): Frame, DriverMessage, TxStatus, and Skip
+// ── TX Feedback Counters ──
+// Aggregate TX completion stats — shared via Arc, readable from any thread.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Aggregate TX feedback counters from firmware ACK/NACK reports.
+///
+/// Updated atomically by the RX pipeline whenever a TxReport arrives.
+/// Attacks and CLI views read these to show delivery success rates.
+#[derive(Default)]
+pub struct TxFeedback {
+    /// Frames acknowledged by the receiver (tx_state == 0).
+    pub acked: AtomicU64,
+    /// Frames NOT acknowledged (tx_state != 0: retry limit, lifetime expired, etc.).
+    pub nacked: AtomicU64,
+    /// Total TX attempts across all reports (sum of tx_cnt fields).
+    /// Divide by total reports to get average retries per frame.
+    pub total_retries: AtomicU64,
+    /// Total TxReports processed.
+    pub total_reports: AtomicU64,
+}
+
+impl TxFeedback {
+    /// Record a TxReport into the aggregate counters.
+    pub fn record(&self, report: &TxReport) {
+        self.total_reports.fetch_add(1, Ordering::Relaxed);
+        self.total_retries.fetch_add(report.tx_cnt as u64, Ordering::Relaxed);
+        if report.acked {
+            self.acked.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.nacked.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot the current counters for display.
+    pub fn snapshot(&self) -> TxFeedbackSnapshot {
+        let acked = self.acked.load(Ordering::Relaxed);
+        let nacked = self.nacked.load(Ordering::Relaxed);
+        let total_retries = self.total_retries.load(Ordering::Relaxed);
+        let total_reports = self.total_reports.load(Ordering::Relaxed);
+        TxFeedbackSnapshot { acked, nacked, total_retries, total_reports }
+    }
+
+    /// Reset all counters to zero (e.g., when starting a new attack).
+    pub fn reset(&self) {
+        self.acked.store(0, Ordering::Relaxed);
+        self.nacked.store(0, Ordering::Relaxed);
+        self.total_retries.store(0, Ordering::Relaxed);
+        self.total_reports.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Point-in-time snapshot of TxFeedback counters — cheap to clone and display.
+#[derive(Debug, Clone, Default)]
+pub struct TxFeedbackSnapshot {
+    pub acked: u64,
+    pub nacked: u64,
+    pub total_retries: u64,
+    pub total_reports: u64,
+}
+
+impl TxFeedbackSnapshot {
+    /// Delivery success rate as a percentage (0.0–100.0). Returns None if no reports.
+    pub fn delivery_pct(&self) -> Option<f64> {
+        if self.total_reports == 0 { return None; }
+        Some(self.acked as f64 / self.total_reports as f64 * 100.0)
+    }
+
+    /// Average TX attempts per frame. Returns None if no reports.
+    pub fn avg_retries(&self) -> Option<f64> {
+        if self.total_reports == 0 { return None; }
+        Some(self.total_retries as f64 / self.total_reports as f64)
+    }
+}
+
 // ── TX Status Report ──
 // Structured TX completion feedback from firmware.
 

@@ -450,6 +450,10 @@ pub fn render_pmkid_view(info: &PmkidInfo, width: u16, _height: u16, scroll_offs
     if info.frames_per_sec > 0.0 {
         stat_parts.push(format!("{:.0} fps", info.frames_per_sec));
     }
+    if info.tx_feedback.total_reports > 0 {
+        stat_parts.push(format!("{} ack", s().green().paint(&prism::format_number(info.tx_feedback.acked))));
+        stat_parts.push(format!("{} nack", s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+    }
     let stats = if stat_parts.is_empty() {
         String::new()
     } else {
@@ -525,6 +529,14 @@ pub fn status_segments(info: &PmkidInfo) -> Vec<StatusSegment> {
             format!("{}/{}", info.target_index, info.target_total),
             SegmentStyle::Dim,
         ));
+    }
+
+    // TX delivery rate
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        let style = if pct > 80.0 { SegmentStyle::Green }
+            else if pct > 50.0 { SegmentStyle::Yellow }
+            else { SegmentStyle::Red };
+        segs.push(StatusSegment::new(format!("{:.0}% delivered", pct), style));
     }
 
     let elapsed_secs = info.start_time.elapsed().as_secs_f64();
@@ -668,6 +680,15 @@ impl Module for PmkidModule {
             s().dim().paint(&format!("{} frames sent", info.frames_sent)),
             s().dim().paint(&format!("{} received", info.frames_received)),
         ));
+
+        // TX feedback
+        if info.tx_feedback.total_reports > 0 {
+            let pct = info.tx_feedback.delivery_pct().unwrap_or(0.0);
+            content_lines.push(format!("TX: {} ack  {} nack  ({:.0}% delivered)",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked)),
+                pct));
+        }
 
         // Per-target results
         if !info.results.is_empty() {

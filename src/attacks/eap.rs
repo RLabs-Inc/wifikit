@@ -29,7 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
 use crate::store::Ap;
 use crate::protocol::eap::{self, EapType};
 use crate::protocol::frames;
@@ -465,6 +465,9 @@ pub struct EapInfo {
 
     // === Credentials list (for CLI display) ===
     pub credentials: Vec<EapCredential>,
+
+    // === TX feedback ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
 }
 
 impl Default for EapInfo {
@@ -502,6 +505,7 @@ impl Default for EapInfo {
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
             credentials: Vec::new(),
+            tx_feedback: Default::default(),
         }
     }
 }
@@ -708,9 +712,17 @@ fn run_eap_attack(
     running: &Arc<AtomicBool>,
 ) {
     let start = Instant::now();
-    let tx_opts = TxOptions::default();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
     let target_bssid = target.bssid;
     let channel = target.channel;
+    // TX options optimized for range — own MAC so ACK feedback works
+    let tx_opts = TxOptions {
+        rate: if channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
+        retries: 12,
+        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
+        ..Default::default()
+    };
     let ssid = &target.ssid;
 
     // === Determine our AP BSSID ===
@@ -1489,7 +1501,16 @@ fn run_eap_attack(
             if secs > 0.0 {
                 i.frames_per_sec = frames_sent as f64 / secs;
             }
+            i.tx_feedback = tx_fb.snapshot();
         }
+    }
+
+    // Final info update
+    {
+        let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+        i.elapsed = start.elapsed();
+        i.frames_sent = frames_sent;
+        i.tx_feedback = tx_fb.snapshot();
     }
 
     // === Cleanup ===

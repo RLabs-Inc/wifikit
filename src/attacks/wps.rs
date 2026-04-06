@@ -32,7 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
 use crate::store::Ap;
 use crate::protocol::frames;
 use crate::protocol::ieee80211::{self, fc, fc_flags, ReasonCode, StatusCode};
@@ -308,6 +308,9 @@ pub struct WpsInfo {
     pub frames_received: u64,
     pub lockouts_detected: u32,
 
+    // === TX Feedback ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     // === Timing ===
     pub start_time: Instant,
     pub elapsed: Duration,
@@ -374,6 +377,7 @@ impl Default for WpsInfo {
             frames_sent: 0,
             frames_received: 0,
             lockouts_detected: 0,
+            tx_feedback: Default::default(),
             start_time: Instant::now(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
@@ -899,13 +903,16 @@ impl WpsAttack {
             .name("wps".into())
             .spawn(move || {
                 let reader = shared.subscribe("wps");
-                run_wps_multi(&shared, &reader, &targets, &params, &info, &events, &running);
+                let tx_fb = shared.tx_feedback();
+                tx_fb.reset();
+                run_wps_multi(&shared, &reader, &targets, &params, &info, &events, &running, &tx_fb);
                 running.store(false, Ordering::SeqCst);
                 done.store(true, Ordering::SeqCst);
                 {
                     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                     info.running = false;
                     info.phase = WpsPhase::Done;
+                    info.tx_feedback = tx_fb.snapshot();
                 }
             })
             .expect("failed to spawn wps thread");
@@ -950,6 +957,7 @@ fn run_wps_multi(
     info: &Arc<Mutex<WpsInfo>>,
     events: &Arc<EventRing<WpsEvent>>,
     running: &Arc<AtomicBool>,
+    tx_fb: &crate::core::TxFeedback,
 ) {
     let attack_start = Instant::now();
 
@@ -984,6 +992,7 @@ fn run_wps_multi(
             i.ap_serial_number = String::new();
             i.ap_device_name = String::new();
             i.elapsed = attack_start.elapsed();
+            i.tx_feedback = tx_fb.snapshot();
         }
 
         push_event(events, attack_start, WpsEventKind::TargetStarted {
@@ -1042,6 +1051,7 @@ fn run_wps_multi(
         };
         i.final_result = Some(final_result);
         i.elapsed = attack_start.elapsed();
+        i.tx_feedback = tx_fb.snapshot();
     }
 
     // Final summary event
@@ -1071,8 +1081,13 @@ fn run_wps_attack_single(
     let bssid = target.bssid;
     let channel = target.channel;
 
-    // TX options for management and data frames
-    let tx_opts = TxOptions::default();
+    // TX options optimized for range — own MAC so ACK feedback works
+    let tx_opts = TxOptions {
+        rate: if channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
+        retries: 12,
+        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
+        ..Default::default()
+    };
 
     // Lock channel
     if channel > 0 {

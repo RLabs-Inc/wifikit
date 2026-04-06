@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
 use crate::store::Ap;
 use crate::protocol::frames;
 use crate::protocol::ie::{self, ApSecurity, BeaconIeConfig};
@@ -295,6 +295,9 @@ pub struct ApInfo {
     pub frames_sent: u64,
     pub frames_received: u64,
 
+    // === TX Feedback (ACK/NACK from firmware) ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     // === Timing ===
     pub start_time: Instant,
     pub elapsed: Duration,
@@ -329,6 +332,7 @@ impl Default for ApInfo {
             bytes_rx: 0,
             frames_sent: 0,
             frames_received: 0,
+            tx_feedback: Default::default(),
             start_time: Instant::now(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
@@ -535,7 +539,8 @@ fn run_ap_attack(
     running: &Arc<AtomicBool>,
 ) {
     let start = Instant::now();
-    let tx_opts = TxOptions::default();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
 
     // === Determine our AP identity ===
     let ssid = params.ssid.clone().unwrap_or_else(|| {
@@ -543,6 +548,13 @@ fn run_ap_attack(
     });
     let channel = target.map(|t| t.channel).unwrap_or(6);
     let target_bssid = target.map(|t| t.bssid);
+    // TX options optimized for range — own MAC so ACK feedback works
+    let tx_opts = TxOptions {
+        rate: if channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
+        retries: 12,
+        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
+        ..Default::default()
+    };
 
     let our_bssid = if let Some(bssid) = params.our_bssid {
         bssid
@@ -1060,6 +1072,7 @@ fn run_ap_attack(
             if secs > 0.0 {
                 i.frames_per_sec = frames_sent as f64 / secs;
             }
+            i.tx_feedback = tx_fb.snapshot();
         }
     }
 

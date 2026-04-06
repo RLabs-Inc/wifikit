@@ -518,11 +518,21 @@ pub fn render_fuzz_view(info: &FuzzInfo, crashes: &[FuzzCrash], width: u16) -> V
                 s().red().paint("crashes"))
         } else { String::new() };
 
-        lines.push(vline(&format!("{}  {} sent  {} recv  {}  {}{}",
+        let tx_fb_str = if info.tx_feedback.total_reports > 0 {
+            let mut fb = format!("  {} ack  {} nack",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked)));
+            if let Some(pct) = info.tx_feedback.delivery_pct() {
+                fb.push_str(&format!("  {}%", pct as u64));
+            }
+            fb
+        } else { String::new() };
+
+        lines.push(vline(&format!("{}  {} sent  {} recv  {}  {}{}{}",
             s().yellow().bold().paint(&iter_str),
             prism::format_number(info.frames_sent),
             prism::format_number(info.frames_received),
-            rate, s().dim().paint(&elapsed), crash_str), inner_w));
+            rate, s().dim().paint(&elapsed), tx_fb_str, crash_str), inner_w));
 
         // Probe health check stats
         if info.probes_sent > 0 {
@@ -627,6 +637,10 @@ pub fn status_segments(info: &FuzzInfo) -> Vec<StatusSegment> {
             format!("{} crashes", info.crashes_found),
             SegmentStyle::RedBold,
         ));
+    }
+
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
 
     segs.push(StatusSegment::new(format_elapsed(info.elapsed), SegmentStyle::Dim));

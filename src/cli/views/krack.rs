@@ -255,9 +255,17 @@ pub fn render_krack_view(info: &KrackInfo, width: u16, _height: u16, scroll_offs
         let hs_badge = if info.handshake_captured {
             s().green().paint("HS\u{2714}")
         } else { s().dim().paint("HS...") };
-        let stats = format!("{}  {} replays  {} reuses  {} sent  {:.1}s",
+        let mut stats = format!("{}  {} replays  {} reuses  {} sent  {:.1}s",
             hs_badge, info.m3_replays_sent, info.nonce_reuses_total,
             prism::format_number(info.frames_sent), elapsed);
+        if info.tx_feedback.total_reports > 0 {
+            stats.push_str(&format!("  {} ack  {} nack",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+            if let Some(pct) = info.tx_feedback.delivery_pct() {
+                stats.push_str(&format!("  {}%", pct as u64));
+            }
+        }
         lines.push(vline(&s().dim().paint(&stats), inner_w));
 
         // Current variant indicator
@@ -383,6 +391,10 @@ pub fn status_segments(info: &KrackInfo) -> Vec<StatusSegment> {
 
     if info.variant_total > 0 {
         segs.push(StatusSegment::new(format!("{}/{}", info.variant_index, info.variant_total), SegmentStyle::Dim));
+    }
+
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
 
     segs.push(StatusSegment::new(

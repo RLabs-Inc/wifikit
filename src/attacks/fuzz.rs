@@ -470,6 +470,10 @@ pub struct FuzzInfo {
     /// Health check probes answered.
     pub probes_answered: u32,
 
+    // === TX Feedback ===
+    /// Hardware TX feedback (ACK/NACK counters from adapter).
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
+
     // === Crash stats ===
     /// Total crashes detected.
     pub crashes_found: u32,
@@ -511,6 +515,7 @@ impl Default for FuzzInfo {
             frames_per_sec: 0.0,
             probes_sent: 0,
             probes_answered: 0,
+            tx_feedback: Default::default(),
             crashes_found: 0,
             crashes_recovered: 0,
             crashes_permanent: 0,
@@ -1856,6 +1861,8 @@ fn run_fuzz_attack(
     crashes: &Arc<Mutex<Vec<FuzzCrash>>>,
 ) {
     let start = Instant::now();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
     let our_mac_addr = shared.mac();
     let our_mac = our_mac_addr.0;
     let target_mac = target.bssid.0;
@@ -2107,6 +2114,7 @@ fn run_fuzz_attack(
             info.probes_sent = probes_sent;
             info.probes_answered = probes_answered;
             info.elapsed = start.elapsed();
+            info.tx_feedback = tx_fb.snapshot();
         }
 
         // ── Rate tracking (once per second) ──
@@ -2119,6 +2127,7 @@ fn run_fuzz_attack(
             {
                 let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                 info.frames_per_sec = fps;
+                info.tx_feedback = tx_fb.snapshot();
             }
 
             push_event(events, start, FuzzEventKind::RateSnapshot {
@@ -2312,6 +2321,7 @@ fn run_fuzz_attack(
         info.crashes_recovered = crashes_recovered;
         info.crashes_permanent = crashes_permanent;
         info.elapsed = start.elapsed();
+        info.tx_feedback = tx_fb.snapshot();
     }
 }
 

@@ -244,11 +244,19 @@ pub fn render_ap_view(info: &ApInfo, width: u16) -> Vec<String> {
 
         // Traffic stats
         if info.data_frames_rx > 0 || info.frames_sent > 0 {
-            let stats3 = format!("{} TX  {} RX  {} data frames  {}",
+            let mut stats3 = format!("{} TX  {} RX  {} data frames  {}",
                 prism::format_compact(info.frames_sent),
                 prism::format_compact(info.frames_received),
                 prism::format_compact(info.data_frames_rx),
                 prism::format_bytes(info.bytes_rx));
+            if info.tx_feedback.total_reports > 0 {
+                stats3.push_str(&format!("  {} ack  {} nack",
+                    s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                    s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+                if let Some(pct) = info.tx_feedback.delivery_pct() {
+                    stats3.push_str(&format!("  {}%", pct as u64));
+                }
+            }
             lines.push(vline(&s().dim().paint(&stats3), inner_w));
         }
 
@@ -385,6 +393,10 @@ pub fn status_segments(info: &ApInfo) -> Vec<StatusSegment> {
             format!("{} SSIDs", info.karma_ssids_collected),
             SegmentStyle::Cyan,
         ));
+    }
+
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
 
     let elapsed_secs = info.start_time.elapsed().as_secs_f64();

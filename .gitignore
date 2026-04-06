@@ -1,6 +1,24 @@
+# Build
 /target
+
+# macOS
 .DS_Store
+
+# Claude Code workspace
 .claude/
+
+# Capture/test files
 *.kismet
 *.csv
+*.pcap
+*.hccapx
+*.hc22000
+
+# Third-party references (854M of vendor driver source)
 references/
+
+# Internal planning docs
+.planning/
+
+# Python tools/venv
+firmware-tools/

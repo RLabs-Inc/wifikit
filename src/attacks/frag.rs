@@ -438,6 +438,9 @@ pub struct FragInfo {
 
     // === Results ===
     pub results: Vec<FragTestResult>,
+
+    // === TX Feedback ===
+    pub tx_feedback: crate::core::TxFeedbackSnapshot,
 }
 
 impl Default for FragInfo {
@@ -462,6 +465,7 @@ impl Default for FragInfo {
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
             results: Vec::new(),
+            tx_feedback: Default::default(),
         }
     }
 }
@@ -671,6 +675,8 @@ fn run_frag_attack(
 ) {
     let start = Instant::now();
     let our_mac = shared.mac();
+    let tx_fb = shared.tx_feedback();
+    tx_fb.reset();
 
     push_event(events, start, FragEventKind::SuiteStarted {
         bssid: target.bssid,
@@ -816,6 +822,7 @@ fn run_frag_attack(
         if secs > 0.0 {
             info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
         }
+        info.tx_feedback = tx_fb.snapshot();
     }
 }
 
@@ -836,6 +843,7 @@ fn run_single_test(
     attack_start: Instant,
 ) -> FragTestResult {
     let test_start = Instant::now();
+    let tx_fb = shared.tx_feedback();
     let mut result = FragTestResult::new(variant);
     result.verdict = FragVerdict::Testing;
 
@@ -911,6 +919,7 @@ fn run_single_test(
                     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                     info.frames_sent += frames_sent;
                     info.frames_received += received_count;
+                    info.tx_feedback = tx_fb.snapshot();
                 }
 
                 result.elapsed = test_start.elapsed();
@@ -936,6 +945,7 @@ fn run_single_test(
     {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.frames_sent += result.frames_sent;
+        info.tx_feedback = tx_fb.snapshot();
     }
 
     result

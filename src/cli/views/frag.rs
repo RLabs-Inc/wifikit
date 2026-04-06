@@ -268,12 +268,20 @@ pub fn render_frag_view(info: &FragInfo, width: u16, _height: u16, scroll_offset
         let retry_str = if info.current_retry > 0 {
             format!("  retry {}", info.current_retry)
         } else { String::new() };
-        let stats = format!("{} sent  {} recv  {:.0} fps  {:.1}s{}",
+        let mut stats = format!("{} sent  {} recv  {:.0} fps  {:.1}s{}",
             prism::format_number(info.frames_sent),
             prism::format_number(info.frames_received),
             info.frames_per_sec,
             elapsed,
             s().yellow().paint(&retry_str));
+        if info.tx_feedback.total_reports > 0 {
+            stats.push_str(&format!("  {} ack  {} nack",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+            if let Some(pct) = info.tx_feedback.delivery_pct() {
+                stats.push_str(&format!("  {}%", pct as u64));
+            }
+        }
         lines.push(vline(&s().dim().paint(&stats), inner_w));
 
         if let Some(variant) = &info.current_variant {
@@ -397,6 +405,10 @@ pub fn status_segments(info: &FragInfo) -> Vec<StatusSegment> {
             format!("{}/{}", info.variant_index, info.variant_total),
             SegmentStyle::Dim,
         ));
+    }
+
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
 
     segs.push(StatusSegment::new(

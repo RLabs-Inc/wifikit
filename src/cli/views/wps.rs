@@ -594,6 +594,13 @@ pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, scroll_offset: 
     if info.frames_per_sec > 0.0 {
         stat_parts.push(format!("{:.0} fps", info.frames_per_sec));
     }
+    if info.tx_feedback.total_reports > 0 {
+        stat_parts.push(format!("{} ack", s().green().paint(&prism::format_number(info.tx_feedback.acked))));
+        stat_parts.push(format!("{} nack", s().red().paint(&prism::format_number(info.tx_feedback.nacked))));
+        if let Some(pct) = info.tx_feedback.delivery_pct() {
+            stat_parts.push(format!("{}%", pct as u64));
+        }
+    }
     let stats = if stat_parts.is_empty() {
         String::new()
     } else {
@@ -659,6 +666,10 @@ pub fn status_segments(info: &WpsInfo) -> Vec<StatusSegment> {
 
     if info.lockouts_detected > 0 {
         segs.push(StatusSegment::new(format!("{}\u{1f512}", info.lockouts_detected), SegmentStyle::Red));
+    }
+
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        segs.push(StatusSegment::new(format!("{}%tx", pct as u64), SegmentStyle::Dim));
     }
 
     let elapsed_secs = info.start_time.elapsed().as_secs_f64();

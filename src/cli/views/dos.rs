@@ -230,12 +230,19 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
     if info.phase == DosPhase::Flooding || info.phase == DosPhase::Done || info.phase == DosPhase::Cooldown {
         let elapsed_secs = info.start_time.elapsed().as_secs_f64();
         let rate = format_rate(info.frames_per_sec);
-        let stats = format!("{} sent  {} recv  {}  {}  {:.1}s",
+        let mut stats = format!("{} sent  {} recv  {}  {}  {:.1}s",
             s().red().bold().paint(&prism::format_number(info.frames_sent)),
             s().dim().paint(&prism::format_number(info.frames_received)),
             rate,
             s().dim().paint(&prism::format_bytes(info.bytes_sent)),
             elapsed_secs);
+        if info.tx_feedback.total_reports > 0 {
+            let pct = info.tx_feedback.delivery_pct().unwrap_or(0.0);
+            stats.push_str(&format!("  {} ack  {} nack ({}%)",
+                s().green().paint(&prism::format_number(info.tx_feedback.acked)),
+                s().red().paint(&prism::format_number(info.tx_feedback.nacked)),
+                s().bold().paint(&format!("{:.0}", pct))));
+        }
         lines.push(vline(&stats, inner_w));
     }
 
@@ -383,6 +390,14 @@ pub fn status_segments(info: &DosInfo) -> Vec<StatusSegment> {
     // Bytes sent
     if info.bytes_sent > 0 {
         segs.push(StatusSegment::new(prism::format_bytes(info.bytes_sent), SegmentStyle::Dim));
+    }
+
+    // TX delivery rate
+    if let Some(pct) = info.tx_feedback.delivery_pct() {
+        let style = if pct > 80.0 { SegmentStyle::Green }
+            else if pct > 50.0 { SegmentStyle::Yellow }
+            else { SegmentStyle::Red };
+        segs.push(StatusSegment::new(format!("{:.0}% delivered", pct), style));
     }
 
     segs
@@ -561,8 +576,18 @@ impl Module for DosModule {
             .map(|r| stop_reason_label(r))
             .unwrap_or("completed");
 
+        let tx_line = if info.tx_feedback.total_reports > 0 {
+            let pct = info.tx_feedback.delivery_pct().unwrap_or(0.0);
+            format!("\nTX: {} ack  {} nack  ({:.0}% delivered)",
+                prism::format_number(info.tx_feedback.acked),
+                prism::format_number(info.tx_feedback.nacked),
+                pct)
+        } else {
+            String::new()
+        };
+
         let content = format!(
-            "Target: {} ({})\nType: {}\nFrames: {} ({} fps)\nDuration: {:.1}s  |  {} sent\nReason: {}",
+            "Target: {} ({})\nType: {}\nFrames: {} ({} fps)\nDuration: {:.1}s  |  {} sent{}\nReason: {}",
             info.target_ssid,
             info.target_bssid,
             info.attack_type.label(),
@@ -570,6 +595,7 @@ impl Module for DosModule {
             prism::format_compact(info.frames_per_sec as u64),
             info.elapsed.as_secs_f64(),
             prism::format_bytes(info.bytes_sent),
+            tx_line,
             reason_str,
         );
 

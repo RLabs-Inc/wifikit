@@ -783,14 +783,14 @@ impl Rtl8812au {
         // Enable OFDM + CCK
         self.set_bb_reg(BB_OFDM_CCK_EN, BB_OFDM_EN | BB_CCK_EN, 0x3)?;
 
-        // TX path configuration
-        self.set_bb_reg(BB_TX_PATH, 0xF0, 0x1)?;       // TX path = A
-        self.set_bb_reg(BB_CCK_RX, 0x0F000000, 0x1)?;  // CCK RX path
+        // TX path configuration (2T2R: both chains for STBC + diversity)
+        self.set_bb_reg(BB_TX_PATH, 0xF0, 0x3)?;       // TX path = A+B (2T2R)
+        self.set_bb_reg(BB_CCK_RX, 0x0F000000, 0x3)?;  // CCK RX path = A+B
 
         // AGC table select for 2.4G (default)
         self.set_bb_reg(BB_AGC_TABLE, 0x3, 0)?;
 
-        // IGI: leave at init table defaults (0x20 for 8812A)
+        // IGI: leave at init table defaults (0x20 for 8812A, both paths active)
         // Note: 8812A AGC differs from 8822B — higher IGI can cause saturation
 
         Ok(())
@@ -1227,10 +1227,7 @@ impl Rtl8812au {
         } else {
             tx_rate_to_hw(&opts.rate, self.channel)
         };
-        // TODO: retries computed but not written to TX descriptor — byte 0x11 is
-        // hardcoded to 0x1F from Linux usbmon. Wire this like RTL8812BU does:
-        // buf[0x12] = (1 << 1) | ((retries & 0x3F) << 2)
-        let _retries = if opts.flags.contains(TxFlags::NO_RETRY) {
+        let retries = if opts.flags.contains(TxFlags::NO_RETRY) {
             1
         } else if opts.retries > 0 {
             opts.retries.min(63)
@@ -1314,6 +1311,17 @@ impl Rtl8812au {
         // byte[0x11] = 0x1F matches Linux for all management frames
         buf[0x10] = rate & 0x7F;                       // TX_RATE [6:0]
         buf[0x11] = 0x1F;                              // Linux: RTY_LMT_EN + rate flags
+
+        // DW5: RTY_LMT_EN + retry limit (same layout as RTL8812BU)
+        buf[0x12] = (1 << 1) | ((retries as u8 & 0x3F) << 2); // RTY_LMT_EN[1] + DATA_RTY_LMT[7:2]
+
+        // DW5: STBC + LDPC (byte 0x17)
+        if opts.flags.contains(TxFlags::STBC) {
+            buf[0x17] |= 1 << 4; // DATA_STBC = 1 (single stream)
+        }
+        if opts.flags.contains(TxFlags::LDPC) {
+            buf[0x17] |= 1; // DATA_LDPC
+        }
 
         // DW8: HWSEQ_EN — let hardware assign sequence numbers
         buf[0x21] = 1 << 7;                            // HWSEQ_EN (bit 15 of DW8)
