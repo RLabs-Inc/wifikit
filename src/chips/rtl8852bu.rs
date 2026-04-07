@@ -1121,9 +1121,7 @@ impl Rtl8852bu {
     /// Each segment is [start, end) — operations at start are included, at end are not.
     const TS_INIT_START: f64       = 0.0;             // beginning of pcap
     const TS_MONITOR_START: f64    = 1775596262.803;  // MONITOR_START
-    const TS_MONITOR_DONE: f64     = 1775596264.414;  // MONITOR_DONE
-    const TS_FULL_CHBW_START: f64  = 1775596332.848;  // FULL_CHBW_START
-    const TS_FULL_CHBW_DONE: f64   = 1775596365.585;  // FULL_CHBW_DONE
+    const TS_FIRST_CH_SWITCH: f64  = 1775596264.415;  // CHANNELS_2G_START — first channel switch op
 
     /// Replay a time-bounded segment of the pcap capture.
     /// Replays ALL operations (register reads, writes, EP7 bulk) verbatim.
@@ -1289,8 +1287,11 @@ impl Rtl8852bu {
             }
         }
 
-        eprintln!("  [{}] {} reg writes, {} reg reads, {} EP7 sent, {} EP7 fail",
-            label, reg_writes, reg_reads, ep7_sent, ep7_fail);
+        // Only log during init phases, not runtime channel switches
+        if label == "init" || label == "monitor" {
+            eprintln!("  [{}] {} reg writes, {} reg reads, {} EP7 sent, {} EP7 fail",
+                label, reg_writes, reg_reads, ep7_sent, ep7_fail);
+        }
 
         Ok((reg_writes, reg_reads, ep7_sent, ep7_fail))
     }
@@ -1300,9 +1301,9 @@ impl Rtl8852bu {
         self.replay_pcap_segment(Self::TS_INIT_START, Self::TS_MONITOR_START, "init")
     }
 
-    /// Replay MONITOR MODE segment: sets up promiscuous monitor mode.
+    /// Replay MONITOR MODE segment: everything from monitor start up to the first channel switch.
     fn replay_pcap_monitor(&self) -> Result<(u32, u32, u32, u32)> {
-        self.replay_pcap_segment(Self::TS_MONITOR_START, Self::TS_MONITOR_DONE, "monitor")
+        self.replay_pcap_segment(Self::TS_MONITOR_START, Self::TS_FIRST_CH_SWITCH, "monitor")
     }
 
     /// Channel+BW pcap segments from FULL_CHBW capture.
