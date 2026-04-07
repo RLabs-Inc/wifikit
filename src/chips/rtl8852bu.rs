@@ -1709,15 +1709,159 @@ impl ChipDriver for Rtl8852bu {
         Duration::from_millis(10)
     }
 
-    // RX pipeline stub — will be implemented after init verification
     fn start_rx_pipeline(
         &mut self,
-        _gate: crate::pipeline::FrameGate,
-        _alive: Arc<AtomicBool>,
+        gate: crate::pipeline::FrameGate,
+        alive: Arc<AtomicBool>,
         _tx_feedback: Arc<crate::core::chip::TxFeedback>,
     ) -> bool {
-        false // fall back to take_rx_handle / rx_frame polling
+        start_rx_pipeline_8852bu(
+            Arc::clone(&self.handle),
+            self.ep_in,
+            Arc::clone(&self.channel),
+            gate,
+            alive,
+        );
+        true
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  RX Pipeline — driver-managed stream parser
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  Two threads:
+//    [rx-usb-reader]    USB bulk IN → raw bytes → mpsc channel
+//    [rx-stream-parser]  mpsc → parse MAC AX RX descriptors → FrameGate.submit()
+//
+//  Same architecture as 8852AU — the RX descriptor format is identical (MAC AX gen2).
+
+fn parse_rx_packet_8852bu(buf: &[u8], channel: u8) -> (usize, crate::core::chip::ParsedPacket) {
+    use crate::core::chip::ParsedPacket;
+
+    if buf.len() < RX_DESC_SHORT {
+        return (0, ParsedPacket::Skip);
+    }
+
+    let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let pkt_len = (dw0 & 0x3FFF) as usize;
+    let shift = ((dw0 >> 14) & 0x3) as usize;
+    let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
+    let drv_info_size = ((dw0 >> 28) & 0x7) as usize;
+    let long_rxd = (dw0 >> 31) & 1 != 0;
+
+    let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
+    let payload_offset = desc_len + (drv_info_size * 8) + (shift * 2);
+
+    // Total consumed bytes — aligned to 8 bytes
+    let total_raw = payload_offset + pkt_len;
+    let consumed = (total_raw + 7) & !7;
+
+    if pkt_len == 0 || consumed > buf.len() {
+        return (consumed.min(buf.len()), ParsedPacket::Skip);
+    }
+
+    // Only WiFi frames (rpkt_type=0)
+    if rpkt_type != 0 {
+        return (consumed, ParsedPacket::Skip);
+    }
+
+    let mac_info_vld = (dw0 >> 23) & 1 != 0;
+    let extra = if mac_info_vld { 4 } else { 0 };
+    let data_start = payload_offset + extra;
+    let frame_len = if pkt_len >= 4 + extra { pkt_len - 4 - extra } else { 0 };
+
+    if frame_len == 0 || data_start + frame_len > buf.len() {
+        return (consumed, ParsedPacket::Skip);
+    }
+
+    // Parse RSSI from RX descriptor DW1 (if long descriptor)
+    let rssi = if long_rxd && buf.len() >= 8 {
+        let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let raw_rssi = ((dw1 >> 0) & 0xFF) as i16;
+        if raw_rssi > 0 { (raw_rssi - 110).max(-100) as i8 } else { -80i8 }
+    } else {
+        -80i8
+    };
+
+    let frame = RxFrame {
+        data: buf[data_start..data_start + frame_len].to_vec(),
+        channel,
+        band: if channel <= 14 { 0 } else { 1 },
+        rssi,
+        ..Default::default()
+    };
+
+    (consumed, ParsedPacket::Frame(frame))
+}
+
+fn start_rx_pipeline_8852bu(
+    device: Arc<DeviceHandle<GlobalContext>>,
+    ep_in: u8,
+    channel: Arc<AtomicU8>,
+    gate: crate::pipeline::FrameGate,
+    alive: Arc<AtomicBool>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    // ── Thread 1: USB reader ──
+    let device_clone = Arc::clone(&device);
+    let alive_reader = Arc::clone(&alive);
+    thread::Builder::new()
+        .name("rx-usb-reader-8852bu".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; RX_BUF_SIZE];
+            while alive_reader.load(Ordering::Relaxed) {
+                match device_clone.read_bulk(ep_in, &mut buf, Duration::from_millis(50)) {
+                    Ok(n) if n > 0 => {
+                        let _ = tx.send(buf[..n].to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .expect("failed to spawn rx-usb-reader-8852bu");
+
+    // ── Thread 2: Stream parser ──
+    let alive_parser = Arc::clone(&alive);
+    thread::Builder::new()
+        .name("rx-stream-parser-8852bu".into())
+        .spawn(move || {
+            let mut stream = std::collections::VecDeque::<u8>::with_capacity(256 * 1024);
+
+            while alive_parser.load(Ordering::Relaxed) {
+                // Drain all available USB reads into the stream buffer
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(data) => { stream.extend(&data); }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(_) => break, // channel closed
+                }
+                // Drain any additional queued reads
+                while let Ok(data) = rx.try_recv() {
+                    stream.extend(&data);
+                }
+
+                // Parse frames from the contiguous stream
+                let contiguous: Vec<u8> = stream.iter().copied().collect();
+                let mut pos = 0;
+                while pos < contiguous.len() {
+                    let remaining = &contiguous[pos..];
+                    let ch = channel.load(Ordering::Relaxed);
+                    let (consumed, packet) = parse_rx_packet_8852bu(remaining, ch);
+                    if consumed == 0 { break; }
+                    pos += consumed;
+
+                    if let crate::core::chip::ParsedPacket::Frame(frame) = packet {
+                        gate.submit(frame);
+                    }
+                }
+                // Remove consumed bytes from stream
+                if pos > 0 {
+                    stream.drain(..pos);
+                }
+            }
+        })
+        .expect("failed to spawn rx-stream-parser-8852bu");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
