@@ -14,6 +14,7 @@ pub enum ChipId {
     Rtl8812au,
     Rtl8812bu,
     Rtl8852au,
+    Rtl8852bu,
     Mt7921au,
     Mt7612u,
     Mt76x1,
@@ -25,6 +26,7 @@ impl fmt::Display for ChipId {
             ChipId::Rtl8812au => write!(f, "RTL8812AU"),
             ChipId::Rtl8812bu => write!(f, "RTL8812BU"),
             ChipId::Rtl8852au => write!(f, "RTL8852AU"),
+            ChipId::Rtl8852bu => write!(f, "RTL8852BU"),
             ChipId::Mt7921au => write!(f, "MT7921AU"),
             ChipId::Mt7612u  => write!(f, "MT7612U"),
             ChipId::Mt76x1   => write!(f, "MT76x1"),
@@ -138,6 +140,9 @@ pub const KNOWN_ADAPTERS: &[KnownAdapter] = &[
     KnownAdapter { vid: 0x0B05, pid: 0x1A62, chip: ChipId::Rtl8852au, name: "ASUS USB-AX56 (RTL8832AU)" },
     KnownAdapter { vid: 0x0B05, pid: 0x1997, chip: ChipId::Rtl8852au, name: "ASUS USB-AX56 (RTL8832AU)" },
     KnownAdapter { vid: 0x0411, pid: 0x0312, chip: ChipId::Rtl8852au, name: "BUFFALO WI-U3-1200AX2 (RTL8852AU)" },
+    // RTL8852BU adapters (WiFi 6E, AX5400, USB 3.0, 2T2R dual-band)
+    KnownAdapter { vid: 0x0BDA, pid: 0xB832, chip: ChipId::Rtl8852bu, name: "Realtek RTL8852BU" },
+    KnownAdapter { vid: 0x0BDA, pid: 0xC832, chip: ChipId::Rtl8852bu, name: "Realtek RTL8852BU (AX5400 6E)" },
     // MT7921AU adapters (USB 3.0, 802.11ax WiFi 6 dual-band)
     KnownAdapter { vid: 0x0E8D, pid: 0x7961, chip: ChipId::Mt7921au, name: "MediaTek MT7921AU (combo BT+WiFi)" },
     KnownAdapter { vid: 0x3574, pid: 0x6211, chip: ChipId::Mt7921au, name: "COMFAST CF-952AX (MT7921AU)" },

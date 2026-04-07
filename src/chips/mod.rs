@@ -34,12 +34,14 @@ mod rtl8852a_channel_switch;
 pub mod rtl8812au;
 pub mod rtl8812bu;
 pub mod rtl8852au;
+pub mod rtl8852bu;
 pub mod mt7921au;
 pub mod mt7612u;
 
 pub use rtl8812au::Rtl8812au;
 pub use rtl8812bu::Rtl8812bu;
 pub use rtl8852au::Rtl8852au;
+pub use rtl8852bu::Rtl8852bu;
 pub use mt7921au::Mt7921au;
 pub use mt7612u::Mt7612u;
 
@@ -64,6 +66,10 @@ pub fn create_driver(info: &AdapterInfo) -> Result<(Box<dyn ChipDriver>, UsbEndp
         }
         ChipId::Rtl8852au => {
             let (driver, endpoints) = Rtl8852au::open_usb(info.vid, info.pid)?;
+            Ok((Box::new(driver), endpoints))
+        }
+        ChipId::Rtl8852bu => {
+            let (driver, endpoints) = Rtl8852bu::open_usb(info.vid, info.pid)?;
             Ok((Box::new(driver), endpoints))
         }
         ChipId::Mt7921au => {

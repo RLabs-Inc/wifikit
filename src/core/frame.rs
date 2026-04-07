@@ -457,6 +457,12 @@ pub struct TxOptions {
     /// Per-frame TX power in 0.5 dBm units. 0 = use adapter default.
     /// Example: 40 = 20 dBm, 10 = 5 dBm (stealth), 60 = 30 dBm (max range)
     pub tx_power_half_dbm: u8,
+    /// Sounding packet type for beamforming: 0=normal, 2=VHT/HE NDPA, 3=VHT/HE NDP
+    pub ndpa: u8,
+    /// Sounding packet role: 0=unicast NDPA, 1=broadcast NDPA, 2=last NDP, 3=mid NDP
+    pub snd_pkt_sel: u8,
+    /// NDPA duration (μs) — how long firmware waits for beamforming feedback report
+    pub ndpa_duration_us: u16,
 }
 
 impl Default for TxOptions {
@@ -470,6 +476,9 @@ impl Default for TxOptions {
             ltf: 0,
             antenna_mask: 0,
             tx_power_half_dbm: 0,
+            ndpa: 0,
+            snd_pkt_sel: 0,
+            ndpa_duration_us: 0,
         }
     }
 }
@@ -602,6 +611,7 @@ bitflags_manual! {
         PROTECT      = 0x0080,  // RTS/CTS protection before frame
         DYN_BW       = 0x0100,  // Dynamic bandwidth — allow fallback to narrower BW
         FORCE_TX_STATUS = 0x0200, // Force TX status report for this frame
+        SIFS_TX      = 0x0400,  // Insert SIFS after TX (for sounding: NDPA→NDP chain)
     }
 }
 
