@@ -1736,17 +1736,296 @@ impl ChipDriver for Rtl8852bu {
 //    [rx-stream-parser]  mpsc → parse MAC AX RX descriptors → FrameGate.submit()
 //
 //  Same architecture as 8852AU — the RX descriptor format is identical (MAC AX gen2).
+//
+// WiFi frames (rpkt_type=0) arrive with no embedded PHY status.
+// RSSI/SNR/EVM/etc arrive in separate PPDU status packets (rpkt_type=1).
+// Correlation is via ppdu_cnt (3-bit counter, 8 slots) in DW1[6:4].
+//
+// Flow:
+//   1. WiFi frame → extract 802.11 data + RX descriptor metadata, park in slot[ppdu_cnt]
+//   2. PPDU status → parse physts header + all IEs, match slot[ppdu_cnt], deliver complete frame
+//   3. If slot is already occupied when new WiFi frame arrives → evict old frame (rssi=0)
+//
+// RX descriptor layout (from hal_trx_8852a.h):
+//   Short RXD = 16 bytes (long_rxd=0): DW0-DW3
+//   Long  RXD = 32 bytes (long_rxd=1): DW0-DW7
+//
+// All 11 rpkt_types are handled — nothing silently dropped.
 
+use crate::core::frame::{RxBandwidth, GuardInterval, PpduType};
+
+/// RX packet types (rpkt_type field, DW0[27:24])
+const RPKT_WIFI: u8 = 0;
+const RPKT_PPDU_STATUS: u8 = 1;
+const RPKT_CHANNEL_INFO: u8 = 2;
+const RPKT_BB_SCOPE: u8 = 3;
+const RPKT_F2P_TX_CMD_RPT: u8 = 4;
+const RPKT_SS2FW_RPT: u8 = 5;
+const RPKT_TX_RPT: u8 = 6;
+const RPKT_TX_PD_RELEASE_HOST: u8 = 7;
+const RPKT_DFS_RPT: u8 = 8;
+const RPKT_TX_PD_RELEASE_WLCPU: u8 = 9;
+const RPKT_C2H: u8 = 10;
+
+/// PPDU type (DW1[3:0])
+const PPDU_T_LEGACY: u8 = 0;
+const PPDU_T_HT: u8 = 1;
+const PPDU_T_VHT: u8 = 2;
+const PPDU_T_HE_SU: u8 = 3;
+const PPDU_T_HE_ER_SU: u8 = 4;
+const PPDU_T_HE_MU: u8 = 5;
+const PPDU_T_HE_TB: u8 = 6;
+
+/// PHY status header length (8 bytes)
+const PHYSTS_HDR_LEN: usize = 8;
+
+/// Maximum PPDU correlation slots (ppdu_cnt is 3 bits)
+const PPDU_SLOT_COUNT: usize = 8;
+
+/// IE fixed lengths in 8-byte units (0xFF = variable length)
+const IE_LEN_TABLE: [u8; 32] = [
+    2, 4, 3, 3, 1, 1, 1, 1,           // IE0-7
+    0xFF, 1, 0xFF, 22, 0xFF, 0xFF, 0xFF, 0xFF, // IE8-15
+    0xFF, 0xFF, 2, 3, 0xFF, 0xFF, 0xFF, 0,     // IE16-23
+    3, 3, 3, 3, 4, 4, 4, 4,           // IE24-31
+];
+
+/// Pending WiFi frame stored in a correlation slot.
+/// The frame data (Vec<u8>) is stored here because the USB buffer will be
+/// overwritten by the next bulk read before the PPDU arrives.
+struct PendingFrame {
+    /// The 802.11 frame data (FCS already stripped).
+    data: Vec<u8>,
+    /// Current channel at time of receipt.
+    channel: u8,
+    /// Band index (0=2.4GHz, 1=5GHz).
+    band: u8,
+    /// RX data rate from DW1[24:16].
+    data_rate: u16,
+    /// PPDU type from DW1[3:0] — used to validate PPDU match.
+    ppdu_type: u8,
+    /// Bandwidth from DW1[31:30].
+    bw: u8,
+    /// GI/LTF from DW1[27:25].
+    gi_ltf: u8,
+    /// Freerun counter from DW2 (timestamp).
+    freerun_cnt: u32,
+    /// AMPDU flag from DW3.
+    is_ampdu: bool,
+    /// AMSDU flag from DW3.
+    is_amsdu: bool,
+    /// Whether this slot is occupied.
+    occupied: bool,
+}
+
+impl Default for PendingFrame {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(), channel: 0, band: 0,
+            data_rate: 0, ppdu_type: 0, bw: 0, gi_ltf: 0,
+            freerun_cnt: 0, is_ampdu: false, is_amsdu: false,
+            occupied: false,
+        }
+    }
+}
+
+/// PHY status parsed from a PPDU status packet — all IEs.
+#[derive(Default)]
+struct PhyStatus {
+    // --- Header ---
+    rssi_avg: u8,       // U(8,1) — raw from physts header
+    rssi_path: [u8; 4], // U(8,1) — raw per-path
+    ie_bitmap_select: u8,
+
+    // --- IE0 (CCK) ---
+    ie0_present: bool,
+    ie0_pop_idx: u8,
+    ie0_rpl: u16,           // 9-bit received power level
+    ie0_cca_time: u8,
+    ie0_antwgt_gain_diff: u8,
+    ie0_hw_antsw: [bool; 4],
+    ie0_noise_pwr: u8,
+    ie0_cfo: i16,           // 12-bit signed
+    ie0_coarse_cfo: i16,    // 12-bit signed
+    ie0_evm_hdr: u8,
+    ie0_evm_pld: u8,
+    ie0_sig_len: u16,
+    ie0_antdiv_rslt: [bool; 4],
+    ie0_preamble_type: u8,
+    ie0_sync_mode: u8,
+    ie0_dagc: [u8; 4],      // 5-bit each
+    ie0_rx_path_en: u8,
+
+    // --- IE1 (OFDM/HT/VHT/HE) ---
+    ie1_present: bool,
+    ie1_pop_idx: u8,
+    ie1_rssi_avg_fd: u8,
+    ie1_ch_idx: u8,
+    ie1_rxsc: u8,
+    ie1_rx_path_en: u8,
+    ie1_noise_pwr: u8,
+    ie1_cfo: i16,           // 12-bit signed
+    ie1_cfo_preamble: i16,  // 12-bit signed
+    ie1_snr: u8,            // 6-bit
+    ie1_evm_max: u8,
+    ie1_evm_min: u8,
+    ie1_gi_type: u8,
+    ie1_is_su: bool,
+    ie1_is_ldpc: bool,
+    ie1_is_ndp: bool,
+    ie1_is_stbc: bool,
+    ie1_grant_bt: bool,
+    ie1_bf_gain_max: u8,
+    ie1_is_awgn: bool,
+    ie1_is_bf: bool,
+    ie1_avg_cn: u8,
+    ie1_sigval_below_th_cnt: u8,
+    ie1_cn_excess_th_cnt: u8,
+    ie1_pwr_to_cca: u16,
+    ie1_cca_to_agc: u8,
+    ie1_cca_to_sbd: u8,
+    ie1_edcca_rpt_cnt: u8,
+    ie1_edcca_total_smp_cnt: u8,
+    ie1_edcca_bw_max: u8,
+    ie1_edcca_bw_min: u8,
+    ie1_bw_idx: u8,
+
+    // --- IE2 (HE/AX extended) ---
+    ie2_present: bool,
+    ie2_max_nsts: u8,
+    ie2_midamble: bool,
+    ie2_ltf_type: u8,
+    ie2_gi: u8,
+    ie2_is_mu_mimo: bool,
+    ie2_is_dl_ofdma: bool,
+    ie2_is_dcm: bool,
+    ie2_is_doppler: bool,
+    ie2_pkt_extension: u8,
+    ie2_coarse_cfo_i: i32,
+    ie2_coarse_cfo_q: i32,
+    ie2_fine_cfo_i: i32,
+    ie2_fine_cfo_q: i32,
+    ie2_est_cmped_phase: u8,
+    ie2_n_ltf: u8,
+    ie2_n_sym: u16,
+
+    // --- IE4-7 (per-path) ---
+    ie_path_present: [bool; 4],
+    ie_path_sig_val: [u8; 4],
+    ie_path_rf_gain_idx: [u8; 4],
+    ie_path_tia_gain_idx: [u8; 4],
+    ie_path_snr: [u8; 4],
+    ie_path_evm: [u8; 4],
+    ie_path_ant_weight: [u8; 4],
+    ie_path_dc_re: [u8; 4],
+    ie_path_dc_im: [u8; 4],
+}
+
+/// Thread-local PPDU correlation state.
+/// Each thread (main driver + RxHandle) gets its own independent state.
+struct PpduCorrelation {
+    slots: [PendingFrame; PPDU_SLOT_COUNT],
+    /// Completed frames ready for delivery (evicted from slots without PPDU match).
+    completed: Vec<RxFrame>,
+}
+
+impl PpduCorrelation {
+    fn new() -> Self {
+        Self {
+            slots: Default::default(),
+            completed: Vec::new(),
+        }
+    }
+}
+
+/// Debug logger for RX packet parsing — writes to /tmp/wifikit_rx_parse_debug_8852bu.log
+struct RxDebugLog {
+    file: Option<std::fs::File>,
+    count: u64,
+    wifi_count: u64,
+    ppdu_count: u64,
+    match_count: u64,
+    evict_count: u64,
+    skip_count: u64,
+}
+
+impl RxDebugLog {
+    fn new() -> Self {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open("/tmp/wifikit_rx_parse_debug_8852bu.log").ok();
+        if let Some(ref mut f) = file.as_ref() {
+            let _ = writeln!(f as &mut dyn Write, "=== RTL8852BU RX Parse Debug Log ===\n");
+        }
+        Self { file, count: 0, wifi_count: 0, ppdu_count: 0, match_count: 0, evict_count: 0, skip_count: 0 }
+    }
+
+    fn log(&mut self, msg: &str) {
+        use std::io::Write;
+        if let Some(ref mut f) = self.file {
+            let _ = writeln!(f, "{}", msg);
+        }
+    }
+
+    fn log_summary(&mut self) {
+        use std::io::Write;
+        if let Some(ref mut f) = self.file {
+            let _ = writeln!(f, "\n--- SUMMARY @ packet #{} ---", self.count);
+            let _ = writeln!(f, "  WiFi frames:  {}", self.wifi_count);
+            let _ = writeln!(f, "  PPDU status:  {}", self.ppdu_count);
+            let _ = writeln!(f, "  Matched:      {} ({:.1}% of WiFi)",
+                self.match_count,
+                if self.wifi_count > 0 { self.match_count as f64 / self.wifi_count as f64 * 100.0 } else { 0.0 });
+            let _ = writeln!(f, "  Evicted:      {} ({:.1}% of WiFi)",
+                self.evict_count,
+                if self.wifi_count > 0 { self.evict_count as f64 / self.wifi_count as f64 * 100.0 } else { 0.0 });
+            let _ = writeln!(f, "  Other/Skip:   {}", self.skip_count);
+            let _ = writeln!(f, "---");
+        }
+    }
+}
+
+thread_local! {
+    static PPDU_STATE: std::cell::RefCell<PpduCorrelation> = std::cell::RefCell::new(PpduCorrelation::new());
+    static RX_DEBUG: std::cell::RefCell<RxDebugLog> = std::cell::RefCell::new(RxDebugLog::new());
+}
+
+/// Parse one RX packet from a USB bulk read buffer.
+///
+/// This is the standalone parse function used by both `recv_frame_internal` (driver path)
+/// and the RxHandle (dedicated RX thread). It handles all 11 rpkt_types, correlates
+/// WiFi frames with PPDU status packets via ppdu_cnt, and returns complete frames
+/// with full PHY status populated.
+///
+/// Returns (bytes_consumed, ParsedPacket).
 fn parse_rx_packet_8852bu(buf: &[u8], channel: u8) -> (usize, crate::core::chip::ParsedPacket) {
     use crate::core::chip::ParsedPacket;
+    use crate::core::frame::RxFrame;
 
+    // First check if we have completed frames from previous evictions
+    let evicted = PPDU_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if !s.completed.is_empty() {
+            Some(s.completed.remove(0))
+        } else {
+            None
+        }
+    });
+    if let Some(frame) = evicted {
+        return (0, ParsedPacket::Frame(frame));
+    }
+
+    // Need at least a short RX descriptor
     if buf.len() < RX_DESC_SHORT {
         return (0, ParsedPacket::Skip);
     }
 
+    // ── DW0: packet length, type, descriptor format ──
     let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let pkt_len = (dw0 & 0x3FFF) as usize;
     let shift = ((dw0 >> 14) & 0x3) as usize;
+    let mac_info_vld = (dw0 >> 23) & 1 != 0;
     let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
     let drv_info_size = ((dw0 >> 28) & 0x7) as usize;
     let long_rxd = (dw0 >> 31) & 1 != 0;
@@ -1754,46 +2033,1060 @@ fn parse_rx_packet_8852bu(buf: &[u8], channel: u8) -> (usize, crate::core::chip:
     let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
     let payload_offset = desc_len + (drv_info_size * 8) + (shift * 2);
 
-    // Total consumed bytes — aligned to 8 bytes
-    let total_raw = payload_offset + pkt_len;
-    let consumed = (total_raw + 7) & !7;
-
-    if pkt_len == 0 || consumed > buf.len() {
-        return (consumed.min(buf.len()), ParsedPacket::Skip);
+    if pkt_len == 0 {
+        return (desc_len, ParsedPacket::Skip);
     }
 
-    // Only WiFi frames (rpkt_type=0)
-    if rpkt_type != 0 {
-        return (consumed, ParsedPacket::Skip);
+    // Total consumed bytes for this packet
+    let total_len = payload_offset + pkt_len;
+    // Round up to 8-byte alignment (USB aggregation boundary)
+    let consumed = (total_len + 7) & !7;
+
+    if total_len > buf.len() {
+        return (0, ParsedPacket::Skip);
     }
 
-    let mac_info_vld = (dw0 >> 23) & 1 != 0;
-    let extra = if mac_info_vld { 4 } else { 0 };
-    let data_start = payload_offset + extra;
-    let frame_len = if pkt_len >= 4 + extra { pkt_len - 4 - extra } else { 0 };
-
-    if frame_len == 0 || data_start + frame_len > buf.len() {
-        return (consumed, ParsedPacket::Skip);
-    }
-
-    // Parse RSSI from RX descriptor DW1 (if long descriptor)
-    let rssi = if long_rxd && buf.len() >= 8 {
-        let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let raw_rssi = ((dw1 >> 0) & 0xFF) as i16;
-        if raw_rssi > 0 { (raw_rssi - 110).max(-100) as i8 } else { -80i8 }
+    // ── DW1: rate/ppdu info (only for WiFi + PPDU types) ──
+    let dw1 = if buf.len() >= 8 {
+        u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])
     } else {
-        -80i8
+        0
     };
 
+    let ppdu_type_raw = (dw1 & 0xF) as u8;
+    let ppdu_cnt = ((dw1 >> 4) & 0x7) as usize;
+    let rx_rate = ((dw1 >> 16) & 0x1FF) as u16;
+    let gi_ltf = ((dw1 >> 25) & 0x7) as u8;
+    let bw = ((dw1 >> 30) & 0x3) as u8;
+
+    // ── DW2: freerun counter (timestamp) ──
+    let dw2 = if buf.len() >= 12 {
+        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+    } else {
+        0
+    };
+
+    // ── DW3: flags (long RXD only, at offset 12) ──
+    let dw3 = if long_rxd && buf.len() >= 16 {
+        u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])
+    } else {
+        0
+    };
+
+    let is_ampdu = (dw3 >> 3) & 1 != 0;
+    let is_amsdu = (dw3 >> 5) & 1 != 0;
+    let crc32_err = (dw3 >> 9) & 1 != 0;
+
+    let band = if channel <= 14 { 0u8 } else { 1u8 };
+
+    // Debug: log every packet's raw descriptor
+    RX_DEBUG.with(|dbg| {
+        let mut d = dbg.borrow_mut();
+        d.count += 1;
+        let pkt_num = d.count;
+        // Log first 200 packets in full detail, then summary every 1000
+        let detailed = pkt_num <= 200;
+        let summary = pkt_num % 1000 == 0;
+
+        if detailed {
+            d.log(&format!(
+                "[PKT #{}] rpkt_type={} pkt_len={} desc_len={} shift={} drv_info_sz={} long_rxd={} mac_info_vld={}",
+                pkt_num, rpkt_type, pkt_len, desc_len, shift, drv_info_size, long_rxd, mac_info_vld));
+            d.log(&format!(
+                "  DW0=0x{:08X} DW1=0x{:08X} DW2=0x{:08X} DW3=0x{:08X}",
+                dw0, dw1, dw2, dw3));
+            d.log(&format!(
+                "  ppdu_cnt={} ppdu_type={} rx_rate=0x{:03X} bw={} gi_ltf={} payload_offset={} consumed={}",
+                ppdu_cnt, ppdu_type_raw, rx_rate, bw, gi_ltf, payload_offset, consumed));
+            // Raw first 48 bytes of packet
+            let hex_len = buf.len().min(48);
+            let hex: String = buf[..hex_len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+            d.log(&format!("  RAW[0..{}]: {}", hex_len, hex));
+        }
+        if summary {
+            d.log_summary();
+        }
+    });
+
+    match rpkt_type {
+        // ═══════════════════════════════════════════════════════════════
+        //  WiFi frame (rpkt_type=0) — park in pending slot
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_WIFI => {
+            // Extra offset for mac_info_vld on non-PPDU packets
+            let extra = if mac_info_vld { 4 } else { 0 };
+            let data_start = payload_offset + extra;
+            // Strip FCS (4 bytes)
+            let frame_len = if pkt_len >= 4 + extra { pkt_len - 4 - extra } else { 0 };
+
+            if frame_len == 0 || data_start + frame_len > buf.len() {
+                return (consumed, ParsedPacket::Skip);
+            }
+
+            // Skip CRC errors
+            if crc32_err {
+                return (consumed, ParsedPacket::Skip);
+            }
+
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                d.wifi_count += 1;
+                if d.wifi_count <= 200 {
+                    // Show frame type from first 2 bytes of 802.11 header
+                    let fc = if data_start + 2 <= buf.len() {
+                        u16::from_le_bytes([buf[data_start], buf[data_start + 1]])
+                    } else { 0 };
+                    let ftype = (fc >> 2) & 0x3;
+                    let fsub = (fc >> 4) & 0xF;
+                    d.log(&format!(
+                        "  → WIFI: frame_len={} fc=0x{:04X} type={} subtype={} ppdu_cnt={} data_start={} ampdu={} amsdu={}",
+                        frame_len, fc, ftype, fsub, ppdu_cnt, data_start, is_ampdu, is_amsdu));
+                    d.log(&format!(
+                        "    ppdu_cnt extraction: DW1_raw=0x{:08X} → bits[6:4]=(0x{:08X} >> 4) & 0x7 = {}",
+                        dw1, dw1, ppdu_cnt));
+                }
+            });
+
+            // Copy frame data now — buffer will be overwritten by next USB read
+            let frame_data = buf[data_start..data_start + frame_len].to_vec();
+
+            PPDU_STATE.with(|state| {
+                let mut s = state.borrow_mut();
+
+                // Evict old frame if slot occupied (PPDU was lost for previous frame)
+                if s.slots[ppdu_cnt].occupied {
+                    let old_rate = s.slots[ppdu_cnt].data_rate;
+                    RX_DEBUG.with(|dbg| {
+                        let mut d = dbg.borrow_mut();
+                        d.evict_count += 1;
+                        if d.count <= 200 {
+                            d.log(&format!("  → EVICT: slot[{}] was occupied (old rate=0x{:03X})",
+                                ppdu_cnt, old_rate));
+                        }
+                    });
+                    let evicted = evict_slot(&mut s.slots[ppdu_cnt]);
+                    s.completed.push(evicted);
+                }
+
+                // Store new frame in slot
+                let slot = &mut s.slots[ppdu_cnt];
+                slot.data = frame_data;
+                slot.channel = channel;
+                slot.band = band;
+                slot.data_rate = rx_rate;
+                slot.ppdu_type = ppdu_type_raw;
+                slot.bw = bw;
+                slot.gi_ltf = gi_ltf;
+                slot.freerun_cnt = dw2;
+                slot.is_ampdu = is_ampdu;
+                slot.is_amsdu = is_amsdu;
+                slot.occupied = true;
+            });
+
+            (consumed, ParsedPacket::Skip)
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  PPDU status (rpkt_type=1) — parse PHY status, match pending frame
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_PPDU_STATUS => {
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                d.ppdu_count += 1;
+            });
+
+            let ppdu_payload = &buf[payload_offset..payload_offset + pkt_len];
+
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                if d.ppdu_count <= 200 {
+                    let hex_len = ppdu_payload.len().min(32);
+                    let hex: String = ppdu_payload[..hex_len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                    d.log(&format!(
+                        "  → PPDU: ppdu_cnt={} mac_info_vld={} payload_len={} payload[0..{}]: {}",
+                        ppdu_cnt, mac_info_vld, ppdu_payload.len(), hex_len, hex));
+                    d.log(&format!(
+                        "    ppdu_cnt extraction: DW1_raw=0x{:08X} → bits[6:4]=(0x{:08X} >> 4) & 0x7 = {}",
+                        dw1, dw1, ppdu_cnt));
+                    // Show what's in each slot right now
+                    PPDU_STATE.with(|state| {
+                        let s = state.borrow();
+                        let mut slot_info = String::from("    slots: ");
+                        for i in 0..8 {
+                            if s.slots[i].occupied {
+                                slot_info.push_str(&format!("[{}:rate=0x{:03X},len={}] ", i, s.slots[i].data_rate, s.slots[i].data.len()));
+                            } else {
+                                slot_info.push_str(&format!("[{}:empty] ", i));
+                            }
+                        }
+                        d.log(&slot_info);
+                    });
+                }
+            });
+
+            // Parse MAC info header if present, then physts.
+            // MAC info struct is 2 DWORDs (8 bytes):
+            //   DW0: usr_num[3:0], lsig_len[27:16], rx_cnt_vld[29]
+            //   DW1: service[15:0], plcp_len[23:16] (in 8-byte units)
+            let physts_data = if mac_info_vld && ppdu_payload.len() >= 8 {
+                let mi_dw0 = u32::from_le_bytes([
+                    ppdu_payload[0], ppdu_payload[1],
+                    ppdu_payload[2], ppdu_payload[3],
+                ]);
+                let mi_dw1 = u32::from_le_bytes([
+                    ppdu_payload[4], ppdu_payload[5],
+                    ppdu_payload[6], ppdu_payload[7],
+                ]);
+                let usr_num = (mi_dw0 & 0xF) as usize;
+                let rx_cnt_vld = mi_dw0 & (1 << 29) != 0;
+                let plcp_len = (((mi_dw1 >> 16) & 0xFF) as usize) * 8; // DW1[23:16] * 8
+
+                // Accumulate size: mac_info header (8B) + per-user (4B each, 8-byte aligned)
+                let mut offset = 8; // sizeof(mac_ax_mac_info_t) = 2 DWORDs = 8 bytes
+                let usr_size = usr_num * 4; // MAC_AX_MAC_INFO_USE_SIZE = 4
+                offset += usr_size;
+                // 8-byte align the user block
+                if usr_num & 1 != 0 { offset += 4; }
+
+                // RX count block (96 bytes if present — MAC_AX_RX_CNT_SIZE=96)
+                if rx_cnt_vld { offset += 96; }
+
+                // PLCP block
+                offset += plcp_len;
+
+                RX_DEBUG.with(|dbg| {
+                    let mut d = dbg.borrow_mut();
+                    if d.ppdu_count <= 200 {
+                        d.log(&format!(
+                            "    MAC_INFO: usr_num={} rx_cnt_vld={} plcp_len={} → physts_offset={} (payload_len={})",
+                            usr_num, rx_cnt_vld, plcp_len, offset, ppdu_payload.len()));
+                    }
+                });
+
+                if offset < ppdu_payload.len() {
+                    &ppdu_payload[offset..]
+                } else {
+                    return (consumed, ParsedPacket::Skip);
+                }
+            } else {
+                // No MAC info — entire payload is physts
+                ppdu_payload
+            };
+
+            if physts_data.len() < PHYSTS_HDR_LEN {
+                return (consumed, ParsedPacket::Skip);
+            }
+
+            // Parse physts header (8 bytes)
+            let mut phy = PhyStatus::default();
+            phy.ie_bitmap_select = physts_data[0] & 0x1F;
+            let is_valid = (physts_data[0] >> 7) & 1 != 0;
+            let total_length = (physts_data[1] as usize) * 8; // in bytes
+            phy.rssi_avg = physts_data[3];
+            phy.rssi_path[0] = physts_data[4];
+            phy.rssi_path[1] = physts_data[5];
+            phy.rssi_path[2] = physts_data[6];
+            phy.rssi_path[3] = physts_data[7];
+
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                if d.ppdu_count <= 200 {
+                    let rssi_dbm = if phy.rssi_avg != 0 { (phy.rssi_avg >> 1) as i16 - 110 } else { 0 };
+                    let hex_len = physts_data.len().min(16);
+                    let hex: String = physts_data[..hex_len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                    d.log(&format!(
+                        "  → PHYSTS HDR: valid={} total_len={} bitmap_sel={} rssi_avg_raw=0x{:02X}({} dBm) rssi_path=[0x{:02X},0x{:02X},0x{:02X},0x{:02X}]",
+                        is_valid, total_length, phy.ie_bitmap_select, phy.rssi_avg, rssi_dbm,
+                        phy.rssi_path[0], phy.rssi_path[1], phy.rssi_path[2], phy.rssi_path[3]));
+                    d.log(&format!("    physts[0..{}]: {}", hex_len, hex));
+                }
+            });
+
+            if !is_valid || total_length == 0 || total_length > physts_data.len() {
+                RX_DEBUG.with(|dbg| {
+                    let mut d = dbg.borrow_mut();
+                    if d.ppdu_count <= 200 {
+                        d.log(&format!("    → SKIP: invalid physts (valid={} total_len={} data_len={})",
+                            is_valid, total_length, physts_data.len()));
+                    }
+                });
+                return deliver_ppdu_match(ppdu_cnt, ppdu_type_raw, rx_rate, &phy, consumed);
+            }
+
+            // Parse IEs — walk from after header to total_length
+            let ie_area = &physts_data[PHYSTS_HDR_LEN..total_length.min(physts_data.len())];
+            parse_physts_ies(ie_area, &mut phy);
+
+            deliver_ppdu_match(ppdu_cnt, ppdu_type_raw, rx_rate, &phy, consumed)
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Channel Info (rpkt_type=2) — raw CSI data
+        //  Format: DW0 header + CSI matrix (I/Q per subcarrier per ant pair)
+        //  RTL8852B: 2x2 MIMO, up to 256 subcarriers (80MHz)
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_CHANNEL_INFO => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // CSI header: first 4 bytes contain metadata
+            // DW0[1:0] = bandwidth (0=20, 1=40, 2=80, 3=160)
+            // DW0[3:2] = Nr (RX chains - 1)
+            // DW0[5:4] = Nc (TX chains - 1)
+            // DW0[15:8] = num_sc (number of subcarriers / 4)
+            let (csi_bw, nr, nc, num_sc) = if payload.len() >= 4 {
+                let hdr = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let csi_bw = (hdr & 0x3) as u8;
+                let nr = (((hdr >> 2) & 0x3) + 1) as u8;
+                let nc = (((hdr >> 4) & 0x3) + 1) as u8;
+                let num_sc = (((hdr >> 8) & 0xFF) as u16) * 4;
+                (csi_bw, nr, nc, num_sc)
+            } else {
+                (0, 2, 2, 0)
+            };
+
+            // Parse I/Q pairs from payload after header
+            let iq_offset = 4;
+            let mut csi_raw = Vec::new();
+            if payload.len() > iq_offset {
+                let iq_data = &payload[iq_offset..];
+                // Each I/Q value is 16-bit signed, packed as [I_lo, I_hi, Q_lo, Q_hi]
+                let mut i = 0;
+                while i + 3 < iq_data.len() {
+                    let real = i16::from_le_bytes([iq_data[i], iq_data[i + 1]]);
+                    let imag = i16::from_le_bytes([iq_data[i + 2], iq_data[i + 3]]);
+                    csi_raw.push(real);
+                    csi_raw.push(imag);
+                    i += 4;
+                }
+            }
+
+            (consumed, ParsedPacket::ChannelInfo(crate::core::chip::ChannelInfo {
+                channel,
+                bandwidth: csi_bw,
+                nr,
+                nc,
+                num_subcarriers: num_sc,
+                csi_raw,
+                timestamp: dw2,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  BB Scope (rpkt_type=3) — raw baseband I/Q waveform
+        //  Digital samples straight from the ADC. Spectrum analyzer gold.
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_BB_SCOPE => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // BB scope header: sample_rate_idx in first byte
+            let sample_rate_idx = if !payload.is_empty() { payload[0] } else { 0 };
+
+            // Parse I/Q sample pairs after 4-byte header
+            let sample_offset = 4;
+            let mut samples_iq = Vec::new();
+            if payload.len() > sample_offset {
+                let sample_data = &payload[sample_offset..];
+                let mut i = 0;
+                while i + 3 < sample_data.len() {
+                    let ii = i16::from_le_bytes([sample_data[i], sample_data[i + 1]]);
+                    let qq = i16::from_le_bytes([sample_data[i + 2], sample_data[i + 3]]);
+                    samples_iq.push((ii, qq));
+                    i += 4;
+                }
+            }
+
+            (consumed, ParsedPacket::BbScope(crate::core::chip::BbScope {
+                channel,
+                sample_rate_idx,
+                samples_iq,
+                timestamp: dw2,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  F2P TX Command Report (rpkt_type=4) — firmware TX scheduling
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_F2P_TX_CMD_RPT => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // DW0[7:0] = mac_id, DW0[11:8] = queue_sel
+            let (mac_id, queue_sel) = if payload.len() >= 4 {
+                let dw = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                ((dw & 0xFF) as u8, ((dw >> 8) & 0xF) as u8)
+            } else {
+                (0, 0)
+            };
+
+            (consumed, ParsedPacket::F2pTxCmdReport(crate::core::chip::F2pTxCmdReport {
+                mac_id,
+                queue_sel,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  SS2FW Report (rpkt_type=5) — spatial sounding / beamforming
+        //  Contains V-matrix feedback from beamforming sounding frames.
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_SS2FW_RPT => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // Sounding report header:
+            // Bytes [0..6] = initiator MAC address
+            // Byte [6] = NSS
+            // Byte [7] = BW
+            let mut initiator = [0u8; 6];
+            let (nss, ss_bw) = if payload.len() >= 8 {
+                initiator.copy_from_slice(&payload[0..6]);
+                (payload[6], payload[7])
+            } else if payload.len() >= 6 {
+                initiator.copy_from_slice(&payload[0..6]);
+                (0, 0)
+            } else {
+                (0, 0)
+            };
+
+            (consumed, ParsedPacket::SpatialSounding(crate::core::chip::SpatialSoundingReport {
+                initiator,
+                nss,
+                bandwidth: ss_bw,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  TX Report (rpkt_type=6) — ACK/NACK for injected frames
+        //  MAC AX TX status format (RTL8852B):
+        //  DW0: pkt_id[15:0], queue_sel[20:16], tx_state[23:21], tx_cnt[26:24]
+        //  DW1: mac_id[7:0], final_rate[24:16], final_bw[29:28], final_gi_ltf[31:30]
+        //  DW2: timestamp[31:0]
+        //  DW3: total_airtime[15:0]
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_TX_RPT => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let txs_dw0 = if payload.len() >= 4 {
+                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+            } else { 0 };
+            let txs_dw1 = if payload.len() >= 8 {
+                u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+            } else { 0 };
+            let txs_dw2 = if payload.len() >= 12 {
+                u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+            } else { 0 };
+            let txs_dw3 = if payload.len() >= 16 {
+                u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]])
+            } else { 0 };
+
+            let pkt_id = (txs_dw0 & 0xFFFF) as u16;
+            let queue_sel = ((txs_dw0 >> 16) & 0x1F) as u8;
+            let tx_state = ((txs_dw0 >> 21) & 0x7) as u8;
+            let tx_cnt = ((txs_dw0 >> 24) & 0x7) as u8;
+            let acked = tx_state == 0;
+
+            let mac_id = (txs_dw1 & 0xFF) as u8;
+            let final_rate = ((txs_dw1 >> 16) & 0x1FF) as u16;
+            let final_bw = ((txs_dw1 >> 28) & 0x3) as u8;
+            let final_gi_ltf = ((txs_dw1 >> 30) & 0x3) as u8;
+
+            let timestamp = txs_dw2;
+            let total_airtime_us = (txs_dw3 & 0xFFFF) as u16;
+
+            (consumed, ParsedPacket::TxStatus(crate::core::chip::TxReport {
+                pkt_id,
+                queue_sel,
+                tx_state,
+                tx_cnt,
+                acked,
+                final_rate,
+                final_bw,
+                final_gi_ltf,
+                mac_id,
+                timestamp,
+                total_airtime_us,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  TX PD Release Host (rpkt_type=7) — buffer release notification
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_TX_PD_RELEASE_HOST => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            // Each PD ID is 2 bytes
+            let mut pd_ids = Vec::new();
+            let mut i = 0;
+            while i + 1 < payload.len() {
+                pd_ids.push(u16::from_le_bytes([payload[i], payload[i + 1]]));
+                i += 2;
+            }
+
+            (consumed, ParsedPacket::TxPdRelease(crate::core::chip::TxPdRelease {
+                release_type: 7,
+                pd_ids,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  DFS Report (rpkt_type=8) — radar detection
+        //  DW0: pulse_width[15:0], pri[31:16]
+        //  DW1: pulse_count[7:0], radar_type[11:8], timestamp[31:16]
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_DFS_RPT => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let dfs_dw0 = if payload.len() >= 4 {
+                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+            } else { 0 };
+            let dfs_dw1 = if payload.len() >= 8 {
+                u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+            } else { 0 };
+
+            let pulse_width_us = (dfs_dw0 & 0xFFFF) as u16;
+            let pri_us = ((dfs_dw0 >> 16) & 0xFFFF) as u16;
+            let pulse_count = (dfs_dw1 & 0xFF) as u8;
+            let radar_type = ((dfs_dw1 >> 8) & 0xF) as u8;
+
+            (consumed, ParsedPacket::DfsReport(crate::core::chip::DfsReport {
+                channel,
+                band,
+                pulse_width_us,
+                pri_us,
+                pulse_count,
+                radar_type,
+                timestamp: dw2,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  TX PD Release WLCPU (rpkt_type=9) — same as type 7 but WLCPU path
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_TX_PD_RELEASE_WLCPU => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let mut pd_ids = Vec::new();
+            let mut i = 0;
+            while i + 1 < payload.len() {
+                pd_ids.push(u16::from_le_bytes([payload[i], payload[i + 1]]));
+                i += 2;
+            }
+
+            (consumed, ParsedPacket::TxPdRelease(crate::core::chip::TxPdRelease {
+                release_type: 9,
+                pd_ids,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  C2H (rpkt_type=10) — firmware command response
+        //  MAC AX C2H format:
+        //  Byte 0: category (0=MAC, 1=BB, 2=RF, 3=BT, 4=FW)
+        //  Byte 1: class
+        //  Byte 2: function
+        //  Byte 3: seq
+        //  Byte 4+: payload
+        // ═══════════════════════════════════════════════════════════════
+        RPKT_C2H => {
+            let payload = &buf[payload_offset..payload_offset + pkt_len];
+            let raw = payload.to_vec();
+
+            let category = if !payload.is_empty() { payload[0] } else { 0 };
+            let class = if payload.len() > 1 { payload[1] } else { 0 };
+            let function = if payload.len() > 2 { payload[2] } else { 0 };
+            let seq = if payload.len() > 3 { payload[3] } else { 0 };
+            let c2h_payload = if payload.len() > 4 { payload[4..].to_vec() } else { Vec::new() };
+
+            (consumed, ParsedPacket::C2hEvent(crate::core::chip::C2hEvent {
+                category,
+                class,
+                function,
+                seq,
+                payload: c2h_payload,
+                raw,
+            }))
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Unknown rpkt_type — preserve raw data, don't discard
+        // ═══════════════════════════════════════════════════════════════
+        _ => {
+            (consumed, ParsedPacket::Skip)
+        }
+    }
+}
+
+/// Match a parsed PPDU to a pending WiFi frame and deliver it.
+fn deliver_ppdu_match(
+    ppdu_cnt: usize,
+    ppdu_type_raw: u8,
+    rx_rate: u16,
+    phy: &PhyStatus,
+    consumed: usize,
+) -> (usize, crate::core::chip::ParsedPacket) {
+    use crate::core::chip::ParsedPacket;
+
+    PPDU_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let slot = &mut s.slots[ppdu_cnt];
+
+        if !slot.occupied {
+            RX_DEBUG.with(|dbg| {
+                let mut d = dbg.borrow_mut();
+                if d.ppdu_count <= 200 {
+                    d.log(&format!("    → NO MATCH: slot[{}] empty (PPDU arrived first)", ppdu_cnt));
+                }
+            });
+            return (consumed, ParsedPacket::Skip);
+        }
+
+        // Build the complete frame — takes ownership of the stored data
+        let data = std::mem::take(&mut slot.data);
+        let mut frame = build_complete_frame(slot, phy);
+        frame.data = data;
+
+        RX_DEBUG.with(|dbg| {
+            let mut d = dbg.borrow_mut();
+            d.match_count += 1;
+            if d.match_count <= 200 {
+                d.log(&format!(
+                    "    → MATCH: slot[{}] → rssi={} dBm, rate=0x{:03X}, frame_len={}",
+                    ppdu_cnt, frame.rssi, frame.data_rate, frame.data.len()));
+            }
+        });
+
+        slot.occupied = false;
+
+        (consumed, ParsedPacket::Frame(frame))
+    })
+}
+
+/// Build a complete RxFrame from pending slot + parsed PHY status.
+fn build_complete_frame(slot: &PendingFrame, phy: &PhyStatus) -> RxFrame {
+    use crate::core::frame::*;
+
+    // Convert RSSI: U(8,1) format → dBm = (raw >> 1) - 110
+    let rssi_avg_dbm = if phy.rssi_avg != 0 {
+        ((phy.rssi_avg >> 1) as i16 - 110) as i8
+    } else {
+        0i8
+    };
+    let rssi_path_dbm: [i8; 4] = std::array::from_fn(|i| {
+        if phy.rssi_path[i] != 0 {
+            ((phy.rssi_path[i] >> 1) as i16 - 110) as i8
+        } else {
+            0i8
+        }
+    });
+
+    let is_cck = phy.ie0_present && !phy.ie1_present;
+
+    // Noise floor and SNR depend on CCK vs OFDM path
+    let noise_floor = if is_cck {
+        if phy.ie0_noise_pwr != 0 { (phy.ie0_noise_pwr as i16 - 110) as i8 } else { 0 }
+    } else if phy.ie1_present {
+        if phy.ie1_noise_pwr != 0 { (phy.ie1_noise_pwr as i16 - 110) as i8 } else { 0 }
+    } else {
+        0
+    };
+
+    let snr = if phy.ie1_present { phy.ie1_snr } else { 0 };
+
+    // CFO: 12-bit signed value in the IE
+    let cfo = if phy.ie1_present { phy.ie1_cfo } else if phy.ie0_present { phy.ie0_cfo } else { 0 };
+    let cfo_preamble = if phy.ie1_present { phy.ie1_cfo_preamble } else { 0 };
+
+    // SNR calculations (per Linux driver halbb_physts_rpt_gen)
+    let snr_td_avg = if is_cck {
+        phy.rssi_avg.saturating_sub(phy.ie0_noise_pwr)
+    } else if phy.ie1_present {
+        phy.rssi_avg.saturating_sub(phy.ie1_noise_pwr)
+    } else {
+        0
+    };
+
+    let snr_td: [u8; 4] = std::array::from_fn(|i| {
+        let noise = if is_cck { phy.ie0_noise_pwr } else if phy.ie1_present { phy.ie1_noise_pwr } else { 0 };
+        phy.rssi_path[i].saturating_sub(noise)
+    });
+
+    let snr_fd_avg = if phy.ie1_present { phy.ie1_snr } else { 0 };
+    let snr_fd: [u8; 4] = std::array::from_fn(|i| {
+        if snr_fd_avg > 0 && phy.rssi_avg > 0 && phy.rssi_path[i] > 0 {
+            (((snr_fd_avg as u16) << 1).wrapping_add(phy.rssi_avg as u16).wrapping_sub(phy.rssi_path[i] as u16) >> 1) as u8
+        } else {
+            0
+        }
+    });
+
+    RxFrame {
+        data: Vec::new(), // Will be set by caller (stored separately)
+        rssi: rssi_avg_dbm,
+        channel: slot.channel,
+        band: slot.band,
+        timestamp: Duration::from_micros(slot.freerun_cnt as u64),
+        rssi_path: rssi_path_dbm,
+        noise_floor,
+        snr,
+        data_rate: slot.data_rate,
+        ppdu_type: ppdu_type_from_raw(slot.ppdu_type),
+        bandwidth: RxBandwidth::from_raw(slot.bw),
+        gi_ltf: GuardInterval::from_raw(slot.gi_ltf),
+        is_ldpc: if phy.ie1_present { phy.ie1_is_ldpc } else { false },
+        is_stbc: if phy.ie1_present { phy.ie1_is_stbc } else { false },
+        is_bf: if phy.ie1_present { phy.ie1_is_bf } else { false },
+        is_ampdu: slot.is_ampdu,
+        is_amsdu: slot.is_amsdu,
+        // Extended IE1 fields
+        rssi_fd: if phy.ie1_present { phy.ie1_rssi_avg_fd } else { 0 },
+        evm_max: if phy.ie1_present { phy.ie1_evm_max } else { 0 },
+        evm_min: if phy.ie1_present { phy.ie1_evm_min } else { 0 },
+        cfo,
+        cfo_preamble,
+        rxsc: if phy.ie1_present { phy.ie1_rxsc } else { 0 },
+        rx_path_en: if phy.ie1_present { phy.ie1_rx_path_en } else if phy.ie0_present { phy.ie0_rx_path_en } else { 0 },
+        is_su: if phy.ie1_present { phy.ie1_is_su } else { true },
+        is_ndp: if phy.ie1_present { phy.ie1_is_ndp } else { false },
+        is_awgn: if phy.ie1_present { phy.ie1_is_awgn } else { false },
+        grant_bt: if phy.ie1_present { phy.ie1_grant_bt } else { false },
+        bf_gain_max: if phy.ie1_present { phy.ie1_bf_gain_max } else { 0 },
+        condition_number: if phy.ie1_present { phy.ie1_avg_cn } else { 0 },
+        sigval_below_th_cnt: if phy.ie1_present { phy.ie1_sigval_below_th_cnt } else { 0 },
+        cn_excess_th_cnt: if phy.ie1_present { phy.ie1_cn_excess_th_cnt } else { 0 },
+        pwr_to_cca: if phy.ie1_present { phy.ie1_pwr_to_cca } else { 0 },
+        cca_to_agc: if phy.ie1_present { phy.ie1_cca_to_agc } else { 0 },
+        cca_to_sbd: if phy.ie1_present { phy.ie1_cca_to_sbd } else { 0 },
+        edcca_rpt_cnt: if phy.ie1_present { phy.ie1_edcca_rpt_cnt } else { 0 },
+        edcca_total_smp_cnt: if phy.ie1_present { phy.ie1_edcca_total_smp_cnt } else { 0 },
+        edcca_rpt_bw_max: if phy.ie1_present { phy.ie1_edcca_bw_max } else { 0 },
+        edcca_rpt_bw_min: if phy.ie1_present { phy.ie1_edcca_bw_min } else { 0 },
+        bw_from_phy: if phy.ie1_present { phy.ie1_bw_idx } else { 0 },
+        pop_idx: if phy.ie1_present { phy.ie1_pop_idx } else if phy.ie0_present { phy.ie0_pop_idx } else { 0 },
+        // CCK fields
+        cck_rpl: if phy.ie0_present { phy.ie0_rpl } else { 0 },
+        cck_cca_time: if phy.ie0_present { phy.ie0_cca_time } else { 0 },
+        cck_evm_hdr: if phy.ie0_present { phy.ie0_evm_hdr } else { 0 },
+        cck_evm_pld: if phy.ie0_present { phy.ie0_evm_pld } else { 0 },
+        cck_sig_len: if phy.ie0_present { phy.ie0_sig_len } else { 0 },
+        cck_preamble_type: if phy.ie0_present { phy.ie0_preamble_type } else { 0 },
+        cck_dagc: if phy.ie0_present { phy.ie0_dagc } else { [0; 4] },
+        cck_antdiv_rslt: if phy.ie0_present { phy.ie0_antdiv_rslt } else { [false; 4] },
+        cck_hw_antsw: if phy.ie0_present { phy.ie0_hw_antsw } else { [false; 4] },
+        cck_antwgt_gain_diff: if phy.ie0_present { phy.ie0_antwgt_gain_diff } else { 0 },
+        cck_sync_mode: if phy.ie0_present { phy.ie0_sync_mode } else { 0 },
+        // IE2 HE/AX fields
+        max_nsts: if phy.ie2_present { phy.ie2_max_nsts } else { 0 },
+        midamble: if phy.ie2_present { phy.ie2_midamble } else { false },
+        ltf_type: if phy.ie2_present { phy.ie2_ltf_type } else { 0 },
+        gi_from_phy: if phy.ie2_present { phy.ie2_gi } else { 0 },
+        is_mu_mimo: if phy.ie2_present { phy.ie2_is_mu_mimo } else { false },
+        is_dl_ofdma: if phy.ie2_present { phy.ie2_is_dl_ofdma } else { false },
+        is_dcm: if phy.ie2_present { phy.ie2_is_dcm } else { false },
+        is_doppler: if phy.ie2_present { phy.ie2_is_doppler } else { false },
+        pkt_extension: if phy.ie2_present { phy.ie2_pkt_extension } else { 0 },
+        coarse_cfo_i: if phy.ie2_present { phy.ie2_coarse_cfo_i } else { 0 },
+        coarse_cfo_q: if phy.ie2_present { phy.ie2_coarse_cfo_q } else { 0 },
+        fine_cfo_i: if phy.ie2_present { phy.ie2_fine_cfo_i } else { 0 },
+        fine_cfo_q: if phy.ie2_present { phy.ie2_fine_cfo_q } else { 0 },
+        est_cmped_phase: if phy.ie2_present { phy.ie2_est_cmped_phase } else { 0 },
+        n_ltf: if phy.ie2_present { phy.ie2_n_ltf } else { 0 },
+        n_sym: if phy.ie2_present { phy.ie2_n_sym } else { 0 },
+        // Per-path IE4-7
+        path_sig_val: phy.ie_path_sig_val,
+        path_rf_gain_idx: phy.ie_path_rf_gain_idx,
+        path_tia_gain_idx: phy.ie_path_tia_gain_idx,
+        path_snr: phy.ie_path_snr,
+        path_evm: phy.ie_path_evm,
+        path_ant_weight: phy.ie_path_ant_weight,
+        path_dc_re: phy.ie_path_dc_re,
+        path_dc_im: phy.ie_path_dc_im,
+        // Derived SNR
+        snr_fd_avg,
+        snr_fd,
+        snr_td,
+    }
+}
+
+/// Evict a pending frame from a slot, returning it with rssi=0.
+fn evict_slot(slot: &mut PendingFrame) -> RxFrame {
     let frame = RxFrame {
-        data: buf[data_start..data_start + frame_len].to_vec(),
-        channel,
-        band: if channel <= 14 { 0 } else { 1 },
-        rssi,
+        data: std::mem::take(&mut slot.data),
+        channel: slot.channel,
+        band: slot.band,
+        data_rate: slot.data_rate,
+        ppdu_type: ppdu_type_from_raw(slot.ppdu_type),
+        bandwidth: RxBandwidth::from_raw(slot.bw),
+        gi_ltf: GuardInterval::from_raw(slot.gi_ltf),
+        timestamp: Duration::from_micros(slot.freerun_cnt as u64),
+        is_ampdu: slot.is_ampdu,
+        is_amsdu: slot.is_amsdu,
         ..Default::default()
     };
+    slot.occupied = false;
+    frame
+}
 
-    (consumed, ParsedPacket::Frame(frame))
+/// Convert raw ppdu_type value to PpduType enum.
+fn ppdu_type_from_raw(raw: u8) -> PpduType {
+    match raw {
+        PPDU_T_LEGACY => PpduType::Ofdm,  // Legacy — could be CCK or OFDM, use OFDM as generic
+        PPDU_T_HT => PpduType::HT,
+        PPDU_T_VHT => PpduType::VhtSu,
+        PPDU_T_HE_SU | PPDU_T_HE_ER_SU => PpduType::HeSu,
+        PPDU_T_HE_MU => PpduType::HeMu,
+        PPDU_T_HE_TB => PpduType::HeTb,
+        _ => PpduType::Cck,
+    }
+}
+
+/// Parse all physts IEs from the IE area (after the 8-byte header).
+fn parse_physts_ies(ie_area: &[u8], phy: &mut PhyStatus) {
+    let mut pos = 0;
+    let mut bitmap: u32 = 0;
+
+    while pos < ie_area.len() {
+        let ie_id = ie_area[pos] & 0x1F;
+
+        // Prevent duplicate IEs
+        if bitmap & (1 << ie_id) != 0 { break; }
+
+        // Determine IE length
+        let ie_len = if (ie_id as usize) < IE_LEN_TABLE.len() && IE_LEN_TABLE[ie_id as usize] != 0xFF {
+            // Fixed length (in 8-byte units → bytes)
+            (IE_LEN_TABLE[ie_id as usize] as usize) * 8
+        } else if pos + 1 < ie_area.len() {
+            // Variable length: 12-bit header
+            let hi3 = ((ie_area[pos] >> 5) & 0x7) as usize;
+            let lo4 = ((ie_area[pos + 1]) & 0xF) as usize;
+            ((lo4 << 3) | hi3) * 8
+        } else {
+            break;
+        };
+
+        if ie_len == 0 || pos + ie_len > ie_area.len() { break; }
+
+        let ie_data = &ie_area[pos..pos + ie_len];
+
+        match ie_id {
+            0 => parse_ie0_cck(ie_data, phy),
+            1 => parse_ie1_ofdm(ie_data, phy),
+            2 => parse_ie2_he(ie_data, phy),
+            // IE3: segment 1 (80+80MHz) — skip for now (20MHz only)
+            4..=7 => parse_ie4_7_path(ie_id - 4, ie_data, phy),
+            // IE8-31: parsed structurally but fields stored as-is
+            // These are less common (channel info, PLCP, debug) —
+            // we walk past them correctly but don't extract every field yet.
+            // The data is still consumed so we don't lose sync.
+            _ => {}
+        }
+
+        bitmap |= 1 << ie_id;
+        pos += ie_len;
+    }
+}
+
+/// Parse IE0 — CCK common (16 bytes)
+fn parse_ie0_cck(data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 16 { return; }
+    phy.ie0_present = true;
+
+    // DW0
+    phy.ie0_pop_idx = (data[0] >> 5) & 0x3;
+    let rpl_l = (data[0] >> 7) & 1;
+    let rpl_m = data[1];
+    phy.ie0_rpl = ((rpl_m as u16) << 1) | (rpl_l as u16);
+    phy.ie0_cca_time = data[2];
+    phy.ie0_antwgt_gain_diff = data[3] & 0x1F;
+    phy.ie0_hw_antsw[0] = (data[3] >> 5) & 1 != 0;
+    phy.ie0_hw_antsw[1] = (data[3] >> 6) & 1 != 0;
+    phy.ie0_hw_antsw[2] = (data[3] >> 7) & 1 != 0;
+
+    // DW1
+    phy.ie0_noise_pwr = data[4];
+    let cfo_l = data[5];
+    let cfo_m = data[6] & 0xF;
+    phy.ie0_cfo = sign_extend_12(((cfo_m as u16) << 8) | (cfo_l as u16));
+    let ccfo_l = (data[6] >> 4) & 0xF;
+    let ccfo_m = data[7];
+    phy.ie0_coarse_cfo = sign_extend_12(((ccfo_m as u16) << 4) | (ccfo_l as u16));
+
+    // DW2
+    phy.ie0_evm_hdr = data[8];
+    phy.ie0_evm_pld = data[9];
+    phy.ie0_sig_len = u16::from_le_bytes([data[10], data[11]]);
+
+    // DW3
+    phy.ie0_antdiv_rslt[0] = data[12] & 1 != 0;
+    phy.ie0_antdiv_rslt[1] = (data[12] >> 1) & 1 != 0;
+    phy.ie0_antdiv_rslt[2] = (data[12] >> 2) & 1 != 0;
+    phy.ie0_antdiv_rslt[3] = (data[12] >> 3) & 1 != 0;
+    phy.ie0_preamble_type = (data[12] >> 4) & 1;
+    phy.ie0_sync_mode = (data[12] >> 5) & 1;
+    phy.ie0_hw_antsw[3] = (data[12] >> 7) & 1 != 0;
+
+    let dagc_a = data[13] & 0x1F;
+    let dagc_b = ((data[13] >> 5) & 0x7) | ((data[14] & 0x3) << 3);
+    let dagc_c = (data[14] >> 2) & 0x1F;
+    let dagc_d = ((data[14] >> 7) & 0x1) | ((data[15] & 0xF) << 1);
+    phy.ie0_dagc = [dagc_a, dagc_b, dagc_c, dagc_d];
+    phy.ie0_rx_path_en = (data[15] >> 4) & 0xF;
+}
+
+/// Parse IE1 — OFDM/HT/VHT/HE common (32 bytes)
+fn parse_ie1_ofdm(data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 24 { return; } // minimum for DW0-DW5
+    phy.ie1_present = true;
+
+    // DW0
+    phy.ie1_pop_idx = (data[0] >> 5) & 0x3;
+    phy.ie1_rssi_avg_fd = data[1];
+    phy.ie1_ch_idx = data[2];
+    phy.ie1_rxsc = data[3] & 0xF;
+    phy.ie1_rx_path_en = (data[3] >> 4) & 0xF;
+
+    // DW1
+    phy.ie1_noise_pwr = data[4];
+    let cfo_l = data[5];
+    let cfo_m = data[6] & 0xF;
+    phy.ie1_cfo = sign_extend_12(((cfo_m as u16) << 8) | (cfo_l as u16));
+    let pcfo_l = (data[6] >> 4) & 0xF;
+    let pcfo_m = data[7];
+    phy.ie1_cfo_preamble = sign_extend_12(((pcfo_m as u16) << 4) | (pcfo_l as u16));
+
+    // DW2
+    phy.ie1_snr = data[8] & 0x3F;
+    phy.ie1_evm_max = data[9];
+    phy.ie1_evm_min = data[10];
+    phy.ie1_gi_type = data[11] & 0x7;
+    phy.ie1_is_su = (data[11] >> 3) & 1 != 0;
+    phy.ie1_is_ldpc = (data[11] >> 4) & 1 != 0;
+    phy.ie1_is_ndp = (data[11] >> 5) & 1 != 0;
+    phy.ie1_is_stbc = (data[11] >> 6) & 1 != 0;
+    phy.ie1_grant_bt = (data[11] >> 7) & 1 != 0;
+
+    // DW3
+    phy.ie1_bf_gain_max = data[12] & 0x7F;
+    phy.ie1_is_awgn = (data[12] >> 7) & 1 != 0;
+    phy.ie1_is_bf = data[13] & 1 != 0;
+    phy.ie1_avg_cn = (data[13] >> 1) & 0x7F;
+    phy.ie1_sigval_below_th_cnt = data[14];
+    phy.ie1_cn_excess_th_cnt = data[15];
+
+    // DW4
+    phy.ie1_pwr_to_cca = u16::from_le_bytes([data[16], data[17]]);
+    phy.ie1_cca_to_agc = data[18];
+    phy.ie1_cca_to_sbd = data[19];
+
+    // DW5
+    phy.ie1_edcca_rpt_cnt = (data[20] >> 1) & 0x7F;
+    phy.ie1_edcca_total_smp_cnt = data[21] & 0x7F;
+    let bw_max_l = (data[21] >> 7) & 1;
+    let bw_max_m = data[22] & 0x3F;
+    phy.ie1_edcca_bw_max = (bw_max_m << 1) | bw_max_l;
+    let bw_min_l = (data[22] >> 6) & 0x3;
+    let bw_min_m = data[23] & 0x1F;
+    phy.ie1_edcca_bw_min = (bw_min_m << 2) | bw_min_l;
+    phy.ie1_bw_idx = (data[23] >> 5) & 0x7;
+}
+
+/// Parse IE2 — HE/AX extended (24 bytes)
+fn parse_ie2_he(data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 16 { return; }
+    phy.ie2_present = true;
+
+    // DW0
+    phy.ie2_max_nsts = (data[0] >> 5) & 0x7;
+    phy.ie2_midamble = data[1] & 1 != 0;
+    phy.ie2_ltf_type = (data[1] >> 1) & 0x3;
+    phy.ie2_gi = (data[1] >> 3) & 0x3;
+    phy.ie2_is_mu_mimo = (data[1] >> 5) & 1 != 0;
+    // Coarse CFO I: 18-bit signed spread across bytes 1-3
+    let c_cfo_i_l = ((data[1] >> 6) & 0x3) as u32;
+    let c_cfo_i_m2 = data[2] as u32;
+    let c_cfo_i_m1 = data[3] as u32;
+    let c_cfo_i_raw = (c_cfo_i_m1 << 10) | (c_cfo_i_m2 << 2) | c_cfo_i_l;
+    phy.ie2_coarse_cfo_i = sign_extend_18(c_cfo_i_raw);
+
+    // DW1
+    phy.ie2_is_dl_ofdma = (data[5] >> 5) & 1 != 0;
+    let c_cfo_q_l = ((data[5] >> 6) & 0x3) as u32;
+    let c_cfo_q_m2 = data[6] as u32;
+    let c_cfo_q_m1 = data[7] as u32;
+    let c_cfo_q_raw = (c_cfo_q_m1 << 10) | (c_cfo_q_m2 << 2) | c_cfo_q_l;
+    phy.ie2_coarse_cfo_q = sign_extend_18(c_cfo_q_raw);
+
+    // DW2
+    phy.ie2_est_cmped_phase = data[8];
+    phy.ie2_is_dcm = data[9] & 1 != 0;
+    phy.ie2_is_doppler = (data[9] >> 1) & 1 != 0;
+    phy.ie2_pkt_extension = (data[9] >> 2) & 0x7;
+    let f_cfo_i_l = ((data[9] >> 6) & 0x3) as u32;
+    let f_cfo_i_m2 = data[10] as u32;
+    let f_cfo_i_m1 = data[11] as u32;
+    let f_cfo_i_raw = (f_cfo_i_m1 << 10) | (f_cfo_i_m2 << 2) | f_cfo_i_l;
+    phy.ie2_fine_cfo_i = sign_extend_18(f_cfo_i_raw);
+
+    // DW3
+    phy.ie2_n_ltf = data[12] & 0x7;
+    let n_sym_l = ((data[12] >> 3) & 0x1F) as u16;
+    let n_sym_m = (data[13] & 0x3F) as u16;
+    phy.ie2_n_sym = (n_sym_m << 5) | n_sym_l;
+    let f_cfo_q_l = ((data[13] >> 6) & 0x3) as u32;
+    let f_cfo_q_m2 = data[14] as u32;
+    let f_cfo_q_m1 = data[15] as u32;
+    let f_cfo_q_raw = (f_cfo_q_m1 << 10) | (f_cfo_q_m2 << 2) | f_cfo_q_l;
+    phy.ie2_fine_cfo_q = sign_extend_18(f_cfo_q_raw);
+}
+
+/// Parse IE4-7 — per-path stats (8 bytes each)
+fn parse_ie4_7_path(path: u8, data: &[u8], phy: &mut PhyStatus) {
+    if data.len() < 8 { return; }
+    let p = path as usize;
+    if p >= 4 { return; }
+    phy.ie_path_present[p] = true;
+
+    // DW0
+    phy.ie_path_sig_val[p] = data[1];
+    phy.ie_path_rf_gain_idx[p] = data[2];
+    phy.ie_path_tia_gain_idx[p] = data[3] & 1;
+    phy.ie_path_snr[p] = (data[3] >> 2) & 0x3F;
+
+    // DW1
+    phy.ie_path_evm[p] = data[4];
+    phy.ie_path_ant_weight[p] = data[5] & 0x7F;
+    phy.ie_path_dc_re[p] = data[6];
+    phy.ie_path_dc_im[p] = data[7];
+}
+
+/// Sign-extend a 12-bit value to i16.
+fn sign_extend_12(val: u16) -> i16 {
+    if val & 0x800 != 0 {
+        (val | 0xF000) as i16
+    } else {
+        val as i16
+    }
+}
+
+/// Sign-extend an 18-bit value to i32.
+fn sign_extend_18(val: u32) -> i32 {
+    if val & 0x20000 != 0 {
+        (val | 0xFFFC0000) as i32
+    } else {
+        val as i32
+    }
 }
 
 fn start_rx_pipeline_8852bu(
