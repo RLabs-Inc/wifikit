@@ -1714,7 +1714,7 @@ impl ChipDriver for Rtl8852bu {
         &mut self,
         gate: crate::pipeline::FrameGate,
         alive: Arc<AtomicBool>,
-        _tx_feedback: Arc<crate::core::chip::TxFeedback>,
+        tx_feedback: Arc<crate::core::chip::TxFeedback>,
     ) -> bool {
         start_rx_pipeline_8852bu(
             Arc::clone(&self.handle),
@@ -1722,6 +1722,7 @@ impl ChipDriver for Rtl8852bu {
             Arc::clone(&self.channel),
             gate,
             alive,
+            tx_feedback,
         );
         true
     }
@@ -1951,14 +1952,12 @@ struct RxDebugLog {
 
 impl RxDebugLog {
     fn new() -> Self {
-        use std::io::Write;
-        let file = std::fs::OpenOptions::new()
-            .create(true).write(true).truncate(true)
-            .open("/tmp/wifikit_rx_parse_debug_8852bu.log").ok();
-        if let Some(ref mut f) = file.as_ref() {
-            let _ = writeln!(f as &mut dyn Write, "=== RTL8852BU RX Parse Debug Log ===\n");
-        }
-        Self { file, count: 0, wifi_count: 0, ppdu_count: 0, match_count: 0, evict_count: 0, skip_count: 0 }
+        // Debug logging disabled for runtime performance.
+        // To enable: uncomment the file open below.
+        // let file = std::fs::OpenOptions::new()
+        //     .create(true).write(true).truncate(true)
+        //     .open("/tmp/wifikit_rx_parse_debug_8852bu.log").ok();
+        Self { file: None, count: 0, wifi_count: 0, ppdu_count: 0, match_count: 0, evict_count: 0, skip_count: 0 }
     }
 
     fn log(&mut self, msg: &str) {
@@ -2040,7 +2039,8 @@ fn parse_rx_packet_8852bu(buf: &[u8], channel: u8) -> (usize, crate::core::chip:
     // Total consumed bytes for this packet
     let total_len = payload_offset + pkt_len;
     // Round up to 8-byte alignment (USB aggregation boundary)
-    let consumed = (total_len + 7) & !7;
+    // Cap to buffer length to prevent overrun in stream drain
+    let consumed = ((total_len + 7) & !7).min(buf.len());
 
     if total_len > buf.len() {
         return (0, ParsedPacket::Skip);
@@ -3095,67 +3095,108 @@ fn start_rx_pipeline_8852bu(
     channel: Arc<AtomicU8>,
     gate: crate::pipeline::FrameGate,
     alive: Arc<AtomicBool>,
+    tx_feedback: Arc<crate::core::chip::TxFeedback>,
 ) {
+    const USB_TIMEOUT: Duration = Duration::from_millis(50);
+
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-    // ── Thread 1: USB reader ──
+    // ── Thread 1: USB reader — reads endpoint, sends each read ──
     let device_clone = Arc::clone(&device);
     let alive_reader = Arc::clone(&alive);
     thread::Builder::new()
         .name("rx-usb-reader-8852bu".into())
         .spawn(move || {
             let mut buf = vec![0u8; RX_BUF_SIZE];
-            while alive_reader.load(Ordering::Relaxed) {
-                match device_clone.read_bulk(ep_in, &mut buf, Duration::from_millis(50)) {
+            let mut consecutive_errors = 0u32;
+
+            loop {
+                if !alive_reader.load(Ordering::SeqCst) { break; }
+
+                let actual = match device_clone.read_bulk(ep_in, &mut buf, USB_TIMEOUT) {
                     Ok(n) if n > 0 => {
-                        let _ = tx.send(buf[..n].to_vec());
+                        consecutive_errors = 0;
+                        n
                     }
-                    _ => {}
-                }
+                    Ok(_) => continue,
+                    Err(rusb::Error::Timeout) => continue,
+                    Err(rusb::Error::Interrupted) => continue,
+                    Err(rusb::Error::Pipe) => {
+                        consecutive_errors += 1;
+                        let _ = device_clone.clear_halt(ep_in);
+                        thread::sleep(Duration::from_millis(5));
+                        if consecutive_errors >= 50 { break; }
+                        continue;
+                    }
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        thread::sleep(Duration::from_millis(10));
+                        if consecutive_errors >= 50 { break; }
+                        continue;
+                    }
+                };
+
+                if tx.send(buf[..actual].to_vec()).is_err() { break; }
             }
         })
         .expect("failed to spawn rx-usb-reader-8852bu");
 
-    // ── Thread 2: Stream parser ──
-    let alive_parser = Arc::clone(&alive);
+    // ── Thread 2: Per-read parser — each USB read is self-contained ──
     thread::Builder::new()
-        .name("rx-stream-parser-8852bu".into())
+        .name("rx-per-read-parser-8852bu".into())
         .spawn(move || {
-            let mut stream = std::collections::VecDeque::<u8>::with_capacity(256 * 1024);
-
-            while alive_parser.load(Ordering::Relaxed) {
-                // Drain all available USB reads into the stream buffer
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(data) => { stream.extend(&data); }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(_) => break, // channel closed
-                }
-                // Drain any additional queued reads
-                while let Ok(data) = rx.try_recv() {
-                    stream.extend(&data);
-                }
-
-                // Parse frames from the contiguous stream
-                let contiguous: Vec<u8> = stream.iter().copied().collect();
+            for read_buf in rx.iter() {
+                let actual = read_buf.len();
                 let mut pos = 0;
-                while pos < contiguous.len() {
-                    let remaining = &contiguous[pos..];
-                    let ch = channel.load(Ordering::Relaxed);
-                    let (consumed, packet) = parse_rx_packet_8852bu(remaining, ch);
-                    if consumed == 0 { break; }
-                    pos += consumed;
 
-                    if let crate::core::chip::ParsedPacket::Frame(frame) = packet {
-                        gate.submit(frame);
+                while pos + 4 <= actual {
+                    let dw0 = u32::from_le_bytes([
+                        read_buf[pos], read_buf[pos+1], read_buf[pos+2], read_buf[pos+3],
+                    ]);
+                    let pkt_len = (dw0 & 0x3FFF) as usize;
+                    let shift = ((dw0 >> 14) & 0x3) as usize;
+                    let long_rxd = (dw0 >> 31) & 1 != 0;
+                    let drv_info_size = ((dw0 >> 28) & 0x7) as usize;
+                    let rpkt_type = ((dw0 >> 24) & 0xF) as u8;
+                    let desc_len = if long_rxd { RX_DESC_LONG } else { RX_DESC_SHORT };
+
+                    if pkt_len == 0 {
+                        if pos + desc_len > actual { break; }
+                        pos += desc_len;
+                        continue;
                     }
-                }
-                // Remove consumed bytes from stream
-                if pos > 0 {
-                    stream.drain(..pos);
+
+                    let payload_offset = desc_len + (drv_info_size * 8) + (shift * 2);
+                    let total_len = payload_offset + pkt_len;
+                    let consumed = (total_len + 7) & !7;
+
+                    if rpkt_type > 10 || pos + consumed > actual {
+                        break;
+                    }
+
+                    let packet = &read_buf[pos..pos + consumed];
+
+                    // Parse — retry loop handles PPDU eviction (pc=0 means evicted frame ready)
+                    let ch = channel.load(Ordering::Relaxed);
+                    loop {
+                        let (pc, result) = parse_rx_packet_8852bu(packet, ch);
+                        match result {
+                            crate::core::chip::ParsedPacket::Frame(frame) => {
+                                gate.submit(frame);
+                            }
+                            crate::core::chip::ParsedPacket::TxStatus(ref rpt) => {
+                                tx_feedback.record(rpt);
+                            }
+                            _ => {}
+                        }
+                        if pc > 0 { break; }
+                    }
+
+                    pos += consumed;
                 }
             }
         })
-        .expect("failed to spawn rx-stream-parser-8852bu");
+        .expect("failed to spawn rx-per-read-parser-8852bu");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
