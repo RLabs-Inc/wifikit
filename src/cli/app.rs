@@ -24,6 +24,7 @@ use crate::cli::banner;
 use crate::cli::commands::{self, Ctx, ShellState, Mode, AdapterStatus};
 use crate::cli::views::pmkid as pmkid_cli;
 use crate::cli::views::dos as dos_cli;
+use crate::attacks::wps::WpsEventKind;
 use crate::cli::views::wps as wps_cli;
 use crate::cli::views::eap as eap_cli;
 use crate::cli::views::fuzz as fuzz_cli;
@@ -359,15 +360,27 @@ impl Shell {
             }
         }
 
-        // Drain events from WPS attack modules → print to scrollback
+        // Drain events from WPS attack modules → print to scrollback + freeze summaries
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(wps_mod) = state.focus_stack.find_as_mut::<wps_cli::WpsModule>("wps") {
                 let events = wps_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| wps_cli::format_event(e)).collect();
+                let info = wps_mod.info();
                 drop(state);
-                for line in &lines {
-                    self.layout.print(line);
+                for event in &events {
+                    // Print every event to scrollback (the real-time story)
+                    let line = wps_cli::format_event(event);
+                    self.layout.print(&line);
+
+                    // Additionally, freeze a summary on target complete
+                    if matches!(&event.kind, WpsEventKind::TargetComplete { .. }) {
+                        if let Some(result) = info.results.last() {
+                            let summary = wps_cli::freeze_target_summary(&info, result);
+                            for sline in &summary {
+                                self.layout.print(sline);
+                            }
+                        }
+                    }
                 }
             }
         }

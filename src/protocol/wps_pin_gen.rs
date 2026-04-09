@@ -125,9 +125,18 @@ pub struct PinCandidate {
 /// Typically returns 0-15 candidates depending on OUI matches.
 pub fn generate_pins(mac: &MacAddress, serial: Option<&str>) -> Vec<PinCandidate> {
     let matches = match_algorithms(mac);
-    if matches.is_empty() {
-        return Vec::new();
-    }
+
+    // Fallback: when no OUI match, try generic MAC-based algorithms
+    // These are purely mathematical — work for any MAC address
+    let matches = if matches.is_empty() {
+        vec![
+            (PinAlgo::Pin24, 30),
+            (PinAlgo::Pin28, 30),
+            (PinAlgo::Pin32, 30),
+        ]
+    } else {
+        matches
+    };
 
     let b = mac.as_bytes();
     let mac_int = mac_to_u64(b);
@@ -711,6 +720,7 @@ static OUI_DATABASE: &[OuiEntry] = &[
     OuiEntry { prefix: "E8CC18", algo: PinAlgo::Asus },
     OuiEntry { prefix: "EC2280", algo: PinAlgo::Asus },
     OuiEntry { prefix: "F8E903F4", algo: PinAlgo::Asus },
+    OuiEntry { prefix: "7C10C9", algo: PinAlgo::Asus },
 
     // ── pinAirocon ──
     OuiEntry { prefix: "0007262F", algo: PinAlgo::Airocon },
@@ -1002,9 +1012,15 @@ mod tests {
 
     #[test]
     fn test_generate_pins_unknown_oui() {
+        // Unknown OUIs now get fallback generic algorithms (pin24, pin28, pin32)
         let m = mac([0xFF, 0xFF, 0xFF, 0x11, 0x22, 0x33]);
         let candidates = generate_pins(&m, None);
-        assert!(candidates.is_empty());
+        assert!(!candidates.is_empty(), "fallback should produce pin24/28/32 candidates");
+        assert!(candidates.len() <= 3);
+        // All should be low confidence (30)
+        for c in &candidates {
+            assert_eq!(c.confidence, 30);
+        }
     }
 
     #[test]
