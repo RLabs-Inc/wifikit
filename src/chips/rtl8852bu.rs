@@ -38,13 +38,17 @@
 //!   - Firmware binary: rtw8852b_fw-1.bin (not rtl8852au_fw.bin)
 //!   - PIDs: 0xB832 and 0xC832
 //!
+//! # Channel Switching
+//!
+//!   Pre-extracted register sequences from monitor-mode usbmon capture.
+//!   111 channel+bandwidth combos (HT20/HT40+/HT40-/VHT80) as direct
+//!   write32/read32 calls — zero pcap parsing at runtime.
+//!   See rtl8852b_channel_switch.rs.
+//!
 //! # What's NOT Implemented
 //!
-//!   - Channel switching (no per-channel pcaps yet)
-//!   - Complex RX pipeline (stubbed — need init verification first)
-//!   - Phase table files (no 8852B post-boot tables yet)
-//!   - 40/80 MHz bandwidth
 //!   - TX power calibration from EFUSE
+//!   - 160 MHz bandwidth
 
 // Register map constants — many not yet wired but needed for full driver implementation.
 // Struct fields/methods used via ChipDriver trait dispatch appear unused to the compiler.
@@ -1040,20 +1044,43 @@ impl Rtl8852bu {
     //  Chip init — pcap replay
     // ══════════════════════════════════════════════════════════════════════════
 
+    fn dump_rx_regs(&self, label: &str) {
+        use std::io::Write;
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/wifikit_8852bu_rx_stats.log") {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let _ = writeln!(f, "\n=== REG DUMP: {} ===", label);
+        for &(addr, name) in &[
+            (0x8900u16, "RXAGG_0"), (0x8904, "RXAGG_1"), (0x8908, "RXDMA_SETTING"),
+            (0x8380, "HCI_FUNC_EN"), (0x8400, "DMAC_FUNC_EN"), (0x8404, "DMAC_CLK_EN"),
+            (0xC000, "CMAC_FUNC_EN"), (0xC004, "CMAC_CLK_EN"),
+            (0xCE20, "RX_FLTR_OPT"), (0xCE24, "CTRL_FLTR"), (0xCE28, "MGNT_FLTR"), (0xCE2C, "DATA_FLTR"),
+            (0x1060, "USB_EP_0"), (0x106C, "USB_EP_3"), (0x1078, "USB_HOST_REQ_2"), (0x1174, "USB_WLAN0_1"),
+            (0x01E0, "WCPU_FW_CTRL"), (0x0088, "PLATFORM_EN"),
+        ] {
+            match self.read32(addr) {
+                Ok(v) => { let _ = writeln!(f, "  0x{:04X} ({:16}) = 0x{:08X}", addr, name, v); }
+                Err(_) => { let _ = writeln!(f, "  0x{:04X} ({:16}) = READ ERROR", addr, name); }
+            }
+        }
+    }
+
     fn chip_init(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
 
-        // ── Phase -1: Clean up dirty firmware state ──
-        // 8852BU disable_cpu() does NOT toggle PLATFORM_EN (ROM re-enables WCPU)
+        // ── Phase -1: Clean up dirty firmware state (EXACT AU pattern) ──
         let fw_ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
+        eprintln!("  [init] FW_CTRL=0x{:02X}", fw_ctrl);
         if fw_ctrl != 0 {
-            eprintln!("  [init] cleaning dirty FW state (ctrl=0x{:02X})", fw_ctrl);
             self.disable_cpu()?;
             self.power_off()?;
             thread::sleep(Duration::from_millis(50));
         }
 
-        // ── Background RX drain thread ──
+        // ── Background RX drain thread (EXACT AU pattern: 1ms timeout) ──
         let drain_handle = Arc::clone(&self.handle);
         let drain_ep = self.ep_in;
         let drain_running = Arc::new(AtomicBool::new(true));
@@ -1061,28 +1088,33 @@ impl Rtl8852bu {
         let drain_thread = thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             let mut total = 0usize;
-            let mut errors = 0u32;
             while drain_flag.load(Ordering::Relaxed) {
-                match drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(1)) {
-                    Ok(n) if n > 0 => { total += n; }
-                    Err(_) => { errors += 1; }
-                    _ => {}
+                if let Ok(n) = drain_handle.read_bulk(drain_ep, &mut buf, Duration::from_millis(1)) {
+                    if n > 0 {
+                        total += n;
+                        let hex: String = buf[..std::cmp::min(n, 32)].iter()
+                            .map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                        eprintln!("  [drain] {} bytes [{}{}]", n, hex, if n > 32 { "..." } else { "" });
+                    }
                 }
             }
-            eprintln!("  [drain] stopped: {} bytes drained, {} timeouts", total, errors);
+            eprintln!("  [drain] stopped: {} bytes total", total);
         });
 
+        eprintln!("  [init] starting pcap replay...");
         // ── Phase 0: Replay INIT segment (power on, DMAC, FWDL, H2C) ──
         self.replay_pcap_init()?;
         let t_init = t0.elapsed();
         eprintln!("  [init] phase 0 done in {:.1}s", t_init.as_secs_f64());
+        self.dump_rx_regs("after init (phase 0)");
 
         // ── Phase 1: Replay MONITOR MODE segment ──
         self.replay_pcap_monitor()?;
         let t_mon = t0.elapsed();
         eprintln!("  [init] phase 1 (monitor) done in {:.1}s", t_mon.as_secs_f64());
+        self.dump_rx_regs("after monitor (phase 1)");
 
-        // ── Stop background drain ──
+        // Stop background drain
         drain_running.store(false, Ordering::Relaxed);
         let _ = drain_thread.join();
 
@@ -1112,22 +1144,23 @@ impl Rtl8852bu {
     //  Pcap segment replay — generic engine used by init, monitor, channel switch
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Pcap file path and device filter for all segment replays.
-    const PCAP_PATH: &'static str = "references/captures/rtl8852bu_full_20260407/full_capture.pcap";
-    const TARGET_BUS: u8 = 1;
+    /// Pcap file paths for init/monitor replay (segmented monitor-mode captures).
+    const PCAP_INIT: &'static str = "references/rtl8852bu_monitor_20260407/01_device_init.pcap";
+    const PCAP_MONITOR: &'static str = "references/rtl8852bu_monitor_20260407/02_monitor_setup.pcap";
+    const TARGET_BUS: u8 = 3;
     const TARGET_DEV: u8 = 5;
 
-    /// Phase boundary timestamps (from phases.log, epoch seconds).
-    /// Each segment is [start, end) — operations at start are included, at end are not.
-    const TS_INIT_START: f64       = 0.0;             // beginning of pcap
-    const TS_MONITOR_START: f64    = 1775596262.803;  // MONITOR_START
-    const TS_FIRST_CH_SWITCH: f64  = 1775596264.415;  // CHANNELS_2G_START — first channel switch op
+    /// Replay entire pcap file (no timestamp filtering needed — each file is one phase).
+    const TS_ALL_START: f64 = 0.0;
+    const TS_ALL_END: f64 = f64::MAX;
 
-    /// Replay a time-bounded segment of the pcap capture.
-    /// Replays ALL operations (register reads, writes, EP7 bulk) verbatim.
+    /// Replay a pcap file (or time-bounded segment) verbatim.
+    /// Handles rtw89 multi-section FWDL: WCPU enable writes just get a brief pause
+    /// and EP7 halt clear. Full firmware-ready polling happens once when transitioning
+    /// from FWDL chunks to H2C commands.
     /// Returns (reg_writes, reg_reads, ep7_sent, ep7_fail).
-    fn replay_pcap_segment(&self, ts_start: f64, ts_end: f64, label: &str) -> Result<(u32, u32, u32, u32)> {
-        let pcap_data = fs::read(Self::PCAP_PATH).map_err(|e| Error::ChipInitFailed {
+    fn replay_pcap_segment(&self, pcap_path: &str, ts_start: f64, ts_end: f64, label: &str) -> Result<(u32, u32, u32, u32)> {
+        let pcap_data = fs::read(pcap_path).map_err(|e| Error::ChipInitFailed {
             chip: "RTL8852BU".into(),
             stage: crate::core::error::InitStage::HardwareSetup,
             reason: format!("pcap read: {}", e),
@@ -1138,11 +1171,11 @@ impl Rtl8852bu {
         let mut reg_reads = 0u32;
         let mut ep7_sent = 0u32;
         let mut ep7_fail = 0u32;
-        let started = ts_start == 0.0; // if start is 0, begin immediately
+        let started = ts_start == 0.0;
         let mut in_range = started;
+        // Pure verbatim replay — exact AU pattern
 
         while offset + 16 <= pcap_data.len() {
-            // Parse pcap packet header
             let ts_sec = u32::from_le_bytes([
                 pcap_data[offset], pcap_data[offset + 1],
                 pcap_data[offset + 2], pcap_data[offset + 3],
@@ -1159,7 +1192,6 @@ impl Rtl8852bu {
             ]) as usize;
             offset += 16;
 
-            // Stop if we've passed the end boundary
             if ts >= ts_end {
                 break;
             }
@@ -1172,7 +1204,6 @@ impl Rtl8852bu {
             let pkt = &pcap_data[offset..offset + incl_len];
             offset += incl_len;
 
-            // Enter range once we reach start timestamp
             if !in_range {
                 if ts >= ts_start {
                     in_range = true;
@@ -1206,31 +1237,35 @@ impl Rtl8852bu {
                     let write_data = &payload[..std::cmp::min(w_len as usize, payload.len())];
                     let addr = (w_idx as u32) << 16 | w_val as u32;
 
-                    // Detect WCPU enable — firmware is booting, EP7 needs halt clearing
+                    // WCPU enable — EXACT AU pattern: write, poll FW ready, clear halt, 50ms
                     if addr == 0x0088 && !write_data.is_empty() && (write_data[0] & 0x02) != 0 {
                         let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
                         reg_writes += 1;
-
-                        // Wait for firmware ready
                         for _ in 0..2000 {
                             let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
                             let fwdl_sts = (ctrl >> B_AX_FWDL_STS_SH) & B_AX_FWDL_STS_MSK;
-                            if fwdl_sts == FWDL_WCPU_FW_INIT_RDY {
-                                break;
-                            }
-                            if ctrl & B_AX_H2C_PATH_RDY != 0 {
-                                break;
-                            }
+                            if fwdl_sts == FWDL_WCPU_FW_INIT_RDY { break; }
+                            if ctrl & B_AX_H2C_PATH_RDY != 0 { break; }
                             thread::sleep(Duration::from_millis(1));
                         }
-                        // Clear EP7 halt — firmware boot resets endpoint state
+                        let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
+                        eprintln!("  [{}] WCPU enable (ctrl=0x{:02X})", label, ctrl);
                         let _ = self.handle.clear_halt(self.ep_fw);
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
 
-                    let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
-                    reg_writes += 1;
+                    match self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT) {
+                        Ok(_) => { reg_writes += 1; }
+                        Err(e) => {
+                            eprintln!("  [{}] REG WRITE FAIL @ 0x{:04X} ({} bytes): {}", label, addr, write_data.len(), e);
+                            reg_writes += 1;
+                        }
+                    }
+                    let total_ops = reg_writes + reg_reads + ep7_sent;
+                    if total_ops % 500 == 0 {
+                        eprintln!("  [{}] progress: {} writes, {} reads, {} EP7", label, reg_writes, reg_reads, ep7_sent);
+                    }
                 }
             }
             // ── Register READ ──
@@ -1243,21 +1278,22 @@ impl Rtl8852bu {
 
                 if b_req == 0x05 && bm_req_type == 0xC0 {
                     let mut buf = vec![0u8; w_len as usize];
-                    let _ = self.handle.read_control(0xC0, 0x05, w_val, w_idx, &mut buf, USB_BULK_TIMEOUT);
-                    reg_reads += 1;
+                    match self.handle.read_control(0xC0, 0x05, w_val, w_idx, &mut buf, USB_BULK_TIMEOUT) {
+                        Ok(_) => { reg_reads += 1; }
+                        Err(e) => {
+                            let addr = (w_idx as u32) << 16 | w_val as u32;
+                            eprintln!("  [{}] REG READ FAIL @ 0x{:04X}: {}", label, addr, e);
+                            reg_reads += 1;
+                        }
+                    }
                 }
             }
-            // ── EP7 bulk OUT (firmware + H2C) ──
+            // ── EP7 bulk OUT (firmware + H2C) — EXACT AU pattern ──
             else if xfer_type == 3 && !ep_dir_in && ep_num == 7 && !payload.is_empty() {
-                let is_fwdl = if payload.len() >= 4 {
-                    let dw0 = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    dw0 & AX_TXD_FWDL_EN != 0
-                } else {
-                    false
-                };
+                let is_fwdl = payload.len() >= 4 && (u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) & AX_TXD_FWDL_EN != 0);
 
                 if !is_fwdl {
-                    // Post-FWDL H2C: replay verbatim
+                    // H2C: replay verbatim
                     match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
                         Ok(_) => { ep7_sent += 1; }
                         Err(_) => {
@@ -1268,7 +1304,7 @@ impl Rtl8852bu {
                     continue;
                 }
 
-                // FWDL chunk — replay verbatim
+                // FWDL: replay verbatim, retry with clear_halt + 50ms
                 let result = match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
                     Ok(_) => Ok(()),
                     Err(_) => {
@@ -1278,16 +1314,21 @@ impl Rtl8852bu {
                     }
                 };
                 match result {
-                    Ok(()) => ep7_sent += 1,
+                    Ok(()) => { ep7_sent += 1; }
                     Err(_) => {
                         ep7_fail += 1;
+                        if ep7_fail <= 3 {
+                            eprintln!("  [{}] EP7 fail #{} (sent={}, {} bytes)", label, ep7_fail, ep7_sent, payload.len());
+                        }
                         let _ = self.handle.clear_halt(self.ep_fw);
                     }
+                }
+                if ep7_sent > 0 && ep7_sent % 50 == 0 {
+                    eprintln!("  [{}] EP7 progress: {} sent, {} fail", label, ep7_sent, ep7_fail);
                 }
             }
         }
 
-        // Only log during init phases, not runtime channel switches
         if label == "init" || label == "monitor" {
             eprintln!("  [{}] {} reg writes, {} reg reads, {} EP7 sent, {} EP7 fail",
                 label, reg_writes, reg_reads, ep7_sent, ep7_fail);
@@ -1296,146 +1337,30 @@ impl Rtl8852bu {
         Ok((reg_writes, reg_reads, ep7_sent, ep7_fail))
     }
 
-    /// Replay INIT segment: power on, DMAC, firmware download, post-FWDL H2C.
+    /// Replay INIT pcap: power on, DMAC, firmware download, post-FWDL H2C.
     fn replay_pcap_init(&self) -> Result<(u32, u32, u32, u32)> {
-        self.replay_pcap_segment(Self::TS_INIT_START, Self::TS_MONITOR_START, "init")
+        self.replay_pcap_segment(Self::PCAP_INIT, Self::TS_ALL_START, Self::TS_ALL_END, "init")
     }
 
-    /// Replay MONITOR MODE segment: everything from monitor start up to the first channel switch.
+    /// Replay MONITOR MODE pcap: RX filters, CMAC, PHY setup.
     fn replay_pcap_monitor(&self) -> Result<(u32, u32, u32, u32)> {
-        self.replay_pcap_segment(Self::TS_MONITOR_START, Self::TS_FIRST_CH_SWITCH, "monitor")
+        self.replay_pcap_segment(Self::PCAP_MONITOR, Self::TS_ALL_START, Self::TS_ALL_END, "monitor")
     }
 
-    /// Channel+BW pcap segments from FULL_CHBW capture.
-    /// Each entry: (channel, bw, ts_start, ts_end)
-    /// BW: 0=HT20, 1=HT40+, 2=HT40-, 3=VHT80
-    const CHBW_SEGMENTS: &'static [(u8, u8, f64, f64)] = &[
-        (  1, 0, 1775596332.908864395, 1775596333.170284271),
-        (  1, 1, 1775596333.170284184, 1775596333.373017311),
-        (  2, 0, 1775596333.632770713, 1775596333.894255400),
-        (  2, 1, 1775596333.894255502, 1775596334.096474171),
-        (  3, 0, 1775596334.358960376, 1775596334.617320538),
-        (  3, 1, 1775596334.617320483, 1775596334.820274115),
-        (  4, 0, 1775596335.085452874, 1775596335.353895903),
-        (  4, 1, 1775596335.353895822, 1775596335.556023836),
-        (  5, 0, 1775596335.819600075, 1775596336.082224131),
-        (  5, 1, 1775596336.082224078, 1775596336.349431038),
-        (  5, 2, 1775596336.349430937, 1775596336.615684509),
-        (  6, 0, 1775596336.615684458, 1775596336.881898880),
-        (  6, 1, 1775596336.881898811, 1775596337.141617775),
-        (  6, 2, 1775596337.141617717, 1775596337.408353567),
-        (  7, 0, 1775596337.408353490, 1775596337.674333334),
-        (  7, 1, 1775596337.674333259, 1775596337.937716484),
-        (  7, 2, 1775596337.937716516, 1775596338.204191685),
-        (  8, 0, 1775596338.204191704, 1775596338.406512022),
-        (  8, 2, 1775596338.667822406, 1775596338.932904720),
-        (  9, 0, 1775596338.932904796, 1775596339.136530399),
-        (  9, 2, 1775596339.402302818, 1775596339.665889263),
-        ( 10, 0, 1775596339.665889284, 1775596339.869635105),
-        ( 10, 2, 1775596340.136416436, 1775596340.404635668),
-        ( 11, 0, 1775596340.404635675, 1775596340.608325958),
-        ( 11, 2, 1775596340.872214313, 1775596341.148038149),
-        ( 36, 0, 1775596341.148038089, 1775596341.407796860),
-        ( 36, 1, 1775596341.407796828, 1775596341.610356092),
-        ( 36, 3, 1775596341.875606883, 1775596342.137137175),
-        ( 40, 0, 1775596342.137137172, 1775596342.399474859),
-        ( 40, 1, 1775596342.399474757, 1775596342.661221743),
-        ( 40, 2, 1775596342.661221839, 1775596342.921890974),
-        ( 40, 3, 1775596342.921890999, 1775596343.183625221),
-        ( 44, 0, 1775596343.183625331, 1775596343.445971012),
-        ( 44, 1, 1775596343.445971040, 1775596343.703505516),
-        ( 44, 2, 1775596343.703505601, 1775596343.967738628),
-        ( 44, 3, 1775596343.967738570, 1775596344.230040312),
-        ( 48, 0, 1775596344.230040197, 1775596344.494866848),
-        ( 48, 1, 1775596344.494866877, 1775596344.760896206),
-        ( 48, 2, 1775596344.760896313, 1775596345.019484520),
-        ( 48, 3, 1775596345.019484463, 1775596345.279819489),
-        ( 52, 0, 1775596345.279819371, 1775596345.543138504),
-        ( 52, 1, 1775596345.543138502, 1775596345.801921129),
-        ( 52, 2, 1775596345.801921028, 1775596346.061734915),
-        ( 52, 3, 1775596346.061734808, 1775596346.322884560),
-        ( 56, 0, 1775596346.322884595, 1775596346.587063789),
-        ( 56, 1, 1775596346.587063856, 1775596346.851374149),
-        ( 56, 2, 1775596346.851374075, 1775596347.112600803),
-        ( 56, 3, 1775596347.112600696, 1775596347.370870590),
-        ( 60, 0, 1775596347.370870552, 1775596347.629253626),
-        ( 60, 1, 1775596347.629253534, 1775596347.893676281),
-        ( 60, 2, 1775596347.893676171, 1775596348.158324957),
-        ( 60, 3, 1775596348.158325059, 1775596348.417471170),
-        ( 64, 0, 1775596348.417471128, 1775596348.619863510),
-        ( 64, 2, 1775596348.882854213, 1775596349.145229340),
-        ( 64, 3, 1775596349.145229298, 1775596349.404724836),
-        (100, 0, 1775596349.404724827, 1775596349.666203499),
-        (100, 1, 1775596349.666203574, 1775596349.868188620),
-        (100, 3, 1775596350.128576937, 1775596350.393667698),
-        (104, 0, 1775596350.393667785, 1775596350.651686668),
-        (104, 1, 1775596350.651686682, 1775596350.917639732),
-        (104, 2, 1775596350.917639659, 1775596351.179428339),
-        (104, 3, 1775596351.179428325, 1775596351.441644192),
-        (108, 0, 1775596351.441644284, 1775596351.700927973),
-        (108, 1, 1775596351.700927978, 1775596351.964344263),
-        (108, 2, 1775596351.964344193, 1775596352.226789236),
-        (108, 3, 1775596352.226789237, 1775596352.483227968),
-        (112, 0, 1775596352.483228001, 1775596352.741564512),
-        (112, 1, 1775596352.741564399, 1775596353.000677824),
-        (112, 2, 1775596353.000677885, 1775596353.259730339),
-        (112, 3, 1775596353.259730328, 1775596353.519711733),
-        (116, 0, 1775596353.519711818, 1775596353.778317690),
-        (116, 1, 1775596353.778317634, 1775596354.041471481),
-        (116, 2, 1775596354.041471390, 1775596354.299799204),
-        (116, 3, 1775596354.299799121, 1775596354.557022810),
-        (120, 0, 1775596354.557022722, 1775596354.818121910),
-        (120, 1, 1775596354.818121884, 1775596355.080141068),
-        (120, 2, 1775596355.080141051, 1775596355.339298725),
-        (120, 3, 1775596355.339298828, 1775596355.598870039),
-        (124, 0, 1775596355.598870108, 1775596355.859756708),
-        (124, 1, 1775596355.859756810, 1775596356.120433569),
-        (124, 2, 1775596356.120433678, 1775596356.379244089),
-        (124, 3, 1775596356.379244162, 1775596356.642272711),
-        (128, 0, 1775596356.642272709, 1775596356.905343056),
-        (128, 1, 1775596356.905343047, 1775596357.165963888),
-        (128, 2, 1775596357.165963832, 1775596357.429456472),
-        (128, 3, 1775596357.429456547, 1775596357.689899206),
-        (132, 0, 1775596357.689899247, 1775596357.955262423),
-        (132, 1, 1775596357.955262389, 1775596358.217630148),
-        (132, 2, 1775596358.217630265, 1775596358.421857595),
-        (136, 0, 1775596358.682160388, 1775596358.945321321),
-        (136, 1, 1775596358.945321394, 1775596359.204892159),
-        (136, 2, 1775596359.204892090, 1775596359.407061100),
-        (140, 0, 1775596359.673602692, 1775596359.875567675),
-        (140, 2, 1775596360.135995762, 1775596360.338492632),
-        (149, 0, 1775596360.598673710, 1775596360.860758543),
-        (149, 1, 1775596360.860758501, 1775596361.063368082),
-        (149, 3, 1775596361.321201521, 1775596361.581191063),
-        (153, 0, 1775596361.581190969, 1775596361.837470293),
-        (153, 1, 1775596361.837470316, 1775596362.100519896),
-        (153, 2, 1775596362.100519904, 1775596362.361242294),
-        (153, 3, 1775596362.361242314, 1775596362.620100260),
-        (157, 0, 1775596362.620100270, 1775596362.877603769),
-        (157, 1, 1775596362.877603771, 1775596363.136083603),
-        (157, 2, 1775596363.136083610, 1775596363.395873070),
-        (157, 3, 1775596363.395873081, 1775596363.657723904),
-        (161, 0, 1775596363.657723852, 1775596363.920693159),
-        (161, 1, 1775596363.920693254, 1775596364.185900927),
-        (161, 2, 1775596364.185900833, 1775596364.452159405),
-        (161, 3, 1775596364.452159292, 1775596364.712657213),
-        (165, 0, 1775596364.712657182, 1775596364.918462038),
-        (165, 2, 1775596365.176805737, 1775596365.383174181),
-    ];
-
-    /// Switch channel by replaying the corresponding pcap segment.
+    /// Switch channel using pre-extracted register sequences (no pcap parsing).
     /// bw: 0=HT20, 1=HT40+, 2=HT40-, 3=VHT80
     pub fn set_channel_pcap(&mut self, ch: u8, bw: u8) -> Result<()> {
-        let seg = Self::CHBW_SEGMENTS.iter()
-            .find(|(c, b, _, _)| *c == ch && *b == bw)
-            .ok_or_else(|| Error::UnsupportedChannel {
-                channel: ch,
-                chip: format!("RTL8852BU (no pcap for ch{} bw{})", ch, bw),
-            })?;
-
-        let label = format!("ch{}bw{}", ch, bw);
-        self.replay_pcap_segment(seg.2, seg.3, &label)?;
+        // Pre-extracted functions — direct register writes, zero file I/O
+        self.pcap_channel_switch(ch, bw)?;
         self.channel.store(ch, Ordering::Relaxed);
+
+        // Re-apply promiscuous RX filter — channel switch was captured in monitor mode
+        // but the filter state may drift. Ensure we always receive all frame types.
+        self.write32(0xCE20, 0x031644BF)?;  // RX_FLTR_OPT: promiscuous
+        self.write32(0xCE24, 0x55555555)?;  // Frame type filter: accept all
+        self.write32(0xCE28, 0x55555555)?;
+        self.write32(0xCE2C, 0x55555555)?;
+
         Ok(())
     }
 
@@ -1647,8 +1572,14 @@ impl ChipDriver for Rtl8852bu {
     }
 
     fn set_monitor_mode(&mut self) -> Result<()> {
-        // Monitor mode is configured by init's pcap replay (RX_FLTR = 0x031644BF).
-        self.write32(R_AX_RXAGG_0, 0x80202020)?;
+        let _ = self.handle.clear_halt(self.ep_in);
+        // Promiscuous RX filter — accept all frame types for monitor mode
+        self.write32(0xCE20, 0x031644BF)?;  // RX_FLTR_OPT: promiscuous sniffer
+        self.write32(0xCE24, 0x55555555)?;  // Frame type filter: accept all
+        self.write32(0xCE28, 0x55555555)?;
+        self.write32(0xCE2C, 0x55555555)?;
+        // Enable RX aggregation (Linux uses async URBs; we need aggregation for bulk reads)
+        self.write32(R_AX_RXAGG_0, 0x80404040)?;
         self.write32(R_AX_RXDMA_SETTING, 0x00046F00)?;
         Ok(())
     }
@@ -3097,7 +3028,7 @@ fn start_rx_pipeline_8852bu(
     alive: Arc<AtomicBool>,
     tx_feedback: Arc<crate::core::chip::TxFeedback>,
 ) {
-    const USB_TIMEOUT: Duration = Duration::from_millis(50);
+    const USB_TIMEOUT: Duration = Duration::from_millis(100);
 
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
@@ -3109,6 +3040,12 @@ fn start_rx_pipeline_8852bu(
         .spawn(move || {
             let mut buf = vec![0u8; RX_BUF_SIZE];
             let mut consecutive_errors = 0u32;
+            let mut usb_reads = 0u64;
+            let mut usb_bytes = 0u64;
+            let mut last_log = std::time::Instant::now();
+            let mut log = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/tmp/wifikit_8852bu_rx_stats.log").ok();
 
             loop {
                 if !alive_reader.load(Ordering::SeqCst) { break; }
@@ -3136,6 +3073,21 @@ fn start_rx_pipeline_8852bu(
                     }
                 };
 
+                usb_reads += 1;
+                usb_bytes += actual as u64;
+
+                if last_log.elapsed() >= Duration::from_secs(5) {
+                    if let Some(ref mut f) = log {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[USB] reads={} bytes={} ({:.0} KB/s)",
+                            usb_reads, usb_bytes,
+                            usb_bytes as f64 / last_log.elapsed().as_secs_f64() / 1024.0);
+                    }
+                    usb_reads = 0;
+                    usb_bytes = 0;
+                    last_log = std::time::Instant::now();
+                }
+
                 if tx.send(buf[..actual].to_vec()).is_err() { break; }
             }
         })
@@ -3145,6 +3097,13 @@ fn start_rx_pipeline_8852bu(
     thread::Builder::new()
         .name("rx-per-read-parser-8852bu".into())
         .spawn(move || {
+            let mut packets_parsed = 0u64;
+            let mut frames_submitted = 0u64;
+            let mut last_log = std::time::Instant::now();
+            let mut log = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/tmp/wifikit_8852bu_rx_stats.log").ok();
+
             for read_buf in rx.iter() {
                 let actual = read_buf.len();
                 let mut pos = 0;
@@ -3175,6 +3134,7 @@ fn start_rx_pipeline_8852bu(
                     }
 
                     let packet = &read_buf[pos..pos + consumed];
+                    packets_parsed += 1;
 
                     // Parse — retry loop handles PPDU eviction (pc=0 means evicted frame ready)
                     let ch = channel.load(Ordering::Relaxed);
@@ -3182,6 +3142,7 @@ fn start_rx_pipeline_8852bu(
                         let (pc, result) = parse_rx_packet_8852bu(packet, ch);
                         match result {
                             crate::core::chip::ParsedPacket::Frame(frame) => {
+                                frames_submitted += 1;
                                 gate.submit(frame);
                             }
                             crate::core::chip::ParsedPacket::TxStatus(ref rpt) => {
@@ -3193,6 +3154,18 @@ fn start_rx_pipeline_8852bu(
                     }
 
                     pos += consumed;
+                }
+
+                if last_log.elapsed() >= Duration::from_secs(5) {
+                    if let Some(ref mut f) = log {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[PARSER] packets={} frames_to_gate={} ({:.1}% yield)",
+                            packets_parsed, frames_submitted,
+                            if packets_parsed > 0 { frames_submitted as f64 / packets_parsed as f64 * 100.0 } else { 0.0 });
+                    }
+                    packets_parsed = 0;
+                    frames_submitted = 0;
+                    last_log = std::time::Instant::now();
                 }
             }
         })

@@ -137,16 +137,17 @@ echo ""
 echo "Step 2: USB3 mode switch"
 
 # Build if needed (quietly)
-info "Building usb3_switch..."
-if ! cargo build --release --bin usb3_switch 2>/dev/null; then
-    fail "Build failed"
-    exit 1
-fi
-ok "Built"
+# info "Building usb3_switch..."
+# if ! cargo build --release --bin usb3_switch 2>/dev/null; then
+#     fail "Build failed"
+#     exit 1
+# fi
+# ok "Built"
 
 # Run the switch
 info "Running USB2→USB3 switch..."
-SWITCH_OUTPUT=$(cargo run --release --bin usb3_switch 2>&1)
+# SWITCH_OUTPUT=$(cargo run --release --bin usb3_switch 2>&1)
+SWITCH_OUTPUT=$(./target/release/usb3_switch 2>&1)
 
 if echo "$SWITCH_OUTPUT" | grep -q "Already in USB 3.0"; then
     ok "Already USB 3.0"

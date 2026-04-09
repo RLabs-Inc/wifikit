@@ -1884,747 +1884,39 @@ impl Mt7612u {
         Ok(())
     }
 
-    fn init_dma(&self) -> Result<()> {
-        // Use kernel's minimal DMA during init (no aggregation).
-        // We enable aggregation AFTER init completes — see end of init().
-        // Kernel doesn't need AGG (128 async URBs), but we DO (userspace sync reads).
-        let val: u32 = 0x00c40020;
-        self.reg_write(CFG_USB_DMA, val)?;
-
-        // ALSO write to MMIO register 0x0238 — on macOS, CFG space writes
-        // may not propagate to the hardware DMA controller
-        self.reg_write(MT_USB_DMA_CFG, val)?;
-
-        Ok(())
-    }
-
-    fn mac_init(&self) -> Result<()> {
-
-        // WPDMA config
-        self.reg_write(MT_WPDMA_GLO_CFG, 0x30)?; // BIT(4) | BIT(5)
-
-        // PBF init
-        self.reg_write(MT_PBF_TX_MAX_PCNT, 0xefef3f1f)?;
-        self.reg_write(MT_PBF_RX_MAX_PCNT, 0x0000febf)?;
-
-        // Bulk register init — the massive table from Linux mt76_write_mac_initvals
-        let init_vals: &[(u32, u32)] = &[
-            (MT_PBF_SYS_CTRL,        0x00080c00),
-            (MT_PBF_CFG,              0x1efebcff),
-            (MT_FCE_PSE_CTRL,         0x00000001),
-            (MT_MAC_SYS_CTRL,         0x00000000),
-            (MT_MAX_LEN_CFG,          0x003e3f00),
-            (MT_AMPDU_MAX_LEN_20M1S,  0xaaa99887),
-            (MT_AMPDU_MAX_LEN_20M2S,  0x000000aa),
-            (MT_XIFS_TIME_CFG,        0x33a40d0a),
-            (MT_BKOFF_SLOT_CFG,       0x00000209),
-            (MT_TBTT_SYNC_CFG,        0x00422010),
-            (MT_PWR_PIN_CFG,          0x00000000),
-            (0x1238,                   0x001700c8),
-            (MT_TX_SW_CFG0,           0x00101001),
-            (MT_TX_SW_CFG1,           0x00010000),
-            (MT_TX_SW_CFG2,           0x00000000),
-            (MT_TXOP_CTRL_CFG,        0x0400583f),
-            (MT_TX_RTS_CFG,           0x00ffff20),
-            (MT_TX_TIMEOUT_CFG,       0x000a2290),
-            (MT_TX_RETRY_CFG,         0x47f01f0f),
-            (MT_EXP_ACK_TIME,         0x002c00dc),
-            (MT_TX_PROT_CFG6,         0xe3f42004),
-            (MT_TX_PROT_CFG7,         0xe3f42084),
-            (MT_TX_PROT_CFG8,         0xe3f42104),
-            (MT_PIFS_TX_CFG,          0x00060fff),
-            (MT_RX_FILTR_CFG,         0x00015f97),
-            (MT_LEGACY_BASIC_RATE,    0x0000017f),
-            (MT_HT_BASIC_RATE,        0x00004003),
-            (MT_PN_PAD_MODE,          0x00000003),
-            (MT_TXOP_HLDR_ET,         0x00000002),
-            (0x0a44,                   0x00000000),
-            (MT_HEADER_TRANS_CTRL,    0x00000000),
-            (MT_TSO_CTRL,             0x00000000),
-            (MT_AUX_CLK_CFG,          0x00000000),
-            (MT_DACCLK_EN_DLY_CFG,    0x00000000),
-            (MT_TX_ALC_CFG_4,         0x00000000),
-            (MT_TX_ALC_VGA3,          0x00000000),
-            // TX power defaults
-            (MT_TX_PWR_CFG_0,         0x3a3a3a3a),
-            (MT_TX_PWR_CFG_0 + 4,     0x3a3a3a3a), // CFG_1
-            (MT_TX_PWR_CFG_0 + 8,     0x3a3a3a3a), // CFG_2
-            (MT_TX_PWR_CFG_0 + 12,    0x3a3a3a3a), // CFG_3
-            (MT_TX_PWR_CFG_0 + 16,    0x3a3a3a3a), // CFG_4
-            (0x13d4,                   0x3a3a3a3a), // CFG_7
-            (0x13d8,                   0x0000003a), // CFG_8
-            (0x13dc,                   0x0000003a), // CFG_9
-            (MT_EFUSE_CTRL,           0x0000d000),
-            (MT_PAUSE_ENABLE_CONTROL1, 0x0000000a),
-            (MT_FCE_WLAN_FLOW_CTRL1,  0x60401c18),
-            (MT_WPDMA_DELAY_INT_CFG,  0x94ff0000),
-            (MT_TX_SW_CFG3,           0x00000004),
-            (MT_HT_FBK_TO_LEGACY,     0x00001818),
-            (MT_VHT_HT_FBK_CFG1,      0xedcba980),
-            (MT_PROT_AUTO_TX_CFG,      0x00830083),
-            (MT_HT_CTRL_CFG,          0x000001ff),
-            (MT_TX_LINK_CFG,          0x00001020),
-        ];
-
-        for &(reg, val) in init_vals {
-            self.reg_write(reg, val)?;
-        }
-
-        // Protection configs — match kernel usbmon values exactly
-        self.reg_write(MT_CCK_PROT_CFG,  0x07f40003)?;
-        self.reg_write(MT_OFDM_PROT_CFG, 0x07f42004)?;
-        self.reg_write(MT_MM20_PROT_CFG, 0x01752004)?;
-        self.reg_write(MT_MM40_PROT_CFG, 0x03f52084)?;
-        self.reg_write(MT_GF20_PROT_CFG, 0x01752004)?;
-        self.reg_write(MT_GF40_PROT_CFG, 0x03f52084)?;
-
-        // Additional MAC
-        self.reg_write(MT_TX_LINK_CFG, 0x1020)?;
-        self.reg_write(MT_AUTO_RSP_CFG, 0x13)?;
-        self.reg_write(MT_MAX_LEN_CFG, 0x2f00)?;
-
-        // WMM
-        self.reg_write(MT_WMM_AIFSN, 0x2273)?;
-        self.reg_write(MT_WMM_CWMIN, 0x2344)?;
-        self.reg_write(MT_WMM_CWMAX, 0x34aa)?;
-
-        // Clear MAC/BBP reset
-        self.reg_clear(MT_MAC_SYS_CTRL, 0x3)?;
-
-        // MT7612 specific: disable coex
-        self.reg_clear(MT_COEXCFG0, 1)?;
-
-        // Extended CCA
-        self.reg_set(MT_EXT_CCA_CFG, 0xF000)?;
-
-        // Clear TX ALC
-        self.reg_clear(MT_TX_ALC_CFG_4, 1 << 31)?;
-
-        Ok(())
-    }
-
-    fn mac_set_address(&self) -> Result<()> {
-        let mac = self.mac_addr.as_bytes();
-        let dw0 = u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]);
-        let dw1 = u16::from_le_bytes([mac[4], mac[5]]) as u32 | (0xFF << 16);
-
-        self.reg_write(MT_MAC_ADDR_DW0, dw0)?;
-        self.reg_write(MT_MAC_ADDR_DW1, dw1)?;
-        self.reg_write(MT_MAC_BSSID_DW0, dw0)?;
-        self.reg_write(MT_MAC_BSSID_DW1, dw1)?;
-
-        Ok(())
-    }
-
-    fn crystal_fixup(&self) -> Result<()> {
-
-        let trim2 = self.eeprom_u16(MT_EE_XTAL_TRIM_2);
-        let offset = (trim2 & 0xFF) as i8;
-
-        let xtal_val = if (trim2 >> 8) != 0xFF && (trim2 >> 8) != 0 {
-            (trim2 >> 8) as u8
-        } else {
-            let trim1 = self.eeprom_u16(MT_EE_XTAL_TRIM_1);
-            if (trim1 & 0xFF) != 0xFF && (trim1 & 0xFF) != 0 {
-                (trim1 & 0xFF) as u8
-            } else {
-                0x14 // default
-            }
-        };
-
-        let adjusted = (xtal_val as i16 + offset as i16).clamp(0, 0x7F) as u32;
-
-        // Write to XO_CTRL5 bits[14:8]
-        let mut val = self.reg_read(CFG_XO_CTRL5)?;
-        val &= !(0x7F << 8);
-        val |= adjusted << 8;
-        self.reg_write(CFG_XO_CTRL5, val)?;
-
-        // Set XO_CTRL6 bits[14:8]
-        self.reg_set(CFG_XO_CTRL6, 0x7F << 8)?;
-
-        // Timing adjustments
-        self.reg_write(0x0504, 0x06000000)?;
-        self.reg_write(0x050c, 0x08800000)?;
-        thread::sleep(Duration::from_millis(5));
-        self.reg_write(0x0504, 0)?;
-
-        // Decrease OFDM SIFS to 13
-        let mut val = self.reg_read(MT_XIFS_TIME_CFG)?;
-        val &= !(0xFF << 8);
-        val |= 0x0D << 8;
-        self.reg_write(MT_XIFS_TIME_CFG, val)?;
-
-        // CC_DELAY
-        let mut val = self.reg_read(MT_BKOFF_SLOT_CFG)?;
-        val &= !(0xF << 8);
-        val |= 1 << 8;
-        self.reg_write(MT_BKOFF_SLOT_CFG, val)?;
-
-        // Disable WR_MPDU_LEN_EN
-        self.reg_clear(MT_FCE_L2_STUFF, 1 << 4)?;
-
-        // Crystal option from NIC_CONF_2
-        let nic_conf_2 = self.eeprom_u16(MT_EE_NIC_CONF_2);
-        let xtal_option = (nic_conf_2 >> 9) & 0x3;
-        match xtal_option {
-            0 => self.reg_write(CFG_XO_CTRL7, 0x5c1fee80)?,
-            1 => self.reg_write(CFG_XO_CTRL7, 0x5c1feed0)?,
-            _ => {} // use default
-        }
-
-        Ok(())
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
-    //  PHASE 6-7: Post-init + start
+    //  Init sequence — TO BE REBUILT
+    //  Everything below this point was gutted for a clean rewrite.
+    //  Old implementation is in git history for reference.
     // ══════════════════════════════════════════════════════════════════════════
 
-    fn init_rx_tx_paths(&mut self) -> Result<()> {
-        // Load calibration registers — Linux: mt76x2_mcu_load_cr(dev, MT_RF_BBP_CR, 0, 0)
-        // mcu.c:47-72 — struct has cr_mode, temp, ch, _pad, cfg (LE32)
-        // cfg = BIT(31) | (NIC_CONF_0 >> 8) & 0xFF | (NIC_CONF_1 << 8) & 0xFF00
-        let nic_conf_0 = self.eeprom_u16(MT_EE_NIC_CONF_0);
-        let nic_conf_1 = self.eeprom_u16(MT_EE_NIC_CONF_1);
-        let cfg: u32 = (1 << 31)
-            | (((nic_conf_0 >> 8) as u32) & 0x00FF)
-            | (((nic_conf_1 as u32) << 8) & 0xFF00);
+    fn init_hardware(&mut self) -> Result<()> {
+        // Phase 1: Power on + WLAN reset
+        self.wlan_reset()?;
+        self.power_on()?;
+        self.wait_for_mac()?;
 
-        let mut payload = [0u8; 8];
-        payload[0] = 2;  // cr_mode = MT_RF_BBP_CR
-        payload[1] = 0;  // temp_level
-        payload[2] = 0;  // channel
-        payload[3] = 0;  // pad
-        payload[4..8].copy_from_slice(&cfg.to_le_bytes());
-        self.mcu_send_cmd(CMD_LOAD_CR, &payload, true)?;
+        // Read ASIC version
+        self.asic_rev = self.reg_read(MT_ASIC_VERSION)?;
 
-        // Set RX path
-        let mut agc0 = self.reg_read(MT_BBP_AGC0)?;
-        if self.rx_paths >= 2 {
-            agc0 |= 1 << 3;  // dual RX
-        } else {
-            agc0 &= !(1 << 3);
-        }
-        agc0 &= !(1 << 4);
-        self.reg_write(MT_BBP_AGC0, agc0)?;
+        // Phase 2: Firmware load
+        self.load_rom_patch()?;
+        self.load_firmware()?;
 
-        // Set TX DAC
-        let mut txbe5 = self.reg_read(MT_BBP_TXBE5)?;
-        if self.tx_paths >= 2 {
-            txbe5 |= 0x3; // dual TX
-        } else {
-            txbe5 &= !0x3;
-        }
-        self.reg_write(MT_BBP_TXBE5, txbe5)?;
+        // Phase 3: MCU init (Q_SELECT + RADIO_ON)
+        self.mcu_init()?;
 
-        Ok(())
+        // Phase 4: Read EEPROM
+        self.read_eeprom()?;
+
+        // Phase 5: MAC init + DMA + channel setup
+        // TODO: rebuild from Linux reference with proper understanding
+        todo!("MT7612U init sequence — rebuild from Linux mt76x2u driver")
     }
 
-    /// Stop TX+RX and wait for idle. Simplified sequence that works with USB.
-    /// The full Linux mt76x2u_mac_stop polls many registers that may behave
-    /// differently over USB vendor requests vs MMIO. Keep it simple but correct.
-    /// Stop TX+RX — exact kernel usbmon sequence for channel switch.
-    fn mac_stop(&self) -> Result<()> {
-        // 1. RTS disable
-        self.reg_write(MT_TX_RTS_CFG, 0x00ffff00)?;
-        // 2. TXOP + TXOP_HLDR disable
-        let txop = self.reg_read(MT_TXOP_CTRL_CFG).unwrap_or(0x04001b3f);
-        self.reg_write(MT_TXOP_CTRL_CFG, txop)?;
-        self.reg_write(MT_TXOP_HLDR_ET, 0x00000000)?;
-        // 3. USB DMA settling — read CFG 12 times
-        for _ in 0..12 { let _ = self.reg_read(CFG_USB_DMA); }
-        // 4. TX STAT FIFO drain
-        let _ = self.reg_read(0x0438);
-        // 5. DMA watchdog reads
-        let _ = self.reg_read(0x0a30);
-        let _ = self.reg_read(0x0a34);
-        // 6. Disable TX+RX
-        self.reg_write(MT_MAC_SYS_CTRL, 0)?;
-        // 7. MAC + BBP status check
-        let _ = self.reg_read(MT_MAC_STATUS);
-        let _ = self.reg_read(0x2130);
-        // 8. DMA watchdog loop ×11
-        for _ in 0..11 {
-            let _ = self.reg_read(0x0430);
-            let _ = self.reg_read(0x0a30);
-            let _ = self.reg_read(0x0a34);
-        }
-        // 9. MAC STATUS again
-        let _ = self.reg_read(MT_MAC_STATUS);
-        // 10. USB DMA settling again
-        for _ in 0..12 { let _ = self.reg_read(CFG_USB_DMA); }
-        Ok(())
-    }
-
-    /// Start TX+RX — exact kernel usbmon sequence for channel switch.
-    fn mac_start(&self) -> Result<()> {
-        // 1. RTS restore
-        self.reg_write(MT_TX_RTS_CFG, 0x00ffff20)?;
-        // 2. Reset all counters (read-to-clear)
-        let _ = self.reg_read(MT_RX_STA_CNT0);
-        let _ = self.reg_read(MT_RX_STA_CNT1);
-        let _ = self.reg_read(MT_RX_STA_CNT2);
-        let _ = self.reg_read(MT_TX_STA_CNT0);
-        let _ = self.reg_read(MT_TX_STA_CNT1);
-        let _ = self.reg_read(MT_TX_STA_CNT2);
-        for i in 0..16u32 { let _ = self.reg_read(0x1720 + i * 4); }
-        // 3. TX stat drain ×16
-        for _ in 0..16 { let _ = self.reg_read(0x1718); }
-        // 4. RX only first
-        self.reg_write(MT_MAC_SYS_CTRL, MT_MAC_SYS_CTRL_ENABLE_TX)?;
-        let _ = self.reg_read(MT_WPDMA_GLO_CFG);
-        // 5. RX filter — use kernel's exact value, NOT self.rxfilter
-        self.reg_write(MT_RX_FILTR_CFG, 0x00017f97)?;
-        // 6. TX + RX on
-        self.reg_write(MT_MAC_SYS_CTRL,
-            MT_MAC_SYS_CTRL_ENABLE_TX | MT_MAC_SYS_CTRL_ENABLE_RX)?;
-        let _ = self.reg_read(MT_WPDMA_GLO_CFG);
-        Ok(())
-    }
-
-    /// Reset WCID table (256 entries) and shared key table (16 vifs × 4 keys)
-    /// Linux: usb_init.c:165-173
-    fn reset_wcid_table(&self) -> Result<()> {
-        // Clear WCID address table: 256 entries × 8 bytes at 0x1800
-        for i in 0..256u32 {
-            let addr = MT_WCID_ADDR_BASE + i * 8;
-            self.reg_write(addr, 0)?;
-            self.reg_write(addr + 4, 0)?;
-        }
-
-        // Clear WCID attribute table: 256 entries × 4 bytes at 0xa800
-        // This is what the kernel trace shows (0xa800-0xabfc all zeroed)
-        for i in 0..256u32 {
-            self.reg_write(0xa800 + i * 4, 0)?;
-        }
-
-        // Shared key mode register: clear cipher for all 16 vifs × 4 keys
-        for i in 0..16u32 {
-            self.reg_write(0x7000 + i * 4, 0)?;
-        }
-
-        // Clear beacon offset table (kernel: 0xb000-0xb3fc, read-write pattern)
-        // 5 groups × 8 entries: 0xb000, 0xb004, 0xb008, 0xb00c, 0xb3f0-0xb3fc
-        for base in &[0xb000u32, 0xb004, 0xb008, 0xb00c, 0xb3f0, 0xb3f4, 0xb3f8, 0xb3fc] {
-            for _ in 0..8 {
-                let _ = self.reg_read(*base);
-                self.reg_write(*base, 0)?;
-            }
-        }
-
-        // Clear multicast filter (kernel zeros 0x1090-0x10cc twice)
-        for _ in 0..2 {
-            for addr in (0x1090..=0x10cc).step_by(4) {
-                self.reg_write(addr, 0)?;
-                let _ = self.reg_read(addr + 4);
-                self.reg_write(addr + 4, 0)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Init beacon config. Linux: mt76x02u_init_beacon_config()
-    fn init_beacon_config(&self) -> Result<()> {
-        // Disable beacon timer, TBTT, beacon TX
-        let mt_beacon_time_cfg: u32 = 0x1114;
-        let timer_en = 1 << 16;
-        let tbtt_en = 1 << 19;
-        let beacon_tx = 1 << 20;
-        let sync_mode = 0x3 << 17; // sync mode bits
-        self.reg_clear(mt_beacon_time_cfg, timer_en | tbtt_en | beacon_tx)?;
-        self.reg_set(mt_beacon_time_cfg, sync_mode)?;
-        // BCN bypass mask
-        self.reg_write(0x108c, 0xFFFF)?;
-        Ok(())
-    }
-
-    fn set_monitor_mode_internal(&mut self) -> Result<()> {
-        // Monitor mode: accept ALL frames including other BSS traffic
-        // Bit 2 = PROMISC (accept non-matching DA)
-        // Bit 3 = OTHER_BSS (accept frames from other BSSIDs) — CRITICAL for scanning
-        self.rxfilter |= MT_RX_FILTR_CFG_PROMISC | MT_RX_FILTR_CFG_OTHER_BSS;
-        self.reg_write(MT_RX_FILTR_CFG, self.rxfilter)?;
-        Ok(())
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Channel switch
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// Full channel switch matching Linux mt76x2u_phy_set_channel() exactly.
-    /// Every register, every MCU command, every calibration — in the right order.
-    fn switch_channel_internal(&mut self, ch: u8) -> Result<()> {
-
-        // Linux: mt76x2u_set_channel calls mac_stop BEFORE phy_set_channel
-        // The MAC must be stopped during register writes and calibrations
-        self.mac_stop()?;
-
-        let band_5g = is_5ghz(ch);
-        let ext_pa = self.ext_pa_enabled(band_5g);
-        self.cal.channel_cal_done = false;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 1: Read EEPROM RX gain for this channel
-        //  Linux: mt76x2_read_rx_gain(dev)  — usb_phy.c:121
-        // ══════════════════════════════════════════════════════════════════════
-        self.read_rx_gain(ch, band_5g);
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 2: TX power register config
-        //  Linux: mt76x2_phy_set_txpower_regs(dev, chan->band)  — phy.c:45-115
-        // ══════════════════════════════════════════════════════════════════════
-        self.phy_set_txpower_regs(band_5g)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 3: TX delay config
-        //  Linux: mt76x2_configure_tx_delay(dev, chan->band, bw)  — phy.c:184-200
-        // ══════════════════════════════════════════════════════════════════════
-        let bw: u8 = 0; // 20MHz
-        let (sw_cfg0, sw_cfg1) = if ext_pa {
-            if bw != 0 { (0x000b0c01u32, 0x00011414u32) }
-            else { (0x00101101u32, 0x00011414u32) }
-        } else {
-            if bw != 0 { (0x000b0b01u32, 0x00021414u32) }
-            else { (0x00101001u32, 0x00021414u32) }
-        };
-        self.reg_write(MT_TX_SW_CFG0, sw_cfg0)?;
-        self.reg_write(MT_TX_SW_CFG1, sw_cfg1)?;
-        // OFDM SIFS = 15 (Linux line 199)
-        let mut xifs = self.reg_read(MT_XIFS_TIME_CFG)?;
-        xifs &= !(0xFF << 8);
-        xifs |= 15 << 8;
-        self.reg_write(MT_XIFS_TIME_CFG, xifs)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 4: Set TX power using EEPROM data
-        //  Linux: mt76x2_phy_set_txpower(dev)  — phy.c:137-181
-        // ══════════════════════════════════════════════════════════════════════
-        self.phy_set_txpower(ch, band_5g)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 5: Set band
-        //  Linux: mt76x02_phy_set_band(dev, chan->band, ch_group_index & 1)
-        //  — mt76x02_phy.c:150-167
-        // ══════════════════════════════════════════════════════════════════════
-        if band_5g {
-            self.reg_clear(MT_TX_BAND_CFG, 1 << 2)?; // clear 2G
-            self.reg_set(MT_TX_BAND_CFG, 1 << 1)?;   // set 5G
-        } else {
-            self.reg_set(MT_TX_BAND_CFG, 1 << 2)?;   // set 2G
-            self.reg_clear(MT_TX_BAND_CFG, 1 << 1)?;  // clear 5G
-        }
-        // primary_upper = false for 20MHz (ch_group_index & 1 = 0)
-        let mut band_cfg = self.reg_read(MT_TX_BAND_CFG)?;
-        band_cfg &= !(1 << 0); // upper_40m = 0
-        self.reg_write(MT_TX_BAND_CFG, band_cfg)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 6: Set bandwidth 20MHz
-        //  Linux: mt76x02_phy_set_bw(dev, width, ch_group_index)
-        //  — mt76x02_phy.c:124-148
-        // ══════════════════════════════════════════════════════════════════════
-        // For 20MHz: core_val=0, agc_val=1, ctrl=0
-        let mut core1 = self.reg_read(MT_BBP_CORE1)?;
-        core1 &= !(0x3 << 3);  // CORE_R1_BW = 0
-        self.reg_write(MT_BBP_CORE1, core1)?;
-
-        let mut agc0 = self.reg_read(MT_BBP_AGC0)?;
-        agc0 &= !(0x7 << 12); // AGC_R0_BW = 1
-        agc0 |= 1 << 12;
-        agc0 &= !(0x3 << 8);  // AGC_R0_CTRL_CHAN = 0
-        self.reg_write(MT_BBP_AGC0, agc0)?;
-
-        let mut txbe0 = self.reg_read(MT_BBP_TXBE0)?;
-        txbe0 &= !0x3; // TXBE_R0_CTRL_CHAN = 0
-        self.reg_write(MT_BBP_TXBE0, txbe0)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 7: EXT_CCA config
-        //  Linux: ext_cca_chan[ch_group_index]  — usb_phy.c:63-84, line 129-135
-        // ══════════════════════════════════════════════════════════════════════
-        // For 20MHz, ch_group_index=0: CCA0=0,CCA1=1,CCA2=2,CCA3=3,MASK=BIT(0)
-        let ext_cca: u32 = (0 << 0) | (1 << 2) | (2 << 4) | (3 << 6) | (1 << 8);
-        let mut cca_cfg = self.reg_read(MT_EXT_CCA_CFG)?;
-        cca_cfg &= !(0x3FF | (0xF << 8)); // clear CCA0-3 + CCA_MASK
-        cca_cfg |= ext_cca;
-        self.reg_write(MT_EXT_CCA_CFG, cca_cfg)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 8: MCU channel switch × 2
-        //  Linux: mt76x2_mcu_set_channel(dev, channel, bw, bw_index, scan)
-        //  — mcu.c:15-44  (called TWICE: first without ext_chan, then with)
-        // ══════════════════════════════════════════════════════════════════════
-        // Linux struct layout (8 bytes, packed, aligned(4)):
-        //   u8 idx, u8 scan, u8 bw, u8 _pad0,
-        //   u16 chainmask, u8 ext_chan, u8 _pad1
-        let mut payload = [0u8; 8];
-        payload[0] = ch;        // idx
-        payload[1] = 0;         // scan = false
-        payload[2] = 0;         // bw = 0 (20MHz)
-        payload[3] = 0;         // pad
-        payload[4..6].copy_from_slice(&self.chainmask.to_le_bytes()); // chainmask
-        payload[6] = 0;         // ext_chan = 0 (first call)
-        payload[7] = 0;         // pad
-
-        // First call: without extension channel info
-        self.mcu_send_cmd(CMD_SWITCH_CHANNEL_OP, &payload, true)?;
-        thread::sleep(Duration::from_millis(5)); // Linux: usleep_range(5000, 10000)
-
-        // Second call: with ext_chan = 0xE0 + bw_index (for 20MHz: 0xE0)
-        payload[6] = 0xE0;      // ext_chan = 0xE0 + 0 (bw_index=0 for 20MHz)
-        self.mcu_send_cmd(CMD_SWITCH_CHANNEL_OP, &payload, true)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 9: MCU init gain (using EEPROM-derived mcu_gain)
-        //  Linux: mt76x2_mcu_init_gain(dev, channel, dev->cal.rx.mcu_gain, true)
-        //  — mcu.c:75-92
-        // ══════════════════════════════════════════════════════════════════════
-        let mut gain_p = [0u8; 8];
-        let ch_with_force = (ch as u32) | (1 << 31); // force=true → set BIT(31)
-        gain_p[0..4].copy_from_slice(&ch_with_force.to_le_bytes());
-        gain_p[4..8].copy_from_slice(&self.cal.rx.mcu_gain.to_le_bytes());
-        self.mcu_send_cmd(CMD_INIT_GAIN_OP, &gain_p, true)?;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 10: LDPC RX enable for rev >= E3
-        //  Linux: usb_phy.c:144-145
-        // ══════════════════════════════════════════════════════════════════════
-        if (self.asic_rev & 0xFFFF) >= 0x0022 {
-            self.reg_set(MT_BBP_RXO13, 1 << 10)?;
-        }
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 11: Initial calibrations (first channel switch only)
-        //  Linux: usb_phy.c:147-159
-        // ══════════════════════════════════════════════════════════════════════
-        if !self.cal.init_cal_done {
-            let bt_rcal = self.eeprom_u8(MT_EE_BT_RCAL_RESULT);
-            if bt_rcal != 0xFF {
-                self.mcu_calibrate(MCU_CAL_R, 0)?;
-            }
-        }
-        // Try calibrations with response waiting. If EP 0x85 dies, fall back
-        // to fire-and-forget. The MCU needs these to calibrate the radio properly.
-        let _ = self.mcu_calibrate(MCU_CAL_RXDCOC, ch as u32);
-        if !self.cal.init_cal_done {
-            let _ = self.mcu_calibrate(MCU_CAL_RC, 0);
-        }
-        self.cal.init_cal_done = true;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 12: Post-MCU BBP register writes
-        //  Linux: usb_phy.c:161-168
-        // ══════════════════════════════════════════════════════════════════════
-        let _ = self.reg_write(MT_BBP_AGC_BASE + (61 << 2), 0xff64a4e2); // AGC(61)
-        let _ = self.reg_write(MT_BBP_AGC_BASE + (7 << 2),  0x08081010); // AGC(7)
-        let _ = self.reg_write(MT_BBP_AGC_BASE + (11 << 2), 0x00000404); // AGC(11)
-        let _ = self.reg_write(MT_BBP_AGC_BASE + (2 << 2),  0x00007070); // AGC(2)
-        let _ = self.reg_write(MT_TXOP_CTRL_CFG, 0x04101b3f);
-        let _ = self.reg_set(MT_BBP_TXO_BASE + (4 << 2), 1 << 25);      // TXO(4)
-        let _ = self.reg_set(MT_BBP_RXO_BASE + (13 << 2), 1 << 8);       // RXO(13)
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 13: Channel calibration (mac stopped for cal)
-        //  Linux: mt76x2u_phy_channel_calibrate(dev, true)  — usb_phy.c:10-39
-        //  This is called with mac_stopped=true since we haven't started yet
-        // ══════════════════════════════════════════════════════════════════════
-        let is_5g_param = if band_5g { 1u32 } else { 0 };
-        // All calibrations are non-fatal — MCU may timeout on USB but radio still works
-        let cal_cmds: &[(u8, u32, &str)] = if band_5g {
-            &[(MCU_CAL_LC, 0, "LC"), (MCU_CAL_TX_LOFT, 1, "TX_LOFT"),
-              (MCU_CAL_TXIQ, 1, "TXIQ"), (MCU_CAL_RXIQC_FI, 1, "RXIQC_FI"),
-              (MCU_CAL_TEMP_SENSOR, 0, "TEMP"), (MCU_CAL_TX_SHAPING, 0, "TX_SHAPE")]
-        } else {
-            &[(MCU_CAL_TX_LOFT, 0, "TX_LOFT"), (MCU_CAL_TXIQ, 0, "TXIQ"),
-              (MCU_CAL_RXIQC_FI, 0, "RXIQC_FI"), (MCU_CAL_TEMP_SENSOR, 0, "TEMP"),
-              (MCU_CAL_TX_SHAPING, 0, "TX_SHAPE")]
-        };
-        // Wait for each calibration response. Non-fatal — if USB pipe dies,
-        // the MCU still executes the calibration, we just can't confirm it.
-        for &(cal_id, param, _name) in cal_cmds {
-            let _ = self.mcu_calibrate(cal_id, param);
-        }
-
-        // Apply gain adjustment AFTER calibration (Linux: usb_phy.c:36)
-        if let Err(e) = self.apply_gain_adj() {
-        }
-
-        // EDCCA init (Linux: mt76x02_edcca_init) — set ED CCA threshold
-        // For monitor mode we just clear it
-        let _ = self.reg_write(MT_TXOP_CTRL_CFG, 0x04101b3f);
-
-        self.cal.channel_cal_done = true;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 14: Init AGC gain (Linux: mt76x02_init_agc_gain — usb_phy.c:174)
-        // ══════════════════════════════════════════════════════════════════════
-        self.cal.agc_gain_init[0] = ((self.reg_read(MT_BBP_AGC_BASE + (8 << 2)).unwrap_or(0) >> 8) & 0x7F) as u8;
-        self.cal.agc_gain_init[1] = ((self.reg_read(MT_BBP_AGC_BASE + (9 << 2)).unwrap_or(0) >> 8) & 0x7F) as u8;
-        self.cal.agc_gain_cur = self.cal.agc_gain_init;
-        self.cal.low_gain = -1;
-        self.cal.gain_init_done = true;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 15: TSSI init (Linux: usb_phy.c:176-196)
-        // ══════════════════════════════════════════════════════════════════════
-        if self.tssi_enabled() {
-            let mt_tx_alc_cfg_1: u32 = 0x13b4;
-            let _ = self.reg_rmw(mt_tx_alc_cfg_1, 0x3F, 0x38);
-            let _ = self.reg_rmw(MT_TX_ALC_CFG_2, 0x3F, 0x38);
-
-            let mut flag: u32 = 0;
-            if band_5g { flag |= 1; }
-            if ext_pa { flag |= 1 << 8; }
-            if let Err(e) = self.mcu_calibrate(MCU_CAL_TSSI, flag) {
-            } else {
-                self.cal.tssi_cal_done = true;
-            }
-        }
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  Step 16: MAC start — enable TX+RX
-        // ══════════════════════════════════════════════════════════════════════
-        let _ = self.mac_start();
-
-        self.current_channel = Channel {
-            number: ch,
-            band: if band_5g { Band::Band5g } else { Band::Band2g },
-            bandwidth: crate::core::channel::Bandwidth::Bw20,
-            center_freq_mhz: channel_to_freq(ch),
-        };
-
-        Ok(())
-    }
-
-    /// Set TX power registers based on band and ext_pa.
-    /// Linux: mt76x2_phy_set_txpower_regs (phy.c:45-115)
-    fn phy_set_txpower_regs(&self, is_5ghz: bool) -> Result<()> {
-        let ext_pa = self.ext_pa_enabled(is_5ghz);
-
-        let (pa_mode0, pa_mode1) = if !is_5ghz {
-            (0x010055ffu32, 0x00550055u32)
-        } else {
-            (0x0000ffffu32, 0x00ff00ffu32)
-        };
-
-        if !is_5ghz {
-            self.reg_write(MT_TX_ALC_CFG_2, 0x35160a00)?;
-            self.reg_write(MT_TX_ALC_CFG_3, 0x35160a06)?;
-            if ext_pa {
-                self.reg_write(MT_RF_PA_MODE_ADJ0, 0x0000ec00)?;
-                self.reg_write(MT_RF_PA_MODE_ADJ1, 0x0000ec00)?;
-            } else {
-                self.reg_write(MT_RF_PA_MODE_ADJ0, 0xf4000200)?;
-                self.reg_write(MT_RF_PA_MODE_ADJ1, 0xfa000200)?;
-            }
-        } else {
-            if ext_pa {
-                self.reg_write(MT_TX_ALC_CFG_2, 0x2f0f0400)?;
-                self.reg_write(MT_TX_ALC_CFG_3, 0x2f0f0476)?;
-            } else {
-                self.reg_write(MT_TX_ALC_CFG_2, 0x1b0f0400)?;
-                self.reg_write(MT_TX_ALC_CFG_3, 0x1b0f0476)?;
-            }
-            let pa_mode_adj = if ext_pa { 0x04000000u32 } else { 0 };
-            self.reg_write(MT_RF_PA_MODE_ADJ0, pa_mode_adj)?;
-            self.reg_write(MT_RF_PA_MODE_ADJ1, pa_mode_adj)?;
-        }
-
-        self.reg_write(MT_BB_PA_MODE_CFG0, pa_mode0)?;
-        self.reg_write(MT_BB_PA_MODE_CFG1, pa_mode1)?;
-        self.reg_write(MT_RF_PA_MODE_CFG0, pa_mode0)?;
-        self.reg_write(MT_RF_PA_MODE_CFG1, pa_mode1)?;
-
-        // RF gain correction and ALC_CFG_4
-        if ext_pa {
-            let corr_val = if !is_5ghz { 0x3c3c023cu32 } else { 0x363c023cu32 };
-            self.reg_write(MT_TX0_RF_GAIN_CORR, corr_val)?;
-            self.reg_write(MT_TX1_RF_GAIN_CORR, corr_val)?;
-            self.reg_write(MT_TX_ALC_CFG_4, 0x00001818)?;
-        } else {
-            if !is_5ghz {
-                self.reg_write(MT_TX0_RF_GAIN_CORR, 0x0f3c3c3c)?;
-                self.reg_write(MT_TX1_RF_GAIN_CORR, 0x0f3c3c3c)?;
-                self.reg_write(MT_TX_ALC_CFG_4, 0x00000606)?;
-            } else {
-                self.reg_write(MT_TX0_RF_GAIN_CORR, 0x383c023c)?;
-                self.reg_write(MT_TX1_RF_GAIN_CORR, 0x24282e28)?;
-                self.reg_write(MT_TX_ALC_CFG_4, 0)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Set TX power using EEPROM-derived per-chain/per-rate values.
-    /// Linux: mt76x2_phy_set_txpower (phy.c:137-181)
-    fn phy_set_txpower(&mut self, channel: u8, is_5ghz: bool) -> Result<()> {
-        let txp = self.get_power_info(channel, is_5ghz);
-
-        // BW delta (we use 20MHz, so delta=0)
-        let delta: i8 = 0;
-
-        let mut t = self.get_rate_power(is_5ghz);
-        t.add_offset((txp.target_power as i8) + delta);
-        t.limit(self.txpower_conf);
-
-        let base_power = t.min_nonzero_power();
-        let rate_delta = base_power - (txp.target_power as i8);
-
-        let mut txp_0 = (txp.chain[0].target_power as i8) + txp.chain[0].delta + rate_delta;
-        let mut txp_1 = (txp.chain[1].target_power as i8) + txp.chain[1].delta + rate_delta;
-
-        let gain = std::cmp::min(txp_0, txp_1);
-        if gain < 0 {
-            t.add_offset(-gain); // can't use, compensate in rate power
-            txp_0 -= gain;
-            txp_1 -= gain;
-        } else if gain > 0x2f {
-            let excess = gain - 0x2f;
-            t.add_offset(-excess);
-            txp_0 = 0x2f;
-            txp_1 = 0x2f;
-        }
-
-        t.add_offset(-base_power);
-        self.target_power = txp.target_power as i8;
-        self.target_power_delta[0] = txp_0 - (txp.chain[0].target_power as i8);
-        self.target_power_delta[1] = txp_1 - (txp.chain[0].target_power as i8);
-        self.rate_power = t.clone();
-
-        // Write to hardware: Linux mt76x02_phy_set_txpower (mt76x02_phy.c:93-121)
-        let mt_tx_alc_cfg_0: u32 = 0x13b0;
-        // CH_INIT_0 in bits[5:0], CH_INIT_1 in bits[13:8]
-        let mut alc0 = self.reg_read(mt_tx_alc_cfg_0)?;
-        alc0 &= !0x3F3F;
-        alc0 |= ((txp_0 as u8 as u32) & 0x3F) | (((txp_1 as u8 as u32) & 0x3F) << 8);
-        self.reg_write(mt_tx_alc_cfg_0, alc0)?;
-
-        // Write per-rate power to TX_PWR_CFG registers
-        let tx_power_mask = |v1: i8, v2: i8, v3: i8, v4: i8| -> u32 {
-            ((v1 as u8 as u32) & 0x3F)
-            | (((v2 as u8 as u32) & 0x3F) << 8)
-            | (((v3 as u8 as u32) & 0x3F) << 16)
-            | (((v4 as u8 as u32) & 0x3F) << 24)
-        };
-
-        self.reg_write(0x1314, tx_power_mask(t.cck[0], t.cck[2], t.ofdm[0], t.ofdm[2]))?; // CFG_0
-        self.reg_write(0x1318, tx_power_mask(t.ofdm[4], t.ofdm[6], t.ht[0], t.ht[2]))?;   // CFG_1
-        self.reg_write(0x131c, tx_power_mask(t.ht[4], t.ht[6], t.ht[8], t.ht[10]))?;       // CFG_2
-        self.reg_write(0x1320, tx_power_mask(t.ht[12], t.ht[14], t.ht[0], t.ht[2]))?;      // CFG_3
-        self.reg_write(0x1324, tx_power_mask(t.ht[4], t.ht[6], 0, 0))?;                     // CFG_4
-        self.reg_write(0x13d4, tx_power_mask(t.ofdm[7], t.vht[0], t.ht[7], t.vht[1]))?;    // CFG_7
-        self.reg_write(0x13d8, tx_power_mask(t.ht[14], 0, t.vht[0], t.vht[1]))?;            // CFG_8
-        self.reg_write(0x13dc, tx_power_mask(t.ht[7], 0, t.vht[0], t.vht[1]))?;             // CFG_9
-
-        Ok(())
-    }
-
-    /// Helper: send MCU calibration command.
+    /// Send MCU calibration command with long timeout.
     /// Calibrations take much longer than regular commands — the MCU runs the
-    /// calibration procedure before responding. We use a dedicated long-timeout
-    /// send to avoid blocking subsequent commands.
+    /// calibration procedure before responding.
     fn mcu_calibrate(&mut self, cal_id: u8, param: u32) -> Result<()> {
         let mut p = [0u8; 8];
         p[0..4].copy_from_slice(&(cal_id as u32).to_le_bytes());
@@ -2632,23 +1924,12 @@ impl Mt7612u {
         match self.mcu_send_cmd_timeout(CMD_CALIBRATION_OP, &p, Duration::from_millis(5000)) {
             Ok(_) => Ok(()),
             Err(e) => {
-                // Clear stalled endpoints to prevent cascading pipe errors
                 let _ = self.handle.clear_halt(self.ep_cmd_resp_in);
                 let _ = self.handle.clear_halt(self.ep_cmd_out);
-
-                // Check if the response ended up on the data endpoint instead
+                // Drain any misrouted responses
                 let mut probe = [0u8; 256];
-                if let Ok(n) = self.handle.read_bulk(self.ep_data_in, &mut probe, Duration::from_millis(50)) {
-                    if n >= 4 {
-                        let w0 = u32::from_le_bytes([probe[0], probe[1], probe[2], probe[3]]);
-                    }
-                }
-                // Also check cmd resp endpoint one more time
-                if let Ok(n) = self.handle.read_bulk(self.ep_cmd_resp_in, &mut probe, Duration::from_millis(50)) {
-                    if n >= 4 {
-                        let w0 = u32::from_le_bytes([probe[0], probe[1], probe[2], probe[3]]);
-                    }
-                }
+                let _ = self.handle.read_bulk(self.ep_data_in, &mut probe, Duration::from_millis(50));
+                let _ = self.handle.read_bulk(self.ep_cmd_resp_in, &mut probe, Duration::from_millis(50));
                 Err(e)
             }
         }
@@ -2656,8 +1937,6 @@ impl Mt7612u {
 
     /// Send MCU command with a custom response timeout (for calibration commands).
     fn mcu_send_cmd_timeout(&mut self, cmd_id: u8, payload: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>> {
-        let cmd_start = Instant::now();
-
         // Drain stale responses
         if self.mcu_seq > 0 {
             let mut drain_buf = [0u8; 1024];
@@ -2689,7 +1968,6 @@ impl Mt7612u {
 
         self.handle.write_bulk(self.ep_cmd_out, &pkt, USB_BULK_TIMEOUT)?;
 
-        // Wait for response with the provided timeout (longer for calibrations)
         let mut resp = vec![0u8; 1024];
         let deadline = Instant::now() + timeout;
         loop {
@@ -2707,13 +1985,11 @@ impl Mt7612u {
                         resp.truncate(n);
                         return Ok(Some(resp));
                     }
-                    // Stale response, keep waiting
                     continue;
                 }
                 Ok(_) => continue,
-                Err(rusb::Error::Timeout) => continue, // keep waiting until deadline
+                Err(rusb::Error::Timeout) => continue,
                 Err(rusb::Error::Pipe) => {
-                    // Endpoint stalled — clear halt and retry
                     let _ = self.handle.clear_halt(self.ep_cmd_resp_in);
                     continue;
                 }
@@ -2723,458 +1999,71 @@ impl Mt7612u {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  RX frame parsing
+    //  Public accessors (for test binaries)
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Parse one RX frame from aggregated USB data. Returns (frame, bytes_consumed).
-    /// Format per frame: [4B DMA hdr: u16 dma_len, u16 pad] [32B RXWI] [MPDU] [4B RXINFO]
-    fn parse_one_rx(&self, raw: &[u8]) -> Option<(RxFrame, usize)> {
-        let min_len = DMA_HDR_LEN + RXWI_SIZE;
-        if raw.len() < min_len {
-            return None;
-        }
-
-        let dma_len = u16::from_le_bytes([raw[0], raw[1]]) as usize;
-        if dma_len == 0 || DMA_HDR_LEN + dma_len > raw.len() {
-            return None;
-        }
-
-        let rxwi = &raw[DMA_HDR_LEN..];
-        if rxwi.len() < RXWI_SIZE {
-            return None;
-        }
-
-        let ctl = u32::from_le_bytes([rxwi[4], rxwi[5], rxwi[6], rxwi[7]]);
-        let mpdu_len = rxwi_mpdu_len(ctl);
-
-        if mpdu_len == 0 || RXWI_SIZE + mpdu_len > dma_len {
-            return None;
-        }
-
-        let rssi0 = rxwi_rssi0(&rxwi[12..16]);
-        let rssi1 = rxwi_rssi1(&rxwi[12..16]);
-        let rssi = std::cmp::max(rssi0, rssi1);
-
-        let frame_start = DMA_HDR_LEN + RXWI_SIZE;
-        let frame_data = &raw[frame_start..frame_start + mpdu_len];
-
-        // Consumed: DMA_HDR + dma_len, 4-byte aligned for next frame
-        let consumed = (DMA_HDR_LEN + dma_len + 3) & !3;
-
-        Some((RxFrame {
-            data: frame_data.to_vec(),
-            rssi,
-            channel: self.current_channel.number,
-            band: match self.current_channel.band { Band::Band2g => 0, Band::Band5g => 1, Band::Band6g => 2 },
-            timestamp: Duration::ZERO,
-            ..Default::default()
-        }, consumed))
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Minimal init — for debugging. No calibrations, no EEPROM config.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// Bare-bones init: firmware + MAC + monitor mode. No channel calibrations,
-    /// no EEPROM-based PHY config, no BBP writes. Just get frames flowing.
-    pub fn init_minimal(&mut self) -> Result<()> {
-        self.asic_rev = self.reg_read(MT_ASIC_VERSION)?;
-
-        self.wlan_reset()?;
-        self.power_on()?;
-        self.wait_for_mac()?;
-
-        self.load_rom_patch()?;
-        self.load_firmware()?;
-
-        self.poll_reg(MT_WPDMA_GLO_CFG, MT_TX_DMA_BUSY | MT_RX_DMA_BUSY, 0,
-            Duration::from_millis(100))?;
-        self.wait_for_mac()?;
-
-        self.init_dma()?;
-        self.mcu_init()?;
-
-        self.mac_init()?;
-        self.read_eeprom()?;
-        self.mac_set_address()?;
-        self.crystal_fixup()?;
-
-        self.rxfilter = self.reg_read(MT_RX_FILTR_CFG)?;
-
-        let _ = self.poll_reg(MT_MAC_STATUS, 0x3, 0, Duration::from_millis(100));
-        self.reset_wcid_table()?;
-        self.init_beacon_config()?;
-        self.reg_rmw(MT_US_CYC_CFG, 0xFF, 0x1e)?;
-        self.reg_write(MT_TXOP_CTRL_CFG, 0x583f)?;
-        self.init_rx_tx_paths()?;
-        self.mac_stop()?;
-
-        // mac_start
-        self.mac_start()?;
-
-        // Bare MCU channel switch to ch1 — NO calibrations, NO BBP writes
-        self.bare_channel_switch(1)?;
-
-        // Monitor mode
-        self.rxfilter |= MT_RX_FILTR_CFG_PROMISC | MT_RX_FILTR_CFG_OTHER_BSS;
-        self.reg_write(MT_RX_FILTR_CFG, self.rxfilter)?;
-
-        Ok(())
-    }
-
-    /// Get shared USB device handle for multi-threaded reads
     pub fn get_handle(&self) -> Arc<DeviceHandle<GlobalContext>> {
         Arc::clone(&self.handle)
     }
 
-    /// Get data IN endpoint address
     pub fn get_ep_data_in(&self) -> u8 {
         self.ep_data_in
     }
 
-    /// Public register read for diagnostics
     pub fn reg_read_pub(&self, addr: u32) -> Result<u32> {
         self.reg_read(addr)
     }
 
-    /// Public register write for diagnostics
     pub fn reg_write_pub(&self, addr: u32, val: u32) -> Result<()> {
         self.reg_write(addr, val)
     }
 
-    /// Public MCU command for diagnostics/replay tests
     pub fn mcu_cmd_pub(&mut self, cmd_id: u8, payload: &[u8], wait_resp: bool) -> Result<()> {
         self.mcu_send_cmd(cmd_id, payload, wait_resp)?;
         Ok(())
     }
-
-    /// Replay exact Linux kernel mt76x2u init sequence (post-firmware).
-    /// Captured from usbmon on Asahi Linux — 660 register operations.
-    /// Proven: 364 frames in 10s on macOS with this exact sequence.
-    fn kernel_init_replay(&mut self) -> Result<()> {
-        let w = |s: &Self, addr: u32, val: u32| -> Result<()> { s.reg_write(addr, val) };
-        let cw = |s: &Self, addr: u32, val: u32| -> Result<()> { s.reg_write(0x4000_0000 | addr, val) };
-
-        // === Post-firmware init ===
-        w(self, 0x0730, 0x001140fb)?;
-        w(self, 0x0800, 0x00000001)?;
-        cw(self, 0x9018, 0x00c40020)?;  // DMA: no agg during init
-
-        // MCU: Q_SELECT + RADIO_ON (no response wait, seq=0)
-        self.mcu_send_cmd(0x01, &[0x01,0x00,0x00,0x00, 0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], false)?;
-        self.mcu_send_cmd(0x14, &[0x31,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], false)?;
-
-        // === mac_init table ===
-        let mac_vals: &[(u32, u32)] = &[
-            (0x0208, 0x00000030), (0x0408, 0xefef3f1f), (0x040c, 0x0000febf),
-            (0x0400, 0x00080c00), (0x0404, 0x1efebcff), (0x0800, 0x00000001),
-            (0x1004, 0x00000000), (0x1018, 0x003e3f00), (0x1030, 0xaaa99887),
-            (0x1034, 0x000000aa), (0x1100, 0x33a40d0a), (0x1104, 0x00000209),
-            (0x1118, 0x00422010), (0x1204, 0x00000000), (0x1238, 0x001700c8),
-            (0x1330, 0x00101001), (0x1334, 0x00010000), (0x1338, 0x00000000),
-            (0x1340, 0x0400583f), (0x1344, 0x00ffff20), (0x1348, 0x000a2290),
-            (0x134c, 0x47f01f0f), (0x1380, 0x002c00dc), (0x13e0, 0xe3f42004),
-            (0x13e4, 0xe3f42084), (0x13e8, 0xe3f42104), (0x13ec, 0x00060fff),
-            (0x1400, 0x00015f97), (0x1408, 0x0000017f), (0x140c, 0x00004003),
-            (0x150c, 0x00000003), (0x1608, 0x00000002), (0x0a44, 0x00000000),
-            (0x0260, 0x00000000), (0x0250, 0x00000000), (0x120c, 0x00000000),
-            (0x1264, 0x00000000), (0x13c0, 0x00000000), (0x13c8, 0x00000000),
-            (0x1314, 0x3a3a3a3a), (0x1318, 0x3a3a3a3a), (0x131c, 0x3a3a3a3a),
-            (0x1320, 0x3a3a3a3a), (0x1324, 0x3a3a3a3a), (0x13d4, 0x3a3a3a3a),
-            (0x13d8, 0x0000003a), (0x13dc, 0x0000003a), (0x0024, 0x0000d000),
-            (0x0a38, 0x0000000a), (0x0824, 0x60401c18), (0x0210, 0x94ff0000),
-            (0x1478, 0x00000004), (0x1384, 0x00001818), (0x1358, 0xedcba980),
-            (0x1648, 0x00830083), (0x1410, 0x000001ff), (0x1350, 0x00001020),
-            (0x1364, 0x07f40003), (0x1368, 0x07f42004), (0x136c, 0x01752004),
-            (0x1370, 0x03f52084), (0x1374, 0x01752004), (0x1378, 0x03f52084),
-            (0x1350, 0x00001020), (0x1404, 0x00000013), (0x1018, 0x00002f00),
-            (0x0214, 0x00002273), (0x0218, 0x00002344), (0x021c, 0x000034aa),
-        ];
-        for &(reg, val) in mac_vals { w(self, reg, val)?; }
-
-        // === Crystal/timing fixup ===
-        w(self, 0x1004, 0x00000000)?;
-        w(self, 0x0040, 0x0000a046)?;
-        w(self, 0x141c, 0x0000f1e4)?;
-        w(self, 0x13c0, 0x00000000)?;
-        cw(self, 0x0114, 0x00002400)?;
-        cw(self, 0x0118, 0x00007f00)?;
-        w(self, 0x0504, 0x06000000)?;
-        w(self, 0x050c, 0x08800000)?;
-        w(self, 0x0504, 0x00000000)?;
-        w(self, 0x1100, 0x33a40d0a)?;
-        w(self, 0x1104, 0x00000109)?;
-        w(self, 0x080c, 0x03ff0223)?;
-
-        // === MAC address (from EEPROM) ===
-        let mac = self.mac_addr.as_bytes();
-        let dw0 = u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]);
-        let dw1_mac = u16::from_le_bytes([mac[4], mac[5]]) as u32;
-        w(self, 0x1008, dw0)?;
-        w(self, 0x100c, 0x00ff0000 | dw1_mac)?;
-        w(self, 0x1010, dw0)?;
-        w(self, 0x1014, 0x00230000 | dw1_mac)?;
-        w(self, 0x1014, 0x003f0000 | dw1_mac)?;
-
-        // === Multicast filter clear (2x) ===
-        for _ in 0..2 {
-            for addr in (0x1090u32..=0x10cc).step_by(4) {
-                w(self, addr, 0)?;
-            }
-        }
-
-        // === WCID attribute table clear: 0xa800-0xabfc ===
-        for addr in (0xa800u32..=0xabfc).step_by(4) {
-            w(self, addr, 0)?;
-        }
-
-        // === Beacon buffer clear ===
-        for base in [0xb000u32, 0xb004, 0xb008, 0xb00c, 0xb3f0, 0xb3f4, 0xb3f8, 0xb3fc] {
-            for _ in 0..8 { w(self, base, 0)?; }
-        }
-
-        // === Beacon config + timing ===
-        w(self, 0x1114, 0x00060640)?;
-        w(self, 0x1114, 0x00060640)?;
-        w(self, 0x108c, 0x0000ffff)?;
-        w(self, 0x041c, 0x4b321900)?;
-        w(self, 0x0420, 0x00000064)?;
-        w(self, 0x0424, 0x00000000)?;
-        w(self, 0x0428, 0x00000000)?;
-        w(self, 0x02a4, 0x0000001e)?;
-        w(self, 0x1340, 0x0000583f)?;
-
-        // === LOAD_CR (MCU cmd 0x02, with response) ===
-        self.mcu_send_cmd(0x02, &[0x02,0x00,0x00,0x00, 0xff,0x80,0x00,0x80, 0x00,0x00,0x00,0x00], true)?;
-
-        // === RX/TX path config ===
-        w(self, 0x2300, 0x00001408)?;
-        w(self, 0x2714, 0x00000003)?;
-        w(self, 0x1344, 0x00ffff00)?;
-        w(self, 0x1340, 0x0000583f)?;
-        w(self, 0x1608, 0x00000000)?;
-
-        // === mac_stop + mac_start sequence ===
-        w(self, 0x1004, 0x00000000)?;
-        w(self, 0x1344, 0x00ffff20)?;
-        w(self, 0x1004, 0x00000004)?;  // RX only
-        w(self, 0x1400, 0x00015f97)?;  // RX filter
-        w(self, 0x1004, 0x0000000c)?;  // RX + TX
-
-        // === Channel 1 config (first channel) ===
-        let ch1_vals: &[(u32, u32)] = &[
-            (0x1364, 0x07f40003), (0x1368, 0x07f42004), (0x136c, 0x01742004),
-            (0x1370, 0x03f42084), (0x1374, 0x01742004), (0x1378, 0x03f42084),
-            (0x13e0, 0xe3f42004), (0x13e4, 0xe3f42084), (0x13e8, 0xe3f42104),
-            (0x1404, 0x00000003), (0x1104, 0x00000114), (0x1348, 0x000a2190),
-            (0x130c, 0x000a4200),
-        ];
-        for &(reg, val) in ch1_vals { w(self, reg, val)?; }
-
-        // WMM per-AC config
-        w(self, 0x0224, 0x00000000)?;
-        w(self, 0x0214, 0x00002273)?; w(self, 0x0218, 0x00004344)?; w(self, 0x021c, 0x0000a4aa)?;
-        w(self, 0x1308, 0x000a4200)?;
-        w(self, 0x0224, 0x00000000)?;
-        w(self, 0x0214, 0x00002273)?; w(self, 0x0218, 0x00004444)?; w(self, 0x021c, 0x0000aaaa)?;
-        w(self, 0x1300, 0x000a4200)?;
-        w(self, 0x0220, 0x00000000)?;
-        w(self, 0x0214, 0x00002272)?; w(self, 0x0218, 0x00004444)?; w(self, 0x021c, 0x0000aaaa)?;
-        w(self, 0x1304, 0x000a4200)?;
-        w(self, 0x0220, 0x00000000)?;
-        w(self, 0x0214, 0x00002222)?; w(self, 0x0218, 0x00004444)?; w(self, 0x021c, 0x0000aaaa)?;
-
-        w(self, 0x1400, 0x00015f97)?;
-
-        // TX power per rate
-        w(self, 0x13b0, 0x2f2f1b1f)?; w(self, 0x13b0, 0x2f2f1f1f)?;
-        w(self, 0x1314, 0x04070606)?; w(self, 0x1318, 0x04060202)?;
-        w(self, 0x131c, 0x04060101)?; w(self, 0x1320, 0x04060101)?;
-        w(self, 0x1324, 0x00000101)?;
-        w(self, 0x13d4, 0x00010002)?; w(self, 0x13d8, 0x00000001)?; w(self, 0x13dc, 0x00000001)?;
-
-        // === Calibration MCU commands ===
-        w(self, 0x1340, 0x0000583f)?;
-        w(self, 0x1608, 0x00000000)?;
-        w(self, 0x1004, 0x00000000)?;
-        w(self, 0x1344, 0x00ffff00)?;
-        w(self, 0x1344, 0x00ffff20)?;
-
-        // TSSI / AGC config
-        w(self, 0x13a8, 0x35160a00)?; w(self, 0x13ac, 0x35160a06)?;
-        w(self, 0x1228, 0xf4000200)?; w(self, 0x122c, 0xfa000200)?;
-        w(self, 0x1214, 0x010055ff)?; w(self, 0x1218, 0x00550055)?;
-        w(self, 0x121c, 0x010055ff)?; w(self, 0x1220, 0x00550055)?;
-        w(self, 0x13a0, 0x0f3c3c3c)?; w(self, 0x13a4, 0x0f3c3c3c)?;
-        w(self, 0x13c0, 0x00000606)?;
-        w(self, 0x1330, 0x00101001)?; w(self, 0x1334, 0x00021414)?;
-        w(self, 0x1100, 0x33a40f0a)?;
-
-        // TX power per rate (5GHz values from EEPROM)
-        w(self, 0x13b0, 0x2f2f1f1b)?; w(self, 0x13b0, 0x2f2f1d1b)?;
-        w(self, 0x1314, 0x05050505)?; w(self, 0x1318, 0x03050101)?;
-        w(self, 0x131c, 0x03050000)?; w(self, 0x1320, 0x03050000)?;
-        w(self, 0x1324, 0x00000000)?;
-        w(self, 0x13d4, 0x01000101)?; w(self, 0x13d8, 0x01010000)?; w(self, 0x13dc, 0x01010000)?;
-
-        // Band config
-        w(self, 0x132c, 0x00000006)?; w(self, 0x132c, 0x00000004)?; w(self, 0x132c, 0x00000004)?;
-
-        // BBP / AGC
-        w(self, 0x2004, 0x00000042)?;
-        w(self, 0x2300, 0x00001408)?; w(self, 0x2300, 0x00001408)?;
-        w(self, 0x2700, 0x00000008)?;
-        w(self, 0x141c, 0x0000f1e4)?;
-
-        // === MCU calibration commands (ch_switch + calibrations) ===
-        // CH_SWITCH (no ext_chan)
-        self.mcu_send_cmd(0x1e, &[0x01,0x00,0x00,0x00, 0x02,0x02,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-        // CH_SWITCH (ext_chan=0xE0)
-        self.mcu_send_cmd(0x1e, &[0x01,0x00,0x00,0x00, 0x02,0x02,0xe0,0x00, 0x00,0x00,0x00,0x00], true)?;
-        // INIT_GAIN
-        self.mcu_send_cmd(0x03, &[0x01,0x00,0x00,0x80, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-
-        w(self, 0x2934, 0x00000492)?;
-        // RXDCOC
-        self.mcu_send_cmd(0x1f, &[0x03,0x00,0x00,0x00, 0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-        // RC cal
-        self.mcu_send_cmd(0x1f, &[0x04,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-
-        // Post-cal register config
-        w(self, 0x23f4, 0xff64a4e2)?; w(self, 0x231c, 0x08081010)?;
-        w(self, 0x232c, 0x00000404)?; w(self, 0x2308, 0x00007070)?;
-        w(self, 0x1340, 0x04101b3f)?; w(self, 0x2610, 0x02000007)?;
-        w(self, 0x2934, 0x00000592)?;
-
-        // TX_LOFT, TXIQ, RXIQC_FI, TEMP, TX_SHAPE cals
-        self.mcu_send_cmd(0x1f, &[0x07,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-        self.mcu_send_cmd(0x1f, &[0x08,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-        self.mcu_send_cmd(0x1f, &[0x0c,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-        self.mcu_send_cmd(0x1f, &[0x02,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-        self.mcu_send_cmd(0x1f, &[0x0f,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-
-        // Post-calibration AGC/IQ — written by Linux kernel after MCU cals.
-        // MCU calibrations above produce identical values, so these writes
-        // are redundant but kept for fidelity with the captured sequence.
-        w(self, 0x2310, 0x15e79544)?; w(self, 0x2314, 0x15e79544)?;
-        w(self, 0x2320, 0x18365ef8)?; w(self, 0x2324, 0x18365ef8)?;
-
-        // Final channel config
-        w(self, 0x1350, 0x007f1020)?; w(self, 0x1340, 0x04001b3f)?;
-        w(self, 0x2308, 0x00007070)?;
-        w(self, 0x1608, 0x00000002)?;
-        w(self, 0x1004, 0x00000004)?;
-        w(self, 0x1404, 0x00000003)?;
-        w(self, 0x1328, 0x33150f0f)?;
-        w(self, 0x13b4, 0x89540038)?;
-        w(self, 0x13a8, 0x35160a38)?;
-
-        // TX_SHAPE cal
-        self.mcu_send_cmd(0x1f, &[0x09,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00], true)?;
-
-        w(self, 0x110c, 0x0000015f)?;
-        w(self, 0x1004, 0x0000000c)?;  // TX + RX enabled
-        w(self, 0x1400, 0x00017f97)?;  // Monitor-mode RX filter
-        w(self, 0x1400, 0x00017f97)?;
-        w(self, 0x1400, 0x00017f97)?;
-
-        Ok(())
-    }
-
-    /// Load firmware only (no full init) — for kernel replay tests
-    pub fn load_firmware_only(&mut self) -> Result<()> {
-        self.asic_rev = self.reg_read(MT_ASIC_VERSION)?;
-        self.wlan_reset()?;
-        self.power_on()?;
-        self.wait_for_mac()?;
-        self.load_rom_patch()?;
-        self.load_firmware()?;
-        self.poll_reg(MT_WPDMA_GLO_CFG, MT_TX_DMA_BUSY | MT_RX_DMA_BUSY, 0,
-            Duration::from_millis(100))?;
-        self.wait_for_mac()?;
-        self.fw_loaded = true;
-        Ok(())
-    }
-
-    /// Raw bulk read for diagnostics — bypasses rx_frame parsing
-    pub fn raw_bulk_read(&self, buf: &mut [u8], timeout: Duration) -> std::result::Result<usize, rusb::Error> {
-        self.handle.read_bulk(self.ep_data_in, buf, timeout)
-    }
-
-    /// Bare MCU channel switch — just the two CH_SWITCH commands + INIT_GAIN.
-    /// No calibrations, no BBP writes, no mac_stop/mac_start.
-    /// Uses 300ms timeout per MCU command (fast scan mode).
-    pub fn bare_channel_switch(&mut self, ch: u8) -> Result<()> {
-        let fast = Duration::from_millis(300);
-
-        // CH_SWITCH without ext_chan
-        let mut payload = [0u8; 8];
-        payload[0] = ch;
-        payload[1] = if is_5ghz(ch) { 1 } else { 0 }; // band
-        payload[2] = 0; // bw = 20MHz
-        payload[3] = 0; // tx_stream = 0 (auto)
-        payload[4] = 0; // rx_stream = 0 (auto)
-        self.mcu_send_cmd_timeout(CMD_SWITCH_CHANNEL_OP, &payload, fast)?;
-
-        // CH_SWITCH with ext_chan
-        payload[6] = 0xE0;
-        self.mcu_send_cmd_timeout(CMD_SWITCH_CHANNEL_OP, &payload, fast)?;
-
-        // INIT_GAIN
-        let mut gain_p = [0u8; 8];
-        let ch_with_force = (ch as u32) | (1 << 31);
-        gain_p[0..4].copy_from_slice(&ch_with_force.to_le_bytes());
-        self.mcu_send_cmd_timeout(CMD_INIT_GAIN_OP, &gain_p, fast)?;
-
-        self.current_channel = Channel {
-            number: ch,
-            band: if is_5ghz(ch) { Band::Band5g } else { Band::Band2g },
-            bandwidth: crate::core::channel::Bandwidth::Bw20,
-            center_freq_mhz: channel_to_freq(ch),
-        };
-        Ok(())
-    }
 }
 
-/// Standalone RX parser for the pipeline's RxHandle.
-///
-/// Same logic as `Mt7612u::parse_one_rx` but takes `channel` as parameter
-/// instead of reading from `self`, so it can be used as a `fn` pointer.
-///
-/// Format per frame: [4B DMA hdr: u16 dma_len, u16 pad] [32B RXWI] [MPDU] [4B RXINFO]
+// ══════════════════════════════════════════════════════════════════════════════
+//  RX frame parsing — TO BE REBUILT
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Parse one RX frame from aggregated USB bulk read.
+/// Format per frame: [4B DMA hdr] [32B RXWI] [MPDU] [4B RXINFO]
 fn mt7612u_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::ParsedPacket) {
-    let min_len = DMA_HDR_LEN + RXWI_SIZE;
+    let min_len = DMA_HDR_LEN + RXWI_SIZE + 4; // DMA + RXWI + RXINFO minimum
     if buf.len() < min_len {
-        return (0, crate::core::chip::ParsedPacket::Skip);
+        return (buf.len(), crate::core::chip::ParsedPacket::Skip);
     }
 
+    // DMA header: u16 dma_len, u16 pad
     let dma_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    if dma_len == 0 || DMA_HDR_LEN + dma_len > buf.len() {
-        return (0, crate::core::chip::ParsedPacket::Skip);
+    if dma_len == 0 || dma_len > buf.len() {
+        return (buf.len(), crate::core::chip::ParsedPacket::Skip);
     }
 
-    let rxwi = &buf[DMA_HDR_LEN..];
-    if rxwi.len() < RXWI_SIZE {
-        return (0, crate::core::chip::ParsedPacket::Skip);
-    }
-
+    // RXWI starts at offset 4
+    let rxwi = &buf[DMA_HDR_LEN..DMA_HDR_LEN + RXWI_SIZE];
     let ctl = u32::from_le_bytes([rxwi[4], rxwi[5], rxwi[6], rxwi[7]]);
     let mpdu_len = rxwi_mpdu_len(ctl);
 
-    if mpdu_len == 0 || RXWI_SIZE + mpdu_len > dma_len {
-        // Skip this chunk — advance past the DMA header to avoid infinite loop
-        let consumed = (DMA_HDR_LEN + dma_len + 3) & !3;
+    if mpdu_len == 0 || mpdu_len > 4096 {
+        // Align to 4 bytes and skip
+        let consumed = (dma_len + DMA_HDR_LEN + 3) & !3;
         return (consumed, crate::core::chip::ParsedPacket::Skip);
     }
 
-    let rssi0 = rxwi_rssi0(&rxwi[12..16]);
-    let rssi1 = rxwi_rssi1(&rxwi[12..16]);
-    let rssi = std::cmp::max(rssi0, rssi1);
-
+    let rssi = rxwi_rssi0(&rxwi[12..16]);
     let frame_start = DMA_HDR_LEN + RXWI_SIZE;
-    let frame_data = &buf[frame_start..frame_start + mpdu_len];
+    let frame_end = frame_start + mpdu_len;
 
-    // Consumed: DMA_HDR + dma_len, 4-byte aligned for next frame
+    if frame_end > buf.len() {
+        return (buf.len(), crate::core::chip::ParsedPacket::Skip);
+    }
+
+    let frame_data = &buf[frame_start..frame_end];
+
+    // Consumed = DMA header + dma_len, aligned to 4 bytes
     let consumed = (DMA_HDR_LEN + dma_len + 3) & !3;
 
     (consumed, crate::core::chip::ParsedPacket::Frame(RxFrame {
@@ -3188,45 +2077,15 @@ fn mt7612u_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Parse
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ChipDriver trait implementation
+//  ChipDriver trait — TO BE REBUILT
 // ══════════════════════════════════════════════════════════════════════════════
 
 impl ChipDriver for Mt7612u {
     fn init(&mut self) -> Result<()> {
-        // ── Phase 1-3: Firmware load (our code, proven working) ──
-        self.load_firmware_only()?;
-
-        // Read EEPROM for MAC address (needed for mac_set_address later)
-        self.read_eeprom()?;
-
-        // ── Phase 4: Kernel init replay ──
-        // Exact register sequence from Linux kernel mt76x2u driver, captured via
-        // usbmon on Asahi Linux. This sequence is PROVEN to produce 364 frames/10s
-        // on macOS. Every register, every value, every order — from the kernel.
-        self.kernel_init_replay()?;
-
-        // ── Phase 5: Enable RX aggregation for userspace ──
-        // Kernel uses 128 async URBs so doesn't need aggregation.
-        // We're in userspace with sync reads — AGG buffers frames for us.
-        let agg_dma: u32 = 0xFF             // RxBulkAggTOut = 0xFF (~8.4µs, max)
-            | (21 << 8)                      // RxBulkAggLmt = 21
-            | (1 << 18)                      // RX_DROP_OR_PAD
-            | (1 << 21)                      // RX_BULK_AGG_EN
-            | (1 << 22)                      // RX_BULK_EN
-            | (1 << 23);                     // TX_BULK_EN
-        self.reg_write(CFG_USB_DMA, agg_dma)?;
-        self.reg_write(MT_USB_DMA_CFG, agg_dma)?;
-        let rb = self.reg_read(CFG_USB_DMA)?;
-
-        // Save state for channel switching / monitor mode
-        self.rxfilter = self.reg_read(MT_RX_FILTR_CFG).unwrap_or(0x00017f97);
-        self.current_channel = Channel { number: 1, band: Band::Band2g, bandwidth: crate::core::channel::Bandwidth::Bw20, center_freq_mhz: 2412 };
-
-        Ok(())
+        self.init_hardware()
     }
 
     fn shutdown(&mut self) -> Result<()> {
-        // Disable TX+RX
         self.reg_write(MT_MAC_SYS_CTRL, 0)?;
         let _ = self.handle.release_interface(self.iface_num);
         Ok(())
@@ -3247,39 +2106,12 @@ impl ChipDriver for Mt7612u {
         }
     }
 
-    fn set_channel(&mut self, channel: Channel) -> Result<()> {
-        // Scan-mode channel switch: fast hop with minimal calibration.
-        // Matches Linux behavior: during scanning, skip heavy TX/IQ cals.
-        // Linux usb_phy.c:170: "if (scan) return 0;" — skips channel_calibrate.
-        //
-        // Fast path: mac_stop → CH_SWITCH + INIT_GAIN → RXDCOC → mac_start
-        // Full calibration is done via calibrate_channel() when settling on a target.
-        let ch = channel.number;
-
-        self.mac_stop()?;
-        self.bare_channel_switch(ch)?;
-
-        // MCU_CAL_RXDCOC (3) — param = channel number. Essential for RX.
-        // Use short timeout: if RXDCOC doesn't respond in 200ms, skip it.
-        // The default mcu_calibrate uses 5000ms which kills scan performance.
-        {
-            let mut p = [0u8; 8];
-            p[0..4].copy_from_slice(&3u32.to_le_bytes()); // CAL_RXDCOC
-            p[4..8].copy_from_slice(&(ch as u32).to_le_bytes());
-            if let Err(_) = self.mcu_send_cmd_timeout(CMD_CALIBRATION_OP, &p, Duration::from_millis(200)) {
-                let _ = self.handle.clear_halt(self.ep_cmd_resp_in);
-            }
-        }
-
-        self.mac_start()?;
-        self.current_channel = channel;
-        Ok(())
+    fn set_channel(&mut self, _channel: Channel) -> Result<()> {
+        todo!("MT7612U set_channel — rebuild from Linux mt76x2u_phy_set_channel")
     }
 
     fn supported_channels(&self) -> &[Channel] {
         use crate::core::channel::Bandwidth;
-        // Static channel list — 2.4 GHz + 5 GHz, 20 MHz BW
-        // MT7612U is dual-band 2x2 MIMO
         static CHANNELS: std::sync::LazyLock<Vec<Channel>> = std::sync::LazyLock::new(|| {
             let mut chs = Vec::new();
             for &ch in CHANNELS_2GHZ {
@@ -3304,116 +2136,16 @@ impl ChipDriver for Mt7612u {
     }
 
     fn set_monitor_mode(&mut self) -> Result<()> {
-        // kernel replay already sets monitor filter — skip extra write
-        Ok(())
+        todo!("MT7612U set_monitor_mode — rebuild")
     }
 
-    fn tx_frame(&mut self, frame: &[u8], _opts: &TxOptions) -> Result<()> {
-        // MT7612U TX format (from usbmon capture 2026-03-22, Asahi Linux mt76 driver):
-        //   [4B TXD info header]  — LE u16 payload_len + 0x08 0x05
-        //   [20B TXWI]           — TX WiFi Info (flags, rate, ack, iv, eiv)
-        //   [802.11 frame]       — raw frame bytes
-        //   [padding to 4B]      — zero-padded alignment
-        //
-        // Endpoint: EP 0x07 (VO/MGMT queue, confirmed from all 37 TX frames in capture)
-        // All scan probes + inject test probes used EP 0x07 exclusively.
-
-        if frame.len() < 10 {
-            return Err(Error::TxFailed {
-                retries: 0,
-                reason: "frame too short".into(),
-            });
-        }
-
-        const TXD_SIZE: usize = 4;
-        const TXWI_SIZE: usize = 20;
-
-        let payload_len = TXWI_SIZE + frame.len();
-        let padded_payload = (payload_len + 3) & !3;
-        let total = TXD_SIZE + padded_payload;
-        let mut buf = vec![0u8; total];
-
-        // ── TXD info header (4 bytes) ──
-        // Bytes 0-1: LE u16 payload length (TXWI + frame, before padding)
-        // Bytes 2-3: constant 0x08, 0x05 (from all 37 captured TX frames)
-        buf[0] = (payload_len & 0xFF) as u8;
-        buf[1] = ((payload_len >> 8) & 0xFF) as u8;
-        buf[2] = 0x08;
-        buf[3] = 0x05;
-
-        // ── TXWI (20 bytes, kernel-replay from usbmon) ──
-        // Two templates observed in capture:
-        //   2.4GHz: 00000000 02fdd600 00000000 00000000 00130000
-        //   5GHz:   00000020 02fddb00 00000000 00000000 00130000
-        // Differences: flags byte[3] = 0x20 for 5GHz, rate byte[2] = 0xdb vs 0xd6
-        let is_5ghz = self.current_channel.band == Band::Band5g;
-        let txwi: [u8; TXWI_SIZE] = if is_5ghz {
-            [
-                0x00, 0x00, 0x00, 0x20, // flags: 5GHz band indicator
-                0x02, 0xfd, 0xdb, 0x00, // rate: OFDM 6Mbps on 5GHz
-                0x00, 0x00, 0x00, 0x00, // ack_ctl=0, wcid=0, len_ctl=0
-                0x00, 0x00, 0x00, 0x00, // iv (no encryption)
-                0x00, 0x13, 0x00, 0x00, // eiv
-            ]
-        } else {
-            [
-                0x00, 0x00, 0x00, 0x00, // flags: 2.4GHz
-                0x02, 0xfd, 0xd6, 0x00, // rate: CCK/OFDM on 2.4GHz
-                0x00, 0x00, 0x00, 0x00, // ack_ctl=0, wcid=0, len_ctl=0
-                0x00, 0x00, 0x00, 0x00, // iv (no encryption)
-                0x00, 0x13, 0x00, 0x00, // eiv
-            ]
-        };
-
-        buf[TXD_SIZE..TXD_SIZE + TXWI_SIZE].copy_from_slice(&txwi);
-
-        // ── 802.11 frame ──
-        buf[TXD_SIZE + TXWI_SIZE..TXD_SIZE + TXWI_SIZE + frame.len()]
-            .copy_from_slice(frame);
-
-        // Send on EP 0x07 (management TX queue)
-        self.handle.write_bulk(self.ep_data_out, &buf, Duration::from_millis(200))
-            .map_err(|e| Error::TxFailed {
-                retries: 0,
-                reason: format!("USB write EP {:#04x}: {}", self.ep_data_out, e),
-            })?;
-
-        Ok(())
+    fn tx_frame(&mut self, _frame: &[u8], _opts: &TxOptions) -> Result<()> {
+        todo!("MT7612U tx_frame — rebuild with proper TXWI")
     }
 
-    fn rx_frame(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {
-        // Drain aggregation buffer first
-        if self.rx_agg_offset < self.rx_agg_buf.len() {
-            if let Some((frame, consumed)) = self.parse_one_rx(&self.rx_agg_buf[self.rx_agg_offset..]) {
-                self.rx_agg_offset += consumed;
-                return Ok(Some(frame));
-            }
-            self.rx_agg_buf.clear();
-            self.rx_agg_offset = 0;
-        }
-
-        // Fresh USB bulk read (64KB for aggregated transfers)
-        let mut buf = vec![0u8; 65536];
-        match self.handle.read_bulk(self.ep_data_in, &mut buf, timeout) {
-            Ok(n) if n > 0 => {
-                buf.truncate(n);
-                match self.parse_one_rx(&buf) {
-                    Some((frame, consumed)) => {
-                        if consumed < n {
-                            self.rx_agg_buf = buf;
-                            self.rx_agg_offset = consumed;
-                        }
-                        Ok(Some(frame))
-                    }
-                    None => Ok(None),
-                }
-            }
-            Ok(_) => Ok(None),
-            Err(rusb::Error::Timeout) => Ok(None),
-            Err(e) => Err(Error::Usb(e)),
-        }
+    fn rx_frame(&mut self, _timeout: Duration) -> Result<Option<RxFrame>> {
+        todo!("MT7612U rx_frame — rebuild with aggregation parsing")
     }
-
 
     fn mac(&self) -> MacAddress {
         self.mac_addr
@@ -3421,7 +2153,6 @@ impl ChipDriver for Mt7612u {
 
     fn set_mac(&mut self, mac: MacAddress) -> Result<()> {
         self.mac_addr = mac;
-        self.mac_set_address()?;
         Ok(())
     }
 
@@ -3431,36 +2162,11 @@ impl ChipDriver for Mt7612u {
 
     fn set_tx_power(&mut self, dbm: i8) -> Result<()> {
         self.tx_power = dbm;
-        // TODO: MCU command to set TX power
-        Ok(())
+        todo!("MT7612U set_tx_power — implement MCU command")
     }
 
     fn calibrate(&mut self) -> Result<()> {
-        // Full per-channel calibration — run when settling on a target channel.
-        // This is the heavy calibration that Linux skips during scanning.
-        // Matches mt76x2u_phy_channel_calibrate + post-RXDCOC AGC setup.
-        let ch = self.current_channel.number;
-        let is_5g = self.current_channel.band == Band::Band5g;
-        let is_5g_param = if is_5g { 1u32 } else { 0u32 };
-
-        // AGC register setup
-        self.reg_write(0x23f4, 0xff64a4e2)?;
-        self.reg_write(0x231c, 0x08081010)?;
-        self.reg_write(0x232c, 0x00000404)?;
-        self.reg_write(0x2308, 0x00007070)?;
-        self.reg_write(0x1340, 0x04101b3f)?;
-
-        // Full channel calibrations
-        if is_5g {
-            self.mcu_calibrate(6, 0)?; // MCU_CAL_LC
-        }
-        self.mcu_calibrate(7, is_5g_param)?;  // MCU_CAL_TX_LOFT
-        self.mcu_calibrate(8, is_5g_param)?;  // MCU_CAL_TXIQ
-        self.mcu_calibrate(12, is_5g_param)?; // MCU_CAL_RXIQC_FI
-        self.mcu_calibrate(2, 0)?;            // MCU_CAL_TEMP_SENSOR
-        self.mcu_calibrate(15, 0)?;           // MCU_CAL_TX_SHAPING
-
-        Ok(())
+        todo!("MT7612U calibrate — rebuild per-channel calibration")
     }
 
     fn take_rx_handle(&mut self) -> Option<crate::core::chip::RxHandle> {
@@ -3473,3 +2179,4 @@ impl ChipDriver for Mt7612u {
         })
     }
 }
+

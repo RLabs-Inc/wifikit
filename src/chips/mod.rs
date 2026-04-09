@@ -31,6 +31,7 @@ mod rtl8852a_phase_txpower;
 mod rtl8852a_phase_rxtx;
 pub mod rtl8852a_full_init;
 mod rtl8852a_channel_switch;
+mod rtl8852b_channel_switch;
 pub mod rtl8812au;
 pub mod rtl8812bu;
 pub mod rtl8852au;

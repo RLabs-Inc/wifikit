@@ -8,6 +8,18 @@ const VID_MEDIATEK: u16 = 0x0E8D;
 const PID_MT7612_CDROM: u16 = 0x2870;
 const PID_MT7612_WIFI: u16 = 0x7612;
 
+const VID_REALTEK: u16 = 0x0BDA;
+const PID_REALTEK_STORAGE: u16 = 0x1A2B;
+// Known Realtek WiFi-mode PIDs after modeswitch
+const REALTEK_WIFI_PIDS: &[(u16, &str)] = &[
+    (0xC832, "RTL8852BU"),   // confirmed: TP-Link 802.11ax WLAN Adapter
+    (0xB832, "RTL8832BU"),
+    (0xB852, "RTL8852AU"),
+    (0xB812, "RTL8812BU"),
+    (0x8812, "RTL8812AU"),
+    (0xC82C, "RTL8852CU"),
+];
+
 // SCSI TEST UNIT READY wrapped in CBW (wake up the device)
 const SCSI_TEST_UNIT_READY: [u8; 31] = [
     0x55, 0x53, 0x42, 0x43, // "USBC"
@@ -92,22 +104,36 @@ fn send_cbw(handle: &rusb::DeviceHandle<rusb::Context>, ep_out: u8, ep_in: u8, c
         }
     }
 
-    // Read CSW
-    let mut csw = [0u8; 13];
+    // Read CSW (use 512-byte buffer to avoid overflow from stale data)
+    let mut csw = [0u8; 512];
     match handle.read_bulk(ep_in, &mut csw, timeout) {
-        Ok(n) if n >= 13 => {
+        Ok(n) if n >= 13 && &csw[..4] == b"USBS" => {
             let status = csw[12];
             println!("  {} CSW status: {} ({})", name,
                 status, if status == 0 { "OK" } else { "FAIL" });
         }
-        Ok(n) => println!("  {} CSW: {} bytes (short)", name, n),
+        Ok(n) => println!("  {} response: {} bytes (not a CSW: {:02x?})", name, n, &csw[..n.min(16)]),
         Err(e) => println!("  {} CSW: {} (may have disconnected)", name, e),
     }
 }
 
+fn find_realtek_wifi(context: &rusb::Context) -> Option<(u16, &'static str)> {
+    for device in context.devices().ok()?.iter() {
+        if let Ok(desc) = device.device_descriptor() {
+            if desc.vendor_id() == VID_REALTEK {
+                for &(pid, name) in REALTEK_WIFI_PIDS {
+                    if desc.product_id() == pid {
+                        return Some((pid, name));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn main() {
-    println!("=== USB Mode Switch for MT7612U ===");
-    println!("Looking for {:04X}:{:04X}...\n", VID_MEDIATEK, PID_MT7612_CDROM);
+    println!("=== USB Mode Switch ===\n");
 
     let context = match rusb::Context::new() {
         Ok(c) => c,
@@ -117,16 +143,25 @@ fn main() {
         }
     };
 
-    let device = match find_device(&context, VID_MEDIATEK, PID_MT7612_CDROM) {
-        Some(d) => d,
-        None => {
-            if find_device(&context, VID_MEDIATEK, PID_MT7612_WIFI).is_some() {
-                println!("Already in WiFi mode! ({:04X}:{:04X})", VID_MEDIATEK, PID_MT7612_WIFI);
-                std::process::exit(0);
-            }
-            eprintln!("Device not found. Is it plugged in?");
-            std::process::exit(1);
+    // Try Realtek storage mode first (covers 8852AU, 8852BU, 8812BU, etc.)
+    let device = if let Some(d) = find_device(&context, VID_REALTEK, PID_REALTEK_STORAGE) {
+        println!("Found Realtek storage device ({:04X}:{:04X})", VID_REALTEK, PID_REALTEK_STORAGE);
+        d
+    } else if let Some(d) = find_device(&context, VID_MEDIATEK, PID_MT7612_CDROM) {
+        println!("Found MediaTek CD-ROM device ({:04X}:{:04X})", VID_MEDIATEK, PID_MT7612_CDROM);
+        d
+    } else {
+        // Check if already in WiFi mode
+        if find_device(&context, VID_MEDIATEK, PID_MT7612_WIFI).is_some() {
+            println!("MT7612U already in WiFi mode! ({:04X}:{:04X})", VID_MEDIATEK, PID_MT7612_WIFI);
+            std::process::exit(0);
         }
+        if let Some((pid, name)) = find_realtek_wifi(&context) {
+            println!("{} already in WiFi mode! ({:04X}:{:04X})", name, VID_REALTEK, pid);
+            std::process::exit(0);
+        }
+        eprintln!("No device in storage mode found. Is it plugged in?");
+        std::process::exit(1);
     };
 
     println!("Found at bus {:03} addr {:03}", device.bus_number(), device.address());
@@ -192,6 +227,23 @@ fn main() {
     let _ = handle.clear_halt(ep_out);
     let _ = handle.clear_halt(ep_in);
 
+    // Drain any stale data from IN endpoint (e.g. SCSI sense data from previous attempts)
+    println!("Draining stale data...");
+    let mut drained = 0;
+    for _ in 0..5 {
+        let mut buf = [0u8; 512];
+        match handle.read_bulk(ep_in, &mut buf, Duration::from_millis(200)) {
+            Ok(n) => {
+                println!("  Drained {} bytes", n);
+                drained += n;
+            }
+            Err(_) => break,
+        }
+    }
+    if drained > 0 {
+        println!("  Total drained: {} bytes", drained);
+    }
+
     // Step 1: TEST UNIT READY (wake up)
     println!("Step 1: TEST UNIT READY");
     send_cbw(&handle, ep_out, ep_in, &SCSI_TEST_UNIT_READY, "TUR", 0);
@@ -214,11 +266,34 @@ fn main() {
 }
 
 fn check_result(context: &rusb::Context) {
+    // Check MediaTek
     if find_device(context, VID_MEDIATEK, PID_MT7612_WIFI).is_some() {
         println!("\n*** SUCCESS! MT7612U switched to WiFi mode! ***");
         println!("Device ready at {:04X}:{:04X}", VID_MEDIATEK, PID_MT7612_WIFI);
-    } else if find_device(context, VID_MEDIATEK, PID_MT7612_CDROM).is_some() {
-        println!("\nStill in CD-ROM mode. Try unplugging and replugging.");
+        return;
+    }
+    // Check Realtek WiFi PIDs
+    if let Some((pid, name)) = find_realtek_wifi(context) {
+        println!("\n*** SUCCESS! {} switched to WiFi mode! ***", name);
+        println!("Device ready at {:04X}:{:04X}", VID_REALTEK, pid);
+        return;
+    }
+    // Check if any new Realtek device appeared (unknown PID)
+    for device in context.devices().unwrap().iter() {
+        if let Ok(desc) = device.device_descriptor() {
+            if desc.vendor_id() == VID_REALTEK && desc.product_id() != PID_REALTEK_STORAGE {
+                println!("\n*** Realtek device appeared with PID {:04X}! ***", desc.product_id());
+                println!("Device at {:04X}:{:04X} — add this PID to REALTEK_WIFI_PIDS",
+                    VID_REALTEK, desc.product_id());
+                return;
+            }
+        }
+    }
+    // Still in storage mode?
+    if find_device(context, VID_REALTEK, PID_REALTEK_STORAGE).is_some()
+        || find_device(context, VID_MEDIATEK, PID_MT7612_CDROM).is_some()
+    {
+        println!("\nStill in storage mode. Try unplugging and replugging.");
     } else {
         println!("\nDevice disconnected — replug it, should come back in WiFi mode.");
     }

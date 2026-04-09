@@ -8,7 +8,9 @@ use std::time::Duration;
 const VID_TPLINK: u16 = 0x2357;
 const PID_8852AU: u16 = 0x013F;
 const VID_RTL: u16 = 0x0BDA;
-// Some 8852AU devices use Realtek VID instead of TP-Link
+const PID_8852BU_C832: u16 = 0xC832;
+const PID_8852BU_B832: u16 = 0xB832;
+// RTL8852 family shares R_AX_ register layout (PAD_CTRL2, USB_STATUS)
 
 // Register addresses
 const R_AX_USB_STATUS: u16 = 0x11F0;
@@ -43,27 +45,56 @@ fn read8(handle: &rusb::DeviceHandle<Context>, addr: u16) -> Result<u8, rusb::Er
 }
 
 fn main() {
-    println!("=== RTL8852AU USB 2→3 Mode Switch ===\n");
+    println!("=== RTL8852 USB 2→3 Mode Switch ===\n");
 
     let context = Context::new().expect("Failed to init libusb");
 
-    // Find the device (try TP-Link VID first, then Realtek VID)
-    let device = context.devices().unwrap().iter()
-        .find(|d| {
+    // Find ALL RTL8852 family devices, switch any that are USB 2.0
+    let devices: Vec<_> = context.devices().unwrap().iter()
+        .filter(|d| {
             if let Ok(desc) = d.device_descriptor() {
-                (desc.vendor_id() == VID_TPLINK && desc.product_id() == PID_8852AU) ||
-                (desc.vendor_id() == VID_RTL && desc.product_id() == PID_8852AU)
+                let vid = desc.vendor_id();
+                let pid = desc.product_id();
+                (vid == VID_TPLINK && pid == PID_8852AU) ||
+                (vid == VID_RTL && (pid == PID_8852AU || pid == PID_8852BU_C832 || pid == PID_8852BU_B832))
             } else {
                 false
             }
-        });
+        })
+        .collect();
 
-    let device = match device {
-        Some(d) => d,
-        None => {
-            eprintln!("RTL8852AU not found (2357:013f). Is it in WiFi mode?");
-            eprintln!("If it shows as 'DISK', eject it first: diskutil eject diskN");
-            std::process::exit(1);
+    if devices.is_empty() {
+        eprintln!("No RTL8852 device found (tried 2357:013f, 0BDA:013f, 0BDA:C832, 0BDA:B832).");
+        eprintln!("If it shows as 'DISK', run modeswitch first.");
+        std::process::exit(1);
+    }
+
+    // Find first device that needs switching (USB 2.0)
+    let device = {
+        let mut target = None;
+        for d in &devices {
+            let desc = d.device_descriptor().unwrap();
+            println!("  Found: {:04x}:{:04x} bus={} addr={} speed={:?}",
+                desc.vendor_id(), desc.product_id(),
+                d.bus_number(), d.address(), d.speed());
+            if let Ok(h) = d.open() {
+                if let Ok(status) = read32(&h, R_AX_USB_STATUS) {
+                    let is_usb3 = (status & B_AX_R_USB2_SEL) != 0;
+                    if !is_usb3 && target.is_none() {
+                        println!("    → USB 2.0 — needs switch!");
+                        target = Some(d);
+                    } else {
+                        println!("    → USB 3.0 — OK");
+                    }
+                }
+            }
+        }
+        match target {
+            Some(d) => d.clone(),
+            None => {
+                println!("\nAll devices already in USB 3.0 mode!");
+                return;
+            }
         }
     };
 
@@ -130,8 +161,10 @@ fn main() {
     let context2 = Context::new().expect("Failed to reinit libusb");
     let found = context2.devices().unwrap().iter().find(|d| {
         if let Ok(desc) = d.device_descriptor() {
-            (desc.vendor_id() == VID_TPLINK && desc.product_id() == PID_8852AU) ||
-            (desc.vendor_id() == VID_RTL && desc.product_id() == PID_8852AU)
+            let vid = desc.vendor_id();
+            let pid = desc.product_id();
+            (vid == VID_TPLINK && pid == PID_8852AU) ||
+            (vid == VID_RTL && (pid == PID_8852AU || pid == PID_8852BU_C832 || pid == PID_8852BU_B832))
         } else {
             false
         }

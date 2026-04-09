@@ -83,7 +83,7 @@ pub fn format_event(event: &DosEvent) -> String {
                 s().bold().paint(&prism::format_number(*frames_sent)),
                 rate,
                 s().dim().paint(&bytes),
-                elapsed.as_secs_f64())
+                prism::format_time((elapsed.as_secs_f64() * 1000.0) as u64))
         }
         DosEventKind::BurstPause { burst_num, frames_in_burst, pause_secs } => {
             format!("  [{}] {} Burst #{} ({} frames) — pausing {:.0}s",
@@ -100,7 +100,7 @@ pub fn format_event(event: &DosEvent) -> String {
                 s().bold().paint("DONE"),
                 s().green().bold().paint("DoS attack complete"),
                 prism::format_number(*frames_sent),
-                elapsed.as_secs_f64(),
+                prism::format_time((elapsed.as_secs_f64() * 1000.0) as u64),
                 s().dim().paint(reason_str))
         }
         DosEventKind::CooldownStarted { duration_secs } => {
@@ -228,14 +228,14 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
 
     // ═══ Stats line ═══
     if info.phase == DosPhase::Flooding || info.phase == DosPhase::Done || info.phase == DosPhase::Cooldown {
-        let elapsed_secs = info.start_time.elapsed().as_secs_f64();
+        let elapsed_fmt = prism::format_time((info.start_time.elapsed().as_secs_f64() * 1000.0) as u64);
         let rate = format_rate(info.frames_per_sec);
-        let mut stats = format!("{} sent  {} recv  {}  {}  {:.1}s",
+        let mut stats = format!("{} sent  {} recv  {}  {}  {}",
             s().red().bold().paint(&prism::format_number(info.frames_sent)),
             s().dim().paint(&prism::format_number(info.frames_received)),
             rate,
             s().dim().paint(&prism::format_bytes(info.bytes_sent)),
-            elapsed_secs);
+            elapsed_fmt);
         if info.tx_feedback.total_reports > 0 {
             let pct = info.tx_feedback.delivery_pct().unwrap_or(0.0);
             stats.push_str(&format!("  {} ack  {} nack ({}%)",
@@ -384,8 +384,7 @@ pub fn status_segments(info: &DosInfo) -> Vec<StatusSegment> {
     }
 
     // Elapsed time
-    let elapsed_secs = info.start_time.elapsed().as_secs_f64();
-    segs.push(StatusSegment::new(format!("{:.1}s", elapsed_secs), SegmentStyle::Dim));
+    segs.push(StatusSegment::new(prism::format_time((info.start_time.elapsed().as_secs_f64() * 1000.0) as u64), SegmentStyle::Dim));
 
     // Bytes sent
     if info.bytes_sent > 0 {
@@ -587,13 +586,13 @@ impl Module for DosModule {
         };
 
         let content = format!(
-            "Target: {} ({})\nType: {}\nFrames: {} ({} fps)\nDuration: {:.1}s  |  {} sent{}\nReason: {}",
+            "Target: {} ({})\nType: {}\nFrames: {} ({} fps)\nDuration: {}  |  {} sent{}\nReason: {}",
             info.target_ssid,
             info.target_bssid,
             info.attack_type.label(),
             prism::format_number(info.frames_sent),
             prism::format_compact(info.frames_per_sec as u64),
-            info.elapsed.as_secs_f64(),
+            prism::format_time((info.elapsed.as_secs_f64() * 1000.0) as u64),
             prism::format_bytes(info.bytes_sent),
             tx_line,
             reason_str,

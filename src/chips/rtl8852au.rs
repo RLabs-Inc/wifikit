@@ -1842,14 +1842,14 @@ impl Rtl8852au {
         Ok(())
     }
 
-    pub(crate) fn read32(&self, addr: u16) -> Result<u32> {
+    pub fn read32(&self, addr: u16) -> Result<u32> {
         let mut buf = [0u8; 4];
         let r = self.handle.read_control(0xC0, RTL_USB_REQ, addr, 0, &mut buf, RTL_USB_TIMEOUT)?;
         if r < 4 { return Err(Error::RegisterReadFailed { addr }); }
         Ok(u32::from_le_bytes(buf))
     }
 
-    pub(crate) fn write32(&self, addr: u16, val: u32) -> Result<()> {
+    pub fn write32(&self, addr: u16, val: u32) -> Result<()> {
         let r = self.handle.write_control(0x40, RTL_USB_REQ, addr, 0, &val.to_le_bytes(), RTL_USB_TIMEOUT)?;
         if r < 4 { return Err(Error::RegisterWriteFailed { addr, val }); }
         Ok(())
@@ -3646,10 +3646,24 @@ impl Rtl8852au {
 
         // INFO DW2 = 0 (no security)
 
-        // INFO DW3 (= overall DW9): SPE_RPT requests firmware TX completion report.
-        // Without this, firmware never generates rpkt_type=6 (TX_RPT) packets.
-        let info_dw3: u32 = AX_TXD_SPE_RPT;
+        // INFO DW3 (= overall DW9): SPE_RPT + sounding fields (NDPA, SND_PKT_SEL, SIFS_TX)
+        // Without SPE_RPT, firmware never generates rpkt_type=6 (TX_RPT) packets.
+        let mut info_dw3: u32 = AX_TXD_SPE_RPT;
+        // Beamforming sounding: NDPA[2:1], SND_PKT_SEL[5:3], SIFS_TX[6]
+        if opts.ndpa != 0 {
+            info_dw3 |= ((opts.ndpa as u32 & 0x3) << 1)       // NDPA type
+                      | ((opts.snd_pkt_sel as u32 & 0x7) << 3); // packet role
+        }
+        if opts.flags.contains(TxFlags::SIFS_TX) {
+            info_dw3 |= 1 << 6; // SIFS_TX — insert SIFS after this frame
+        }
         buf[36..40].copy_from_slice(&info_dw3.to_le_bytes());
+
+        // INFO DW5 (= overall DW11): NDPA_DURATION[31:16]
+        if opts.ndpa_duration_us > 0 {
+            let info_dw5: u32 = (opts.ndpa_duration_us as u32) << 16;
+            buf[44..48].copy_from_slice(&info_dw5.to_le_bytes());
+        }
 
         // INFO DW4: RTS/CTS protection
         if opts.flags.contains(TxFlags::PROTECT) {
