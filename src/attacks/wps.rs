@@ -295,6 +295,21 @@ impl Default for WpsStatus {
 //  WPS Attack Info — real-time state snapshot
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Tracks a completed or in-progress sub-attack for live view rendering.
+#[derive(Debug, Clone)]
+pub struct SubAttackInfo {
+    /// Sub-attack name: "Computed PINs", "Pixie Dust", "Null PIN", "Brute Force"
+    pub name: String,
+    /// Status: InProgress, Success, or a failure variant.
+    pub status: WpsStatus,
+    /// Short detail string: "no candidates", "timeout at M3", "rejected at M4", etc.
+    pub detail: String,
+    /// Duration of this sub-attack.
+    pub elapsed: Duration,
+    /// Whether this sub-attack is currently active (has spinner).
+    pub active: bool,
+}
+
 /// Real-time info snapshot for the CLI to render.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -328,6 +343,9 @@ pub struct WpsInfo {
     pub ap_model_number: String,
     pub ap_serial_number: String,
     pub ap_device_name: String,
+
+    // === Sub-attack tracking (for live active zone rendering) ===
+    pub sub_attacks: Vec<SubAttackInfo>,
 
     // === Results ===
     pub pin_found: Option<String>,
@@ -409,6 +427,7 @@ impl Default for WpsInfo {
             ap_model_number: String::new(),
             ap_serial_number: String::new(),
             ap_device_name: String::new(),
+            sub_attacks: Vec::new(),
             pin_found: None,
             psk_found: None,
             has_pixie_data: false,
@@ -1268,34 +1287,101 @@ fn run_wps_attack_single(
         WpsAttackType::Auto => {
             // Smart chain: ComputedPin → PixieDust → NullPin
             // Each step checks skip_attack + running + success before continuing.
+            // Sub-attack tracking: push to info.sub_attacks for live view rendering.
+
+            // Clear sub-attacks for this target
+            { info.lock().unwrap_or_else(|e| e.into_inner()).sub_attacks.clear(); }
+
+            // Helper: record a sub-attack start/end
+            let push_sub = |info: &Arc<Mutex<WpsInfo>>, name: &str, active: bool| {
+                let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+                i.sub_attacks.push(SubAttackInfo {
+                    name: name.to_string(),
+                    status: WpsStatus::InProgress,
+                    detail: String::new(),
+                    elapsed: Duration::ZERO,
+                    active,
+                });
+            };
+            let finish_sub = |info: &Arc<Mutex<WpsInfo>>, status: WpsStatus, detail: &str, elapsed: Duration| {
+                let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(last) = i.sub_attacks.last_mut() {
+                    last.status = status;
+                    last.detail = detail.to_string();
+                    last.elapsed = elapsed;
+                    last.active = false;
+                }
+            };
 
             // 1. Computed PINs
             skip_attack.store(false, Ordering::SeqCst);
+            push_sub(info, "Computed PINs", true);
+            let sub_start = Instant::now();
             run_computed_pins(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
                 target.capability, &target.supported_rates, &None);
+            let sub_elapsed = sub_start.elapsed();
 
-            if is_success() || !should_continue() {
-                if skip_attack.load(Ordering::SeqCst) {
-                    push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Computed PIN".to_string() });
-                }
+            let cur_status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
+            if skip_attack.load(Ordering::SeqCst) {
+                finish_sub(info, WpsStatus::Stopped, "skipped", sub_elapsed);
+                push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Computed PIN".to_string() });
+            } else if matches!(cur_status, WpsStatus::Success) {
+                finish_sub(info, WpsStatus::Success, "PIN matched!", sub_elapsed);
+            } else {
+                let detail = {
+                    let i = info.lock().unwrap_or_else(|e| e.into_inner());
+                    if i.pin_found.is_some() { "found".to_string() }
+                    else { "no candidates".to_string() }
+                };
+                finish_sub(info, WpsStatus::PinWrong, &detail, sub_elapsed);
             }
 
             // 2. Pixie Dust
             if !is_success() && should_continue() {
                 skip_attack.store(false, Ordering::SeqCst);
+                push_sub(info, "Pixie Dust", true);
+                let sub_start = Instant::now();
                 run_pixie_dust(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
                     target.capability, &target.supported_rates);
+                let sub_elapsed = sub_start.elapsed();
 
+                let cur_status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
                 if skip_attack.load(Ordering::SeqCst) {
+                    finish_sub(info, WpsStatus::Stopped, "skipped", sub_elapsed);
                     push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Pixie Dust".to_string() });
+                } else if matches!(cur_status, WpsStatus::Success) {
+                    finish_sub(info, WpsStatus::Success, "PIN cracked!", sub_elapsed);
+                } else {
+                    let phase = info.lock().unwrap_or_else(|e| e.into_inner()).phase;
+                    let detail = match phase {
+                        WpsPhase::PixieCracking | WpsPhase::Done => "no weak nonces".to_string(),
+                        _ => format!("timeout at {}", phase.short_label()),
+                    };
+                    let status = if matches!(cur_status, WpsStatus::PixieDataOnly) { WpsStatus::PixieDataOnly } else { cur_status };
+                    finish_sub(info, status, &detail, sub_elapsed);
                 }
             }
 
             // 3. Null PIN
             if !is_success() && should_continue() {
                 skip_attack.store(false, Ordering::SeqCst);
+                push_sub(info, "Null PIN", true);
+                let sub_start = Instant::now();
                 run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
                     target.capability, &target.supported_rates);
+                let sub_elapsed = sub_start.elapsed();
+
+                let cur_status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
+                if matches!(cur_status, WpsStatus::Success) {
+                    finish_sub(info, WpsStatus::Success, "PIN accepted!", sub_elapsed);
+                } else {
+                    let phase = info.lock().unwrap_or_else(|e| e.into_inner()).phase;
+                    let detail = match phase {
+                        WpsPhase::Done => "rejected".to_string(),
+                        _ => format!("failed at {}", phase.short_label()),
+                    };
+                    finish_sub(info, WpsStatus::PinWrong, &detail, sub_elapsed);
+                }
             }
         }
     }
