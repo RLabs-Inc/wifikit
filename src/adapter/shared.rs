@@ -98,6 +98,8 @@ struct SharedAdapterInner {
     adapter: Mutex<Adapter>,
     /// The FrameGate that receives all RX frames for downstream processing.
     gate: FrameGate,
+    /// The FrameStore for applying + broadcasting StoreUpdate deltas.
+    store: crate::store::FrameStore,
     /// Current channel the radio is tuned to (updated by set_channel).
     /// The RX thread reads this to tag frames with the correct channel.
     current_channel: AtomicU8,
@@ -143,6 +145,7 @@ impl SharedAdapter {
     pub fn spawn(
         info: &AdapterInfo,
         gate: FrameGate,
+        store: crate::store::FrameStore,
         mut on_status: impl FnMut(&str),
     ) -> Result<Self> {
         // 1. Open adapter (USB claim)
@@ -172,6 +175,7 @@ impl SharedAdapter {
             inner: Arc::new(SharedAdapterInner {
                 adapter: Mutex::new(adapter),
                 gate: gate.clone(),
+                store,
                 current_channel: AtomicU8::new(0),
                 current_band: AtomicU8::new(0),
                 locked_channel: AtomicU8::new(NO_CHANNEL_LOCK),
@@ -232,6 +236,15 @@ impl SharedAdapter {
     /// this gives access to individual frames as they arrive.
     pub fn subscribe(&self, label: &str) -> crate::pipeline::PipelineSubscriber {
         self.inner.gate.subscribe(label)
+    }
+
+    /// Emit StoreUpdate deltas into the unified delta stream.
+    ///
+    /// Applies deltas to the FrameStore and broadcasts to all update subscribers.
+    /// Used by attacks to push state (phase changes, events, counters) through
+    /// the same stream that frame-derived deltas flow through.
+    pub fn emit_updates(&self, deltas: Vec<crate::store::update::StoreUpdate>) {
+        self.inner.gate.emit_updates(&self.inner.store, deltas);
     }
 
     /// Get pipeline statistics snapshot.

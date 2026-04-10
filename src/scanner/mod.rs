@@ -19,6 +19,7 @@ use crate::core::channel::{Band, Channel};
 use crate::core::TxOptions;
 use crate::protocol::frames;
 use crate::store::FrameStore;
+use crate::store::update::StoreUpdate;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Channel lists for hopping
@@ -210,12 +211,10 @@ impl Scanner {
 
         self.running.store(true, Ordering::SeqCst);
         self.round.store(0, Ordering::SeqCst);
-        store.set_round(0);
-
-        // Clear stale channel stats from any previous scan (different adapter
-        // may have scanned different channels — e.g., MT7921 6GHz entries
-        // would persist when switching to RTL8812BU).
-        store.clear_channel_stats();
+        store.apply(&[
+            StoreUpdate::ScannerRoundComplete { round: 0 },
+            StoreUpdate::ChannelStatsCleared,
+        ]);
 
         // Use the driver's hardware MAC for TX frames (probe requests).
         // The randomized MAC (shared.mac()) hasn't been written to the hardware
@@ -237,7 +236,7 @@ impl Scanner {
                 if locked != 0 {
                     // Dwell on the locked channel without switching.
                     self.current_channel.store(locked, Ordering::SeqCst);
-                    store.set_current_channel(locked);
+                    store.apply(&[StoreUpdate::ScannerChannelChanged { channel: locked }]);
                     self.dwell();
                     continue;
                 }
@@ -250,16 +249,12 @@ impl Scanner {
                 };
 
                 // End dwell on previous channel (if any) before switching.
-                // This calculates per-channel FPS for the channel we're leaving.
                 {
                     let prev_ch = self.current_channel.load(Ordering::SeqCst);
                     if prev_ch != 0 {
-                        let prev_key = crate::store::stats::channel_key(prev_ch, prev_band_idx);
-                        store.with_channel_stats_mut(|stats| {
-                            if let Some(cs) = stats.get_mut(&prev_key) {
-                                cs.end_dwell();
-                            }
-                        });
+                        store.apply(&[StoreUpdate::ChannelDwellEnded {
+                            channel: prev_ch, band: prev_band_idx,
+                        }]);
                     }
                 }
 
@@ -269,19 +264,13 @@ impl Scanner {
                     continue;
                 }
                 self.current_channel.store(ch.number, Ordering::SeqCst);
-                store.set_current_channel(ch.number);
                 prev_band_idx = band_idx;
 
-                // Start dwell tracking on the new channel.
-                // Create the entry if it doesn't exist yet — this ensures
-                // frame_count_at_dwell_start is set BEFORE frames arrive,
-                // so FPS is accurate from the very first round.
-                let key = crate::store::stats::channel_key(ch.number, band_idx);
-                store.with_channel_stats_mut(|stats| {
-                    stats.entry(key)
-                        .or_insert_with(|| crate::store::stats::ChannelStats::new(ch.number, band_idx))
-                        .start_dwell();
-                });
+                // Emit channel change + start dwell on the new channel.
+                store.apply(&[
+                    StoreUpdate::ScannerChannelChanged { channel: ch.number },
+                    StoreUpdate::ChannelDwellStarted { channel: ch.number, band: band_idx },
+                ]);
 
                 // Wait for PHY to stabilize after channel switch.
                 // Settle time comes from the chipset — each adapter knows its PLL retune time.
@@ -310,7 +299,7 @@ impl Scanner {
 
             // Completed one full round through all channels.
             let completed = self.round.fetch_add(1, Ordering::SeqCst) + 1;
-            store.set_round(completed);
+            store.apply(&[StoreUpdate::ScannerRoundComplete { round: completed }]);
 
             // Check round limit (0 = infinite).
             if self.config.num_rounds > 0 && completed >= self.config.num_rounds {

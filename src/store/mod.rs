@@ -806,6 +806,25 @@ impl FrameStore {
                     self.set_round(*round);
                 }
 
+                // ── Scanner dwell tracking ────────────────────────────────
+                StoreUpdate::ChannelDwellStarted { channel, band } => {
+                    let key = stats::channel_key(*channel, *band);
+                    self.with_channel_stats_mut(|cs_map| {
+                        cs_map.entry(key)
+                            .or_insert_with(|| ChannelStats::new(*channel, *band))
+                            .start_dwell();
+                    });
+                }
+
+                StoreUpdate::ChannelDwellEnded { channel, band } => {
+                    let key = stats::channel_key(*channel, *band);
+                    self.with_channel_stats_mut(|cs_map| {
+                        if let Some(cs) = cs_map.get_mut(&key) {
+                            cs.end_dwell();
+                        }
+                    });
+                }
+
                 // ── Frame accounting ──────────────────────────────────────
                 StoreUpdate::FrameCounted { frame_count, eapol_frame_count, accounting } => {
                     // Update atomic counters to match extractor's tally

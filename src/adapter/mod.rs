@@ -165,6 +165,7 @@ impl AdapterManager {
         &mut self,
         index: usize,
         gate: FrameGate,
+        store: crate::store::FrameStore,
         on_status: impl FnMut(&str),
     ) -> Result<SharedAdapter> {
         let slot = self.slots.get_mut(index).ok_or_else(|| {
@@ -179,7 +180,7 @@ impl AdapterManager {
             return Ok(shared.clone());
         }
 
-        let shared = SharedAdapter::spawn(&slot.info, gate, on_status)?;
+        let shared = SharedAdapter::spawn(&slot.info, gate, store, on_status)?;
         slot.shared = Some(shared.clone());
         Ok(shared)
     }

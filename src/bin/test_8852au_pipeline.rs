@@ -55,7 +55,7 @@ fn main() {
     let gate = FrameGate::new(store.clone(), None);
 
     eprintln!("Opening {} via SharedAdapter::spawn...", info.name);
-    let shared = wifikit::adapter::SharedAdapter::spawn(&info, gate.clone(), |msg| {
+    let shared = wifikit::adapter::SharedAdapter::spawn(&info, gate.clone(), store.clone(), |msg| {
         eprintln!("  {}", msg);
     }).expect("spawn failed");
 

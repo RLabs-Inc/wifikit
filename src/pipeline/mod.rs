@@ -287,6 +287,20 @@ impl FrameGate {
         UpdateSubscriber::new(rx, label)
     }
 
+    /// Emit StoreUpdate deltas from any producer (attacks, scanner, adapter).
+    ///
+    /// Applies the deltas to the FrameStore and broadcasts them to all
+    /// update subscribers. This is the same path the pipeline thread uses
+    /// for frame-derived deltas — attacks and other producers use it to
+    /// push their state into the unified delta stream.
+    pub fn emit_updates(&self, store: &FrameStore, deltas: Vec<StoreUpdate>) {
+        if deltas.is_empty() { return; }
+        store.apply(&deltas);
+        let arc_deltas = Arc::new(deltas);
+        let mut usubs = self.inner.update_subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        usubs.retain(|tx| tx.send(Arc::clone(&arc_deltas)).is_ok());
+    }
+
     /// Get a snapshot of pipeline statistics.
     pub fn stats(&self) -> PipelineStatsSnapshot {
         self.inner.stats.snapshot()

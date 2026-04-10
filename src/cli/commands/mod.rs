@@ -159,7 +159,7 @@ impl<'a> Ctx<'a> {
         // Create FrameGate — the pipeline thread that parses RX frames and updates the store
         let gate = FrameGate::new(self.store.clone(), Some(pcap_path));
 
-        match self.manager.open_adapter(idx, gate, move |status| {
+        match self.manager.open_adapter(idx, gate, self.store.clone(), move |status| {
             if verbose {
                 layout_ref.print(&format!("    {} {}",
                     prism::s().dim().paint("\u{00b7}"),

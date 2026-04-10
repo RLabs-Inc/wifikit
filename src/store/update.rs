@@ -358,6 +358,18 @@ pub enum StoreUpdate {
     /// Channel stats cleared (new scan started).
     ChannelStatsCleared,
 
+    /// Dwell started on a channel (scanner just switched to it).
+    ChannelDwellStarted {
+        channel: u8,
+        band: u8,
+    },
+
+    /// Dwell ended on a channel (scanner is about to leave it).
+    ChannelDwellEnded {
+        channel: u8,
+        band: u8,
+    },
+
     // ═══════════════════════════════════════════════════════════════════
     //  Scanner engine state
     // ═══════════════════════════════════════════════════════════════════
