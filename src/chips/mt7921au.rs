@@ -476,6 +476,10 @@ const RX_BUF_SIZE: usize = 65536;
 const FW_ROM_PATCH: &str = "WIFI_MT7961_patch_mcu_1_2_hdr.bin";
 const FW_WM_RAM: &str = "WIFI_RAM_CODE_MT7961_1.bin";
 
+/// Embedded firmware — no external file I/O needed at runtime.
+const FW_ROM_PATCH_DATA: &[u8] = include_bytes!("runtime/firmware/WIFI_MT7961_patch_mcu_1_2_hdr.bin");
+const FW_WM_RAM_DATA: &[u8] = include_bytes!("runtime/firmware/WIFI_RAM_CODE_MT7961_1.bin");
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  Firmware binary structures
 // ══════════════════════════════════════════════════════════════════════════════
@@ -950,8 +954,9 @@ impl Mt7921au {
 
     /// Find the firmware directory containing MT7961 firmware files.
     fn find_firmware_dir() -> String {
-        // Check relative to our binary / project root first
+        // Check runtime directory first, then legacy location
         let candidates = [
+            "src/chips/runtime/firmware",
             "src/chips/firmware",
         ];
         for path in &candidates {
@@ -961,7 +966,7 @@ impl Mt7921au {
             }
         }
         // Default — will error at firmware load time
-        "src/chips/firmware".to_string()
+        "src/chips/runtime/firmware".to_string()
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -2434,12 +2439,7 @@ impl Mt7921au {
     /// Load ROM patch from file.
     /// Matches mt76_connac2_load_patch() from the kernel driver.
     fn load_patch(&mut self) -> Result<()> {
-        let path = format!("{}/{}", self.fw_dir, FW_ROM_PATCH);
-        let fw_data = std::fs::read(&path).map_err(|e| Error::ChipInitFailed {
-            chip: "MT7921AU".into(),
-            stage: crate::core::error::InitStage::FirmwareDownload,
-            reason: format!("failed to read ROM patch {}: {}", path, e),
-        })?;
+        let fw_data = FW_ROM_PATCH_DATA;
 
         if fw_data.len() < PATCH_HEADER_SIZE {
             return Err(Error::ChipInitFailed {
@@ -2509,12 +2509,7 @@ impl Mt7921au {
     /// Load WM RAM firmware from file.
     /// Matches mt76_connac2_load_ram() from the kernel driver.
     fn load_ram(&mut self) -> Result<()> {
-        let path = format!("{}/{}", self.fw_dir, FW_WM_RAM);
-        let fw_data = std::fs::read(&path).map_err(|e| Error::ChipInitFailed {
-            chip: "MT7921AU".into(),
-            stage: crate::core::error::InitStage::FirmwareDownload,
-            reason: format!("failed to read WM firmware {}: {}", path, e),
-        })?;
+        let fw_data = FW_WM_RAM_DATA;
 
         if fw_data.len() < FW_TRAILER_SIZE {
             return Err(Error::ChipInitFailed {

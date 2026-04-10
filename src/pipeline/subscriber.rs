@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::parsed_frame::ParsedFrame;
+use crate::store::update::StoreUpdate;
 
 /// A subscription to the parsed frame stream.
 ///
@@ -115,6 +116,63 @@ impl PipelineSubscriber {
                 Err(_) => return None,
             }
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UpdateSubscriber — receives semantic StoreUpdate deltas from the pipeline
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A subscription to the semantic delta stream.
+///
+/// Receives `Arc<Vec<StoreUpdate>>` — one batch per frame processed.
+/// Drop the subscriber to unsubscribe (the pipeline will clean up the dead sender).
+pub struct UpdateSubscriber {
+    receiver: mpsc::Receiver<Arc<Vec<StoreUpdate>>>,
+    label: String,
+}
+
+impl UpdateSubscriber {
+    /// Create a new subscriber. Called by FrameGate::subscribe_updates().
+    pub(crate) fn new(receiver: mpsc::Receiver<Arc<Vec<StoreUpdate>>>, label: &str) -> Self {
+        Self {
+            receiver,
+            label: label.to_string(),
+        }
+    }
+
+    /// The label for this subscriber (for debugging/stats).
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Try to receive a delta batch without blocking.
+    pub fn try_recv(&self) -> Option<Arc<Vec<StoreUpdate>>> {
+        self.receiver.try_recv().ok()
+    }
+
+    /// Receive a delta batch with timeout.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<Arc<Vec<StoreUpdate>>> {
+        self.receiver.recv_timeout(timeout).ok()
+    }
+
+    /// Drain all available delta batches without blocking.
+    pub fn drain(&self) -> Vec<Arc<Vec<StoreUpdate>>> {
+        let mut batches = Vec::new();
+        while let Ok(batch) = self.receiver.try_recv() {
+            batches.push(batch);
+        }
+        batches
+    }
+
+    /// Drain all available deltas, flattened into a single Vec.
+    /// Convenient for consumers that don't care about per-frame batching.
+    pub fn drain_flat(&self) -> Vec<StoreUpdate> {
+        let mut updates = Vec::new();
+        while let Ok(batch) = self.receiver.try_recv() {
+            updates.extend(batch.iter().cloned());
+        }
+        updates
     }
 }
 

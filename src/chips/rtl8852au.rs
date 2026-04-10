@@ -98,7 +98,6 @@ use crate::core::{
     adapter::UsbEndpoints,
 };
 
-use super::rtl8852a_post_boot;
 
 // ── Constants — hardware register map ──
 // Complete MAC AX register addresses, bit definitions, and protocol constants.
@@ -299,13 +298,6 @@ const MAC_AX_DMA_B0MG: u32 = 8;  // band 0 management
 const POLL_ITER_DELAY: Duration = Duration::from_micros(100);
 const FIRST_TX_DMA_CHECK_DELAY: Duration = Duration::from_millis(2);
 
-// ── Firmware search paths ──
-
-const FW_SEARCH_PATHS: &[&str] = &[
-    "rtl8852au_fw.bin",
-    "references/rtl8852au/rtl8852au_fw.bin",
-    "../wifikit/rtl8852au_fw.bin",
-];
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Channel list (same dual-band set as other Realtek chips)
@@ -2223,108 +2215,6 @@ impl Rtl8852au {
         Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed })
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Firmware download — from fwdl.c
-    // ══════════════════════════════════════════════════════════════════════════
-
-    fn load_firmware(&mut self) -> Result<()> {
-        // Find firmware file
-        let fw_data = self.find_firmware()?;
-
-        // Parse FW header
-        if fw_data.len() < FWHDR_HDR_LEN {
-            return Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::TooSmall });
-        }
-
-        let dw6 = u32::from_le_bytes([fw_data[24], fw_data[25], fw_data[26], fw_data[27]]);
-        let section_num = ((dw6 >> 8) & 0xFF) as usize;
-        let hdr_len = FWHDR_HDR_LEN + section_num * FWHDR_SECTION_LEN;
-
-        // Parse FW version
-        let major = fw_data[4];
-        let minor = fw_data[5];
-        let sub = fw_data[6];
-        self.fw_version = format!("{}.{}.{}", major, minor, sub);
-
-        // Parse section info
-        let mut sections: Vec<(u32, usize, usize)> = Vec::new(); // (dl_addr, offset, len)
-        let mut data_offset = hdr_len;
-        for i in 0..section_num {
-            let sh_off = FWHDR_HDR_LEN + i * FWHDR_SECTION_LEN;
-            let sec_dl_addr = u32::from_le_bytes([
-                fw_data[sh_off], fw_data[sh_off+1], fw_data[sh_off+2], fw_data[sh_off+3]
-            ]) & 0x1FFFFFFF;
-            let sec_dw1 = u32::from_le_bytes([
-                fw_data[sh_off+4], fw_data[sh_off+5], fw_data[sh_off+6], fw_data[sh_off+7]
-            ]);
-            let mut sec_size = (sec_dw1 & 0x00FFFFFF) as usize;
-            let has_checksum = (sec_dw1 >> 28) & 1 != 0;
-            if has_checksum {
-                sec_size += 8; // FWDL_SECTION_CHKSUM_LEN
-            }
-            sections.push((sec_dl_addr, data_offset, sec_size));
-            data_offset += sec_size;
-        }
-
-        // Modify FW header: set FW_PART_SZ to chunk size
-        let mut fw_hdr = fw_data[..hdr_len].to_vec();
-        let dw7 = u32::from_le_bytes([fw_hdr[28], fw_hdr[29], fw_hdr[30], fw_hdr[31]]);
-        let dw7_new = (dw7 & !0x0000FFFF) | (FWDL_SECTION_PER_PKT_LEN as u32 & 0xFFFF);
-        fw_hdr[28..32].copy_from_slice(&dw7_new.to_le_bytes());
-
-        // CPU enable + H2C path ready already done by dmac_pre_init_and_enable_cpu()
-        // Proceed directly to FW header download
-
-        // Step 4: Phase 1 — send FW header
-        self.fwdl_send_h2c(&fw_hdr)?;
-
-        // Wait for FWDL path ready
-        for i in 0..FWDL_WAIT_US {
-            let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
-            if ctrl & B_AX_FWDL_PATH_RDY != 0 {
-                break;
-            }
-            if i == FWDL_WAIT_US - 1 {
-                // FWDL path not ready — will fail at FW init check below
-                return Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed });
-            }
-            thread::sleep(Duration::from_micros(1));
-        }
-
-        self.write32(R_AX_HALT_H2C_CTRL, 0)?;
-        self.write32(R_AX_HALT_C2H_CTRL, 0)?;
-
-        // Step 5: Phase 2 — send FW sections
-        for &(_dl_addr, offset, size) in sections.iter() {
-            let section_data = &fw_data[offset..offset + size];
-            self.fwdl_send_section(section_data)?;
-        }
-
-        // Step 6: Wait for FW init ready
-        thread::sleep(Duration::from_millis(5));
-        for _ in 0..FWDL_WAIT_US {
-            let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
-            let sts = (ctrl >> B_AX_FWDL_STS_SH) & B_AX_FWDL_STS_MSK;
-            if sts == FWDL_WCPU_FW_INIT_RDY {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_micros(1));
-        }
-
-        let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
-        let sts = (ctrl >> B_AX_FWDL_STS_SH) & B_AX_FWDL_STS_MSK;
-        let reason = match sts {
-            0 => "INITIAL_STATE",
-            1 => "FWDL_ONGOING",
-            2 => "CHECKSUM_FAIL",
-            3 => "SECURITY_FAIL",
-            4 => "CUT_NOT_MATCH",
-            6 => "WCPU_FWDL_RDY (not FW_INIT_RDY)",
-            _ => "UNKNOWN",
-        };
-        Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed })
-    }
-
     fn disable_cpu(&self) -> Result<()> {
         // Clear WCPU_EN
         self.clear_bits32(R_AX_PLATFORM_ENABLE, B_AX_WCPU_EN)?;
@@ -2336,17 +2226,6 @@ impl Rtl8852au {
         self.clear_bits32(R_AX_PLATFORM_ENABLE, B_AX_PLATFORM_EN)?;
         self.set_bits32(R_AX_PLATFORM_ENABLE, B_AX_PLATFORM_EN)?;
         Ok(())
-    }
-
-    fn find_firmware(&self) -> Result<Vec<u8>> {
-        for path in FW_SEARCH_PATHS {
-            if let Ok(data) = fs::read(path) {
-                if data.len() > FWHDR_HDR_LEN {
-                    return Ok(data);
-                }
-            }
-        }
-        Err(Error::FirmwareError { chip: "RTL8852AU".into(), kind: crate::core::error::FirmwareErrorKind::DownloadFailed })
     }
 
     /// Send FW header via bulk OUT EP7 with H2C WD + H2C header prepended
@@ -3145,120 +3024,6 @@ impl Rtl8852au {
         Some((cat, class, func, payload))
     }
 
-    /// Extract the LAST ADDR_CAM MAC from the pcap sequence (without replaying).
-    /// The firmware's active MAC is the last ADDR_CAM written. Linux often sends
-    /// multiple ADDR_CAMs (CREATE station → CREATE monitor → CHANGE).
-    fn extract_pcap_addr_cam_mac(seq: &[rtl8852a_post_boot::PostBootOp]) -> Option<[u8; 6]> {
-        use rtl8852a_post_boot::PostBootOp;
-        let mut last_mac: Option<[u8; 6]> = None;
-        for op in seq {
-            if let PostBootOp::BulkOut(0x07, data) = op {
-                if let Some((cat, class, func, payload)) = Self::parse_h2c_from_pcap(data) {
-                    if cat == 1 && class == 6 && func == 0 && payload.len() >= 24 {
-                        let mac = [
-                            payload[16], payload[17], payload[18], payload[19],
-                            payload[20], payload[21],
-                        ];
-                        if mac != [0u8; 6] {
-                            last_mac = Some(mac);
-                        }
-                    }
-                }
-            }
-        }
-        last_mac
-    }
-
-    /// Replay a PostBootOp sequence from usbmon capture.
-    /// H2C commands get headers REBUILT with our seq counter + REC_ACK for confirmation.
-    /// Register ops and FWDL bulks are replayed verbatim.
-    fn replay_phase(&mut self, name: &str, seq: &[rtl8852a_post_boot::PostBootOp],
-                              skip_fw_bulk: bool) -> Result<()> {
-        use rtl8852a_post_boot::PostBootOp;
-
-        let mut read_ok = 0usize;
-        let mut write_ok = 0usize;
-        let mut write_fail = 0usize;
-        let mut bulk_ok = 0usize;
-        let mut bulk_fail = 0usize;
-        let mut bulk_skip = 0usize;
-        // ep7_count, reg_ops_since_last_bulk, h2c_sent removed — all EP7 bulk
-        // commands are now skipped during pcap replay (sent programmatically after).
-
-        for op in seq {
-            match op {
-                PostBootOp::Read(full_addr, width) => {
-
-                    let _ = if *full_addr > 0xFFFF {
-                        self.read32_ext(*full_addr).map(|_| ())
-                    } else {
-                        let addr = *full_addr as u16;
-                        match width {
-                            1 => self.read8(addr).map(|_| ()),
-                            2 => self.read16(addr).map(|_| ()),
-                            _ => self.read32(addr).map(|_| ()),
-                        }
-                    };
-                    read_ok += 1;
-                }
-                PostBootOp::Write(full_addr, val, width) => {
-
-                    let result = if *full_addr > 0xFFFF {
-                        self.write32_ext(*full_addr, *val)
-                    } else {
-                        let addr = *full_addr as u16;
-                        match width {
-                            1 => self.write8(addr, *val as u8),
-                            2 => self.write16(addr, *val as u16),
-                            _ => self.write32(addr, *val),
-                        }
-                    };
-                    if let Err(e) = result {
-                        if write_fail < 5 {
-                        }
-                        write_fail += 1;
-                    } else {
-                        write_ok += 1;
-                    }
-                }
-                PostBootOp::BulkOut(ep, data) => {
-                    // ── SKIP ALL EP7 (H2C) bulk commands from pcap replay ──
-                    // H2C commands contain firmware-instance-specific data: sequence numbers,
-                    // MAC addresses, role IDs, and calibration payloads from the capture machine.
-                    // Replaying them into a different firmware instance causes silent rejection —
-                    // the firmware ignores stale H2C and never enables TX DMA (SYS_CFG5=0).
-                    //
-                    // Register writes (EP0 control) are hardware-level and safe to replay.
-                    // After pcap replay, we send fresh programmatic H2C with correct seq numbers:
-                    //   FWROLE_MAINTAIN(CREATE) → ADDR_CAM(our MAC) → FWROLE_MAINTAIN(CHANGE)
-                    if *ep == 0x07 {
-                        bulk_skip += 1;
-                        continue;
-                    }
-
-                    let target_ep = self.ep_out;
-                    let timeout = Duration::from_millis(if data.len() > 1024 { 2000 } else { 500 });
-                    match self.handle.write_bulk(target_ep, data, timeout) {
-                        Ok(_) => {
-                            bulk_ok += 1;
-                        }
-                        Err(e) => {
-                            bulk_fail += 1;
-                            // Bulk write failed — non-fatal during replay
-                            let _ = self.handle.clear_halt(target_ep);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Debug: phase completion summary
-        let _ = (
-            name, read_ok, write_ok, write_fail, bulk_ok, bulk_fail, bulk_skip);
-
-        Ok(())
-    }
-
     fn chip_init(&mut self) -> Result<()> {
         // ══════════════════════════════════════════════════════════════════
         //  Pure pcap replay — usbmon IS the spec.
@@ -3328,69 +3093,25 @@ impl Rtl8852au {
         Ok(())
     }
 
-    /// Replay the complete init sequence from the working pcap capture.
+    /// Replay the complete init sequence from compiled-in pcap data.
+    /// No external file I/O — all operations are baked into the binary.
     /// Returns (reg_writes, reg_reads, ep7_sent, ep5_sent, h2c_seq).
     fn replay_pcap_init(&self) -> Result<(u32, u32, u32, u32, u16)> {
-        const PCAP_PATH: &str = "references/captures/rtl8852au_tx_20260404/usb3_gentle_tx.pcap";
-        const TARGET_BUS: u8 = 1;
-        const TARGET_DEV: u8 = 16;
+        use super::rtl8852a_init_ops::{INIT_SEQUENCE, UsbInitOp};
 
-        let pcap_data = fs::read(PCAP_PATH).map_err(|e| Error::ChipInitFailed {
-            chip: "RTL8852AU".into(),
-            stage: crate::core::error::InitStage::HardwareSetup,
-            reason: format!("pcap read: {}", e),
-        })?;
-
-        let mut offset = 24; // skip pcap global header
         let mut reg_writes = 0u32;
         let mut reg_reads = 0u32;
         let mut ep7_sent = 0u32;
         let mut ep7_fail = 0u32;
-        let mut ep5_sent = 0u32;
 
-        while offset + 16 <= pcap_data.len() {
-            let incl_len = u32::from_le_bytes([
-                pcap_data[offset + 8], pcap_data[offset + 9],
-                pcap_data[offset + 10], pcap_data[offset + 11],
-            ]) as usize;
-            offset += 16;
-
-            if offset + incl_len > pcap_data.len() || incl_len < 64 {
-                offset += incl_len;
-                continue;
-            }
-
-            let pkt = &pcap_data[offset..offset + incl_len];
-            offset += incl_len;
-
-            let pkt_type = pkt[8];
-            let xfer_type = pkt[9];
-            let ep = pkt[10];
-            let devnum = pkt[11];
-            let busnum = u16::from_le_bytes([pkt[12], pkt[13]]);
-            let ep_num = ep & 0x7F;
-            let ep_dir_in = ep & 0x80 != 0;
-            let payload = &pkt[64..];
-
-            if busnum != TARGET_BUS as u16 || devnum != TARGET_DEV || pkt_type != 0x53 {
-                continue;
-            }
-
-            // ── Register WRITE ──
-            if xfer_type == 2 && !ep_dir_in && !payload.is_empty() {
-                let setup = &pkt[40..48];
-                let (bm_req_type, b_req) = (setup[0], setup[1]);
-                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
-                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
-                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
-
-                if b_req == 0x05 && bm_req_type == 0x40 {
-                    let write_data = &payload[..std::cmp::min(w_len as usize, payload.len())];
-                    let addr = (w_idx as u32) << 16 | w_val as u32;
+        for op in INIT_SEQUENCE {
+            match op {
+                UsbInitOp::ControlWrite(w_val, w_idx, data) => {
+                    let addr = (*w_idx as u32) << 16 | *w_val as u32;
 
                     // Detect WCPU enable — firmware is booting, EP7 needs halt clearing
-                    if addr == 0x0088 && !write_data.is_empty() && (write_data[0] & 0x02) != 0 {
-                        let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
+                    if addr == 0x0088 && !data.is_empty() && (data[0] & 0x02) != 0 {
+                        let _ = self.handle.write_control(0x40, 0x05, *w_val, *w_idx, data, USB_BULK_TIMEOUT);
                         reg_writes += 1;
 
                         // Wait for firmware ready
@@ -3398,10 +3119,8 @@ impl Rtl8852au {
                             let ctrl = self.read8(R_AX_WCPU_FW_CTRL)?;
                             let fwdl_sts = (ctrl >> B_AX_FWDL_STS_SH) & B_AX_FWDL_STS_MSK;
                             if fwdl_sts == FWDL_WCPU_FW_INIT_RDY {
-                                // FW ready — proceed with EP7 halt clear
                                 break;
                             }
-                            // Also check H2C_PATH_RDY for FWDL phase
                             if ctrl & B_AX_H2C_PATH_RDY != 0 {
                                 break;
                             }
@@ -3413,80 +3132,60 @@ impl Rtl8852au {
                         continue;
                     }
 
-                    let _ = self.handle.write_control(0x40, 0x05, w_val, w_idx, write_data, USB_BULK_TIMEOUT);
+                    let _ = self.handle.write_control(0x40, 0x05, *w_val, *w_idx, data, USB_BULK_TIMEOUT);
                     reg_writes += 1;
                 }
-            }
-            // ── Register READ ──
-            else if xfer_type == 2 && ep_dir_in {
-                let setup = &pkt[40..48];
-                let (bm_req_type, b_req) = (setup[0], setup[1]);
-                let w_val = u16::from_le_bytes([setup[2], setup[3]]);
-                let w_idx = u16::from_le_bytes([setup[4], setup[5]]);
-                let w_len = u16::from_le_bytes([setup[6], setup[7]]);
-
-                if b_req == 0x05 && bm_req_type == 0xC0 {
-                    let mut buf = vec![0u8; w_len as usize];
-                    let _ = self.handle.read_control(0xC0, 0x05, w_val, w_idx, &mut buf, USB_BULK_TIMEOUT);
+                UsbInitOp::ControlRead(w_val, w_idx, w_len) => {
+                    let mut buf = vec![0u8; *w_len as usize];
+                    let _ = self.handle.read_control(0xC0, 0x05, *w_val, *w_idx, &mut buf, USB_BULK_TIMEOUT);
                     reg_reads += 1;
                 }
-            }
-            // ── EP7 bulk OUT (firmware + H2C) ──
-            else if xfer_type == 3 && !ep_dir_in && ep_num == 7 && !payload.is_empty() {
-                // Check if this is FWDL (DW0 has FWDL_EN = bit 20)
-                // FWDL DW0 = 0x001C0000 (CH_DMA=12<<16, FWDL_EN=1<<20)
-                // Post-FWDL H2C DW0 = 0x000C0000 (CH_DMA=12<<16, no FWDL_EN)
-                let is_fwdl = if payload.len() >= 4 {
-                    let dw0 = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    dw0 & AX_TXD_FWDL_EN != 0 // bit 20
-                } else {
-                    false
-                };
+                UsbInitOp::BulkOut(ep_num, data) => {
+                    if *ep_num != 7 || data.is_empty() {
+                        continue;
+                    }
 
-                if !is_fwdl {
-                    // Post-FWDL H2C: replay verbatim. Fresh firmware expects seq from 0.
-                    match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
-                        Ok(_) => { ep7_sent += 1; }
+                    // Check if this is FWDL (DW0 bit 20 = FWDL_EN)
+                    let is_fwdl = if data.len() >= 4 {
+                        let dw0 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                        dw0 & AX_TXD_FWDL_EN != 0
+                    } else {
+                        false
+                    };
+
+                    if !is_fwdl {
+                        // Post-FWDL H2C: replay verbatim
+                        match self.handle.write_bulk(self.ep_fw, data, Duration::from_secs(2)) {
+                            Ok(_) => { ep7_sent += 1; }
+                            Err(_) => {
+                                ep7_fail += 1;
+                                let _ = self.handle.clear_halt(self.ep_fw);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // FWDL chunk — replay with retry
+                    let result = match self.handle.write_bulk(self.ep_fw, data, Duration::from_secs(2)) {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            let _ = self.handle.clear_halt(self.ep_fw);
+                            thread::sleep(Duration::from_millis(50));
+                            self.handle.write_bulk(self.ep_fw, data, Duration::from_secs(2)).map(|_| ())
+                        }
+                    };
+                    match result {
+                        Ok(()) => ep7_sent += 1,
                         Err(_) => {
                             ep7_fail += 1;
                             let _ = self.handle.clear_halt(self.ep_fw);
                         }
                     }
-                    continue;
                 }
-
-                // FWDL chunk — replay verbatim
-                let result = match self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)) {
-                    Ok(_) => Ok(()),
-                    Err(_) => {
-                        let _ = self.handle.clear_halt(self.ep_fw);
-                        thread::sleep(Duration::from_millis(50));
-                        self.handle.write_bulk(self.ep_fw, payload, Duration::from_secs(2)).map(|_| ())
-                    }
-                };
-                match result {
-                    Ok(()) => ep7_sent += 1,
-                    Err(e) => {
-                        ep7_fail += 1;
-                        if ep7_fail <= 3 {
-                            // EP7 failure during pcap replay — non-fatal
-                        }
-                        let _ = self.handle.clear_halt(self.ep_fw);
-                    }
-                }
-            }
-            // ── EP5 bulk OUT (TX) — stop before first TX, init is complete ──
-            else if xfer_type == 3 && !ep_dir_in && ep_num == 5 && payload.len() > 48 {
-                // Init is done. Don't replay TX frames — our code handles TX.
-                break;
             }
         }
 
-        if ep7_fail > 0 {
-            // EP7 had failures — may cause H2C processing issues
-        }
-
-        Ok((reg_writes, reg_reads, ep7_sent, ep5_sent, 0u16))
+        Ok((reg_writes, reg_reads, ep7_sent, 0u32, 0u16))
     }
 
     fn recv_frame_internal(&mut self, timeout: Duration) -> Result<Option<RxFrame>> {

@@ -1350,8 +1350,10 @@ impl Rtl8852bu {
     /// Switch channel using pre-extracted register sequences (no pcap parsing).
     /// bw: 0=HT20, 1=HT40+, 2=HT40-, 3=VHT80
     pub fn set_channel_pcap(&mut self, ch: u8, bw: u8) -> Result<()> {
-        // Pre-extracted functions — direct register writes, zero file I/O
-        self.pcap_channel_switch(ch, bw)?;
+        // TODO: re-add pcap_channel_switch when 8852BU driver is working
+        // (rtl8852b_channel_switch.rs moved to references/unused-phases/)
+        let _ = (ch, bw);
+        return Err(Error::UnsupportedChip { vid: 0x0BDA, pid: 0xC832 });
         self.channel.store(ch, Ordering::Relaxed);
 
         // Re-apply promiscuous RX filter — channel switch was captured in monitor mode

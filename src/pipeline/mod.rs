@@ -25,8 +25,10 @@ use std::time::Instant;
 use crate::core::frame::RxFrame;
 use crate::core::parsed_frame::{self, ParsedFrame, FrameBody, DataPayload};
 use crate::store::FrameStore;
+use crate::store::update::StoreUpdate;
 
 pub use subscriber::PipelineSubscriber;
+pub use subscriber::UpdateSubscriber;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PCAP constants
@@ -170,8 +172,10 @@ pub struct FrameGate {
 struct FrameGateInner {
     /// Channel for submitting RxFrames to the pipeline thread.
     tx: mpsc::Sender<RxFrame>,
-    /// All active subscriber channels. Protected by mutex for subscribe/remove.
+    /// All active raw frame subscriber channels. Protected by mutex for subscribe/remove.
     subscribers: Mutex<Vec<mpsc::Sender<Arc<ParsedFrame>>>>,
+    /// All active delta subscriber channels. Receives semantic StoreUpdate deltas.
+    update_subscribers: Mutex<Vec<mpsc::Sender<Arc<Vec<StoreUpdate>>>>>,
     /// Pipeline statistics (atomic, lock-free reads).
     stats: PipelineStats,
     /// When the pipeline was created (for pcap timestamp calculation).
@@ -212,6 +216,7 @@ impl FrameGate {
         let inner = Arc::new(FrameGateInner {
             tx,
             subscribers: Mutex::new(Vec::new()),
+            update_subscribers: Mutex::new(Vec::new()),
             stats,
             start_time,
             pcap_path: pcap_path.clone(),
@@ -266,6 +271,20 @@ impl FrameGate {
         }
         self.inner.stats.subscriber_count.fetch_add(1, Ordering::Relaxed);
         PipelineSubscriber::new(rx, label)
+    }
+
+    /// Subscribe to the semantic delta stream.
+    ///
+    /// Returns an UpdateSubscriber that receives `Arc<Vec<StoreUpdate>>` batches.
+    /// Each batch contains all deltas produced from a single frame (or scanner event).
+    /// The channel is unbounded — it NEVER drops updates.
+    pub fn subscribe_updates(&self, label: &str) -> UpdateSubscriber {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut subs = self.inner.update_subscribers.lock().unwrap_or_else(|e| e.into_inner());
+            subs.push(tx);
+        }
+        UpdateSubscriber::new(rx, label)
     }
 
     /// Get a snapshot of pipeline statistics.
@@ -359,10 +378,22 @@ fn pipeline_thread(
             }
         }
 
-        // ── 4. Update the FrameStore ──
-        extractor::process_frame(&parsed, parsed.channel, parsed.band, &store);
+        // ── 4. Extract deltas + apply to the FrameStore ──
+        //
+        // The extractor produces semantic deltas from each frame.
+        // The store applies them (single write path for all state).
+        // The deltas are then broadcast to all update subscribers.
+        let deltas = extractor::extract_frame(&parsed, parsed.channel, parsed.band, &store);
+        store.apply(&deltas);
 
-        // ── 5. Broadcast to subscribers ──
+        // ── 5. Broadcast deltas to update subscribers ──
+        if !deltas.is_empty() {
+            let arc_deltas = Arc::new(deltas);
+            let mut usubs = inner.update_subscribers.lock().unwrap_or_else(|e| e.into_inner());
+            usubs.retain(|tx| tx.send(Arc::clone(&arc_deltas)).is_ok());
+        }
+
+        // ── 6. Broadcast raw frames to subscribers ──
         let arc_frame = Arc::new(parsed);
         {
             let mut subs = inner.subscribers.lock().unwrap_or_else(|e| e.into_inner());

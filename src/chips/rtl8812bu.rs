@@ -229,6 +229,7 @@ const FIRST_TX_DMA_CHECK_DELAY: Duration = Duration::from_millis(2);
 // ── Firmware search paths ──
 
 const FW_SEARCH_PATHS: &[&str] = &[
+    "src/chips/runtime/firmware/rtl8822bu_nic.bin",
     "rtl8822bu_nic.bin",
     "libwifikit/rtl8822bu_nic.bin",
     "../wifi-map/libwifikit/rtl8822bu_nic.bin",
