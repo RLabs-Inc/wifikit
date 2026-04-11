@@ -1315,6 +1315,26 @@ impl Rtl8812au {
         // DW5: RTY_LMT_EN + retry limit (same layout as RTL8812BU)
         buf[0x12] = (1 << 1) | ((retries as u8 & 0x3F) << 2); // RTY_LMT_EN[1] + DATA_RTY_LMT[7:2]
 
+        // DW3: RTS/CTS protection (byte 0x0D)
+        // RTS_ENABLE = DW3[12], HW_RTS_ENABLE = DW3[13] → byte 0x0D bits 4,5
+        if opts.flags.contains(TxFlags::PROTECT) {
+            buf[0x0D] |= (1 << 4)                     // RTS_ENABLE
+                       | (1 << 5);                     // HW_RTS_ENABLE
+            // RTS_RATE = DW4[28:24] → byte 0x13 bits [4:0]
+            // Use OFDM 6M (0x04) for RTS — robust + universally understood
+            buf[0x13] = 0x04;
+        }
+
+        // DW5: DATA_BW + DATA_SHORT + DATA_SC (byte 0x14)
+        // DATA_SC[3:0] = sub-channel, DATA_BW[6:5] = bandwidth, DATA_SHORT[7] = short GI
+        let bw = (opts.bw as u8).min(2); // 0=20MHz, 1=40MHz, 2=80MHz
+        if bw > 0 {
+            buf[0x14] |= (bw & 0x03) << 5;            // DATA_BW [6:5]
+        }
+        if opts.gi > 0 {
+            buf[0x14] |= 1 << 7;                       // DATA_SHORT (short GI)
+        }
+
         // DW5: STBC + LDPC (byte 0x17)
         if opts.flags.contains(TxFlags::STBC) {
             buf[0x17] |= 1 << 4; // DATA_STBC = 1 (single stream)
@@ -1519,7 +1539,30 @@ impl ChipDriver for Rtl8812au {
         20
     }
 
-    fn set_tx_power(&mut self, _dbm: i8) -> Result<()> {
+    fn set_tx_power(&mut self, dbm: i8) -> Result<()> {
+        // Jaguar 1 TXAGC: 0.5 dBm per index unit, max 0x3F (31.5 dBm).
+        // Path A: 0xC20-0xC3C, Path B: 0xE20-0xE3C (8 regs × 4 rates each).
+        // Registers: CCK[0xC20-0xC24], OFDM[0xC28-0xC2C], HT[0xC30-0xC34], VHT[0xC38-0xC3C]
+        let idx = if dbm <= 0 {
+            0x3F // Max power (hardware-limited by PA)
+        } else {
+            ((dbm as u16) * 2).min(0x3F) as u8
+        };
+
+        let pw4 = (idx as u32) * 0x01010101; // Same index for all 4 rates in register
+        let vht4 = (idx.saturating_sub(4) as u32) * 0x01010101; // VHT: -2dBm for PA linearity
+
+        for &base in &[0xC20u16, 0xE20] {
+            // CCK + OFDM + HT: full power
+            for offset in 0..6 {
+                self.write32(base + offset * 4, pw4)?;
+            }
+            // VHT: reduced for PA linearity
+            for offset in 6..8 {
+                self.write32(base + offset * 4, vht4)?;
+            }
+        }
+
         Ok(())
     }
 

@@ -43,9 +43,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
+use crate::attacks::next_attack_id;
 use crate::core::{EventRing, MacAddress, TxOptions};
-use crate::core::frame::{TxFlags, TxRate};
+use crate::core::chip::ChipCaps;
 use crate::store::{Ap, Station};
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::frames;
 use crate::protocol::ieee80211::{
     ReasonCode, StatusCode, auth_algo, cap_info, fc, fc_flags,
@@ -254,6 +258,19 @@ pub enum DosPhase {
     Cooldown,
     /// Attack completed or stopped.
     Done,
+}
+
+impl DosPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::ChannelLock => AttackPhase { label: "ChannelLock", is_active: true, is_terminal: false },
+            Self::Flooding => AttackPhase { label: "Flooding", is_active: true, is_terminal: false },
+            Self::Cooldown => AttackPhase { label: "Cooldown", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
+    }
 }
 
 impl Default for DosPhase {
@@ -557,67 +574,77 @@ fn run_dos_attack(
     let our_mac = shared.mac();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
+
+    // Emit AttackStarted into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackStarted {
+        id: attack_id,
+        attack_type: AttackType::Dos,
+        target_bssid: target.bssid,
+        target_ssid: target.ssid.clone(),
+        target_channel: target.channel,
+    }]);
 
     // Fire attack started event
-    push_event(events, start, DosEventKind::AttackStarted {
+    push_event(shared, events, start, DosEventKind::AttackStarted {
         attack_type: params.attack_type,
         bssid: target.bssid,
         ssid: target.ssid.clone(),
         channel: target.channel,
         station: target_station,
-    });
+    }, attack_id);
 
     // Lock channel to target's channel
     if let Err(e) = shared.lock_channel(target.channel, "dos") {
-        push_event(events, start, DosEventKind::Error {
+        push_event(shared, events, start, DosEventKind::Error {
             message: format!("Failed to lock channel {}: {}", target.channel, e),
-        });
+        }, attack_id);
         {
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
             info.stop_reason = Some(StopReason::ChannelError);
         }
-        push_event(events, start, DosEventKind::AttackComplete {
+        push_event(shared, events, start, DosEventKind::AttackComplete {
             frames_sent: 0,
             elapsed: start.elapsed(),
             reason: StopReason::ChannelError,
-        });
+        }, attack_id);
+        // Emit AttackComplete for early exit
+        shared.emit_updates(vec![StoreUpdate::AttackComplete {
+            id: attack_id,
+            attack_type: AttackType::Dos,
+            result: AttackResult::Dos {
+                frames_sent: 0,
+                stop_reason: StopReason::ChannelError,
+            },
+        }]);
         return;
     }
-    push_event(events, start, DosEventKind::ChannelLocked { channel: target.channel });
+    push_event(shared, events, start, DosEventKind::ChannelLocked { channel: target.channel }, attack_id);
 
     // Channel settle — wait for PLL lock + AGC
     thread::sleep(params.channel_settle);
 
     // Update phase to flooding
-    {
-        let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-        info.phase = DosPhase::Flooding;
-    }
-    push_event(events, start, DosEventKind::FloodingStarted);
+    update_phase(shared, info, DosPhase::Flooding, attack_id);
+    push_event(shared, events, start, DosEventKind::FloodingStarted, attack_id);
 
-    // TX options: optimized for maximum range and reliability
-    //
-    // Deauth/disassoc are management frames — use the most robust modulation:
-    //   - 2.4GHz: CCK 1Mbps (~6dB better sensitivity than OFDM 6M, ~100m more range)
-    //   - 5GHz: OFDM 6Mbps (mandatory minimum, best sensitivity in OFDM)
-    // LDPC: ~0.5-1dB coding gain at low SNR (helps at range limit)
-    // STBC: ~3dB diversity gain on 2x2 adapters (two copies of the same data)
-    // NO_ACK: deauth frames are broadcast-class, no ACK expected
-    // NO_RETRY: firmware won't retry without ACK anyway; we handle retries
-    //   via burst repetition instead (entire burst repeats each loop iteration)
-    let is_2ghz = target.channel <= 14;
-    let tx_opts = TxOptions {
-        rate: if is_2ghz { TxRate::Cck1m } else { TxRate::Ofdm6m },
-        retries: 0,
-        flags: TxFlags::NO_ACK | TxFlags::NO_RETRY | TxFlags::LDPC | TxFlags::STBC,
-        ..Default::default()
-    };
+    // TX options: maximum range + channel clearing
+    //   - CCK 1M on 2.4GHz, HE_EXT_SU MCS0 on 5/6GHz (WiFi 6), OFDM 6M fallback
+    //   - LDPC + STBC for coding/diversity gain
+    //   - PROTECT (RTS/CTS) clears channel before deauth — forces NAV on all STAs
+    //   - NO_ACK: broadcast-class, retries handled by burst repetition
+    let has_he = shared.caps().contains(ChipCaps::HE);
+    let tx_opts = TxOptions::max_range_noack(target.channel, has_he);
 
     // Rate tracking: snapshot every second
     let mut rate_start = Instant::now();
     let mut rate_checkpoint: u64 = 0;
     let mut frames_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
+    // Track time spent in burst pause (listen window) so fps excludes it.
+    // Frame interval pacing (1ms between frames) IS included — that's real throughput.
+    // Burst pause (2s listen window in deauth mode) is NOT included — that's waiting.
+    let mut pause_time_in_window = Duration::ZERO;
 
     // Simple RNG state for random MACs and SSIDs
     let mut rng_state: u32 = (start.elapsed().as_nanos() as u32) ^ 0xDEAD_BEEF;
@@ -636,22 +663,22 @@ fn run_dos_attack(
         // Check duration limit
         if params.duration > Duration::ZERO && start.elapsed() >= params.duration {
             store_final_result(info, params, target, frames_sent, bytes_sent, start, StopReason::DurationReached);
-            push_event(events, start, DosEventKind::AttackComplete {
+            push_event(shared, events, start, DosEventKind::AttackComplete {
                 frames_sent,
                 elapsed: start.elapsed(),
                 reason: StopReason::DurationReached,
-            });
+            }, attack_id);
             break;
         }
 
         // Check frame count limit
         if params.max_frames > 0 && frames_sent >= params.max_frames {
             store_final_result(info, params, target, frames_sent, bytes_sent, start, StopReason::FrameCountReached);
-            push_event(events, start, DosEventKind::AttackComplete {
+            push_event(shared, events, start, DosEventKind::AttackComplete {
                 frames_sent,
                 elapsed: start.elapsed(),
                 reason: StopReason::FrameCountReached,
-            });
+            }, attack_id);
             break;
         }
 
@@ -717,9 +744,13 @@ fn run_dos_attack(
         let rate_elapsed = rate_start.elapsed();
         if rate_elapsed >= Duration::from_secs(1) {
             let delta = frames_sent - rate_checkpoint;
-            let fps = delta as f64 / rate_elapsed.as_secs_f64();
+            // Exclude burst pause time (listen windows) from fps calculation.
+            // Frame interval pacing (1ms) is kept — it's real throughput.
+            let active_secs = rate_elapsed.saturating_sub(pause_time_in_window).as_secs_f64();
+            let fps = if active_secs > 0.0001 { delta as f64 / active_secs } else { 0.0 };
             rate_checkpoint = frames_sent;
             rate_start = Instant::now();
+            pause_time_in_window = Duration::ZERO;
 
             // Update info
             {
@@ -732,12 +763,15 @@ fn run_dos_attack(
             }
 
             // Fire rate snapshot event
-            push_event(events, start, DosEventKind::RateSnapshot {
+            push_event(shared, events, start, DosEventKind::RateSnapshot {
                 frames_sent,
                 frames_per_sec: fps,
                 elapsed: start.elapsed(),
                 bytes_sent,
-            });
+            }, attack_id);
+
+            // Emit batched counters into the delta stream (~1x/sec)
+            emit_counters(shared, attack_id, info, start, &tx_fb);
         }
 
         // Track frames in current burst
@@ -755,11 +789,11 @@ fn run_dos_attack(
                 info.elapsed = start.elapsed();
             }
 
-            push_event(events, start, DosEventKind::BurstPause {
+            push_event(shared, events, start, DosEventKind::BurstPause {
                 burst_num,
                 frames_in_burst,
                 pause_secs: params.burst_pause.as_secs_f64(),
-            });
+            }, attack_id);
 
             // Pause — check running flag every 100ms so Ctrl+C is responsive
             // Drain RX frames during pause — capture handshakes from reconnecting clients
@@ -771,7 +805,7 @@ fn run_dos_attack(
                 }
                 thread::sleep(Duration::from_millis(100));
             }
-
+            pause_time_in_window += pause_start.elapsed();
             frames_in_burst = 0;
         } else {
             // Normal frame interval
@@ -779,14 +813,22 @@ fn run_dos_attack(
         }
     }
 
+    // Determine the stop reason for this run
+    let stop_reason = if !running.load(Ordering::SeqCst) {
+        Some(StopReason::UserStopped)
+    } else {
+        // Already handled by the break above (DurationReached or FrameCountReached)
+        None
+    };
+
     // If we exited because running was set to false (user stop), fire event
-    if !running.load(Ordering::SeqCst) {
-        store_final_result(info, params, target, frames_sent, bytes_sent, start, StopReason::UserStopped);
-        push_event(events, start, DosEventKind::AttackComplete {
+    if let Some(reason) = stop_reason {
+        store_final_result(info, params, target, frames_sent, bytes_sent, start, reason);
+        push_event(shared, events, start, DosEventKind::AttackComplete {
             frames_sent,
             elapsed: start.elapsed(),
-            reason: StopReason::UserStopped,
-        });
+            reason,
+        }, attack_id);
     }
 
     // Final info update
@@ -802,15 +844,15 @@ fn run_dos_attack(
     // Clients deauthed near the end need time to complete auth→assoc→EAPOL.
     // The scanner is still running on the locked channel, capturing everything.
     if params.cooldown > Duration::ZERO {
+        update_phase(shared, info, DosPhase::Cooldown, attack_id);
         {
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-            info.phase = DosPhase::Cooldown;
             info.cooldown_start = Some(Instant::now());
             info.cooldown_duration = params.cooldown;
         }
-        push_event(events, start, DosEventKind::CooldownStarted {
+        push_event(shared, events, start, DosEventKind::CooldownStarted {
             duration_secs: params.cooldown.as_secs_f64(),
-        });
+        }, attack_id);
 
         let cooldown_start = Instant::now();
         while cooldown_start.elapsed() < params.cooldown {
@@ -823,9 +865,28 @@ fn run_dos_attack(
         }
     }
 
+    // Emit final counters before completing
+    emit_counters(shared, attack_id, info, start, &tx_fb);
+
     // Unlock channel — scanner resumes hopping
     shared.unlock_channel();
-    push_event(events, start, DosEventKind::ChannelUnlocked);
+    push_event(shared, events, start, DosEventKind::ChannelUnlocked, attack_id);
+
+    // Determine the final stop reason for AttackComplete
+    let final_reason = {
+        let info = info.lock().unwrap_or_else(|e| e.into_inner());
+        info.stop_reason.unwrap_or(StopReason::UserStopped)
+    };
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Dos,
+        result: AttackResult::Dos {
+            frames_sent,
+            stop_reason: final_reason,
+        },
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1165,13 +1226,65 @@ fn store_final_result(
 }
 
 /// Push an event to the ring buffer with automatic seq + timestamp.
-fn push_event(events: &Arc<EventRing<DosEvent>>, start: Instant, kind: DosEventKind) {
+/// Also emits into the delta stream via SharedAdapter.
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<DosEvent>>,
+    start: Instant,
+    kind: DosEventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(DosEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Dos(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(DosEvent { seq, timestamp, kind });
+}
+
+/// Emit phase change into the delta stream and update legacy Info struct.
+fn update_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<DosInfo>>,
+    phase: DosPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
+    let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+    info.phase = phase;
+    info.elapsed = info.start_time.elapsed();
+}
+
+/// Emit batched counter update into the delta stream.
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<DosInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1722,13 +1835,13 @@ mod tests {
         assert_eq!(info.frames_per_sec, 0.0);
     }
 
-    // ── push_event test ──
+    // ── EventRing tests ──
 
     #[test]
-    fn test_push_event() {
+    fn test_event_ring_push() {
         let events = Arc::new(EventRing::<DosEvent>::new(64));
         let start = Instant::now();
-        push_event(&events, start, DosEventKind::FloodingStarted);
+        events.push(DosEvent { seq: 1, timestamp: start.elapsed(), kind: DosEventKind::FloodingStarted });
         let drained = events.drain();
         assert_eq!(drained.len(), 1);
         match &drained[0].kind {
@@ -1738,13 +1851,17 @@ mod tests {
     }
 
     #[test]
-    fn test_push_event_attack_complete() {
+    fn test_event_ring_attack_complete() {
         let events = Arc::new(EventRing::<DosEvent>::new(64));
         let start = Instant::now();
-        push_event(&events, start, DosEventKind::AttackComplete {
-            frames_sent: 42000,
-            elapsed: Duration::from_secs(10),
-            reason: StopReason::UserStopped,
+        events.push(DosEvent {
+            seq: 1,
+            timestamp: start.elapsed(),
+            kind: DosEventKind::AttackComplete {
+                frames_sent: 42000,
+                elapsed: Duration::from_secs(10),
+                reason: StopReason::UserStopped,
+            },
         });
         let drained = events.drain();
         assert_eq!(drained.len(), 1);

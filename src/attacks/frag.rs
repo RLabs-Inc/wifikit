@@ -36,9 +36,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
+use crate::attacks::next_attack_id;
 use crate::core::{EventRing, MacAddress, TxOptions};
-use crate::core::frame::TxFlags;
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  FragAttacks Variant — one per CVE
@@ -322,6 +326,20 @@ pub enum FragPhase {
 impl Default for FragPhase {
     fn default() -> Self {
         Self::Idle
+    }
+}
+
+impl FragPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::ChannelLock => AttackPhase { label: "ChannelLock", is_active: true, is_terminal: false },
+            Self::MitmSetup => AttackPhase { label: "MitmSetup", is_active: true, is_terminal: false },
+            Self::Injecting => AttackPhase { label: "Injecting", is_active: true, is_terminal: false },
+            Self::Monitoring => AttackPhase { label: "Monitoring", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
     }
 }
 
@@ -674,22 +692,34 @@ fn run_frag_attack(
     running: &Arc<AtomicBool>,
 ) {
     let start = Instant::now();
+    let mut wait_time = Duration::ZERO;
     let our_mac = shared.mac();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
 
-    push_event(events, start, FragEventKind::SuiteStarted {
+    // Emit AttackStarted delta
+    shared.emit_updates(vec![StoreUpdate::AttackStarted {
+        id: attack_id,
+        attack_type: AttackType::Frag,
+        target_bssid: target.bssid,
+        target_ssid: target.ssid.clone(),
+        target_channel: target.channel,
+    }]);
+
+    push_event(shared, events, start, FragEventKind::SuiteStarted {
         bssid: target.bssid,
         ssid: target.ssid.clone(),
         channel: target.channel,
         variant_count: variants.len() as u32,
-    });
+    }, attack_id);
 
     // Lock channel to target's channel
+    update_phase(shared, info, FragPhase::ChannelLock, attack_id);
     if let Err(e) = shared.lock_channel(target.channel, "frag") {
-        push_event(events, start, FragEventKind::Error {
+        push_event(shared, events, start, FragEventKind::Error {
             message: format!("channel lock to ch{} failed: {e}", target.channel),
-        });
+        }, attack_id);
         // Mark all as Error
         {
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -701,10 +731,11 @@ fn run_frag_attack(
         return;
     }
 
-    push_event(events, start, FragEventKind::ChannelLocked {
+    push_event(shared, events, start, FragEventKind::ChannelLocked {
         channel: target.channel,
-    });
+    }, attack_id);
     thread::sleep(params.channel_settle);
+    wait_time += params.channel_settle;
 
     let mut total_tested: u32 = 0;
     let mut total_vulnerable: u32 = 0;
@@ -728,20 +759,20 @@ fn run_frag_attack(
             info.elapsed = start.elapsed();
         }
 
-        push_event(events, start, FragEventKind::TestStarted {
+        push_event(shared, events, start, FragEventKind::TestStarted {
             variant: *variant,
             index: idx as u32 + 1,
             total: variants.len() as u32,
-        });
+        }, attack_id);
 
         // Skip MitM-required tests if skip_unsupported is set
         // (MitM engine not yet implemented — dual adapter required)
         if variant.requires_mitm() && params.skip_unsupported {
             let reason = "requires MitM (dual adapter + CSA relay) — not yet implemented".to_string();
-            push_event(events, start, FragEventKind::TestSkipped {
+            push_event(shared, events, start, FragEventKind::TestSkipped {
                 variant: *variant,
                 reason: reason.clone(),
-            });
+            }, attack_id);
 
             total_skipped += 1;
             {
@@ -753,21 +784,22 @@ fn run_frag_attack(
                 }
             }
 
-            push_event(events, start, FragEventKind::TestComplete {
+            push_event(shared, events, start, FragEventKind::TestComplete {
                 variant: *variant,
                 verdict: FragVerdict::Skipped,
                 frames_sent: 0,
                 response_time_ms: 0,
                 elapsed_ms: 0,
-            });
+            }, attack_id);
             continue;
         }
 
         // Run the individual test
-        let result = run_single_test(
+        let (result, test_wait) = run_single_test(
             shared, reader, target, *variant, params, &our_mac,
-            info, events, running, start,
+            info, events, running, start, attack_id,
         );
+        wait_time += test_wait;
 
         match result.verdict {
             FragVerdict::Vulnerable => total_vulnerable += 1,
@@ -787,13 +819,16 @@ fn run_frag_attack(
             }
         }
 
-        push_event(events, start, FragEventKind::TestComplete {
+        push_event(shared, events, start, FragEventKind::TestComplete {
             variant: *variant,
             verdict: result.verdict,
             frames_sent: result.frames_sent,
             response_time_ms: result.response_time_ms,
             elapsed_ms: result.elapsed.as_millis() as u64,
-        });
+        }, attack_id);
+
+        // Emit counters after each variant (natural batch point)
+        emit_counters(shared, attack_id, info, start, &tx_fb);
 
         // Stop on first vuln if configured
         if params.stop_on_first_vuln && result.verdict == FragVerdict::Vulnerable {
@@ -803,27 +838,45 @@ fn run_frag_attack(
 
     // Unlock channel
     shared.unlock_channel();
-    push_event(events, start, FragEventKind::ChannelUnlocked);
+    push_event(shared, events, start, FragEventKind::ChannelUnlocked, attack_id);
 
     let elapsed = start.elapsed();
-    push_event(events, start, FragEventKind::SuiteComplete {
+    push_event(shared, events, start, FragEventKind::SuiteComplete {
         tested: total_tested,
         vulnerable: total_vulnerable,
         skipped: total_skipped,
         total: variants.len() as u32,
         elapsed,
-    });
+    }, attack_id);
 
     // Final info update
     {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.elapsed = elapsed;
-        let secs = elapsed.as_secs_f64();
-        if secs > 0.0 {
-            info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
+        let active_secs = elapsed.saturating_sub(wait_time).as_secs_f64();
+        if active_secs > 0.0 {
+            info.frames_per_sec =
+                (info.frames_sent + info.frames_received) as f64 / active_secs;
         }
         info.tx_feedback = tx_fb.snapshot();
     }
+
+    // Collect final results for AttackComplete
+    let final_results = {
+        let info = info.lock().unwrap_or_else(|e| e.into_inner());
+        info.results.clone()
+    };
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Frag,
+        result: AttackResult::Frag {
+            tested: total_tested,
+            vulnerable: total_vulnerable,
+            results: final_results,
+        },
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -841,10 +894,12 @@ fn run_single_test(
     events: &Arc<EventRing<FragEvent>>,
     running: &Arc<AtomicBool>,
     attack_start: Instant,
-) -> FragTestResult {
+    attack_id: AttackId,
+) -> (FragTestResult, Duration) {
     let test_start = Instant::now();
     let tx_fb = shared.tx_feedback();
     let mut result = FragTestResult::new(variant);
+    let mut wait_time = Duration::ZERO;
     result.verdict = FragVerdict::Testing;
 
     // Each variant crafts specific frames and monitors for response
@@ -853,54 +908,54 @@ fn run_single_test(
             result.verdict = FragVerdict::NotVulnerable;
             result.detail = "stopped".to_string();
             result.elapsed = test_start.elapsed();
-            return result;
+            return (result, wait_time);
         }
 
         if retry > 0 {
-            push_event(events, attack_start, FragEventKind::RetryingTest {
+            push_event(shared, events, attack_start, FragEventKind::RetryingTest {
                 variant,
                 retry,
                 max_retries: params.retry_count,
-            });
+            }, attack_id);
             thread::sleep(params.retry_delay);
+            wait_time += params.retry_delay;
         }
 
         result.retries = retry;
 
+        update_phase(shared, info, FragPhase::Injecting, attack_id);
         {
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-            info.phase = FragPhase::Injecting;
             info.current_retry = retry;
         }
 
         // Craft and inject the test frames
-        let frames_sent = inject_test_frames(
+        let (frames_sent, inject_wait) = inject_test_frames(
             shared, target, variant, params, our_mac,
-            info, events, attack_start,
+            info, events, attack_start, attack_id,
         );
         result.frames_sent += frames_sent;
+        wait_time += inject_wait;
 
-        push_event(events, attack_start, FragEventKind::FramesInjected {
+        push_event(shared, events, attack_start, FragEventKind::FramesInjected {
             variant,
             count: frames_sent,
             retry,
-        });
+        }, attack_id);
 
         // Monitor for response
-        {
-            let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-            info.phase = FragPhase::Monitoring;
-        }
+        update_phase(shared, info, FragPhase::Monitoring, attack_id);
 
-        push_event(events, attack_start, FragEventKind::MonitoringResponse {
+        push_event(shared, events, attack_start, FragEventKind::MonitoringResponse {
             variant,
             timeout_ms: params.response_wait.as_millis() as u64,
-        });
+        }, attack_id);
 
         let monitor_start = Instant::now();
         match monitor_response(reader, target, variant, params, running, info) {
             Some(received_count) => {
                 let response_time = monitor_start.elapsed();
+                wait_time += response_time;
                 result.verdict = FragVerdict::Vulnerable;
                 result.response_time_ms = response_time.as_millis() as u64;
                 result.frames_received += received_count;
@@ -909,10 +964,10 @@ fn run_single_test(
                     result.response_time_ms
                 );
 
-                push_event(events, attack_start, FragEventKind::ResponseReceived {
+                push_event(shared, events, attack_start, FragEventKind::ResponseReceived {
                     variant,
                     response_time_ms: result.response_time_ms,
-                });
+                }, attack_id);
 
                 // Update global counters
                 {
@@ -923,10 +978,11 @@ fn run_single_test(
                 }
 
                 result.elapsed = test_start.elapsed();
-                return result;
+                return (result, wait_time);
             }
             None => {
                 // No response — continue retrying
+                wait_time += monitor_start.elapsed();
                 result.frames_received = 0;
             }
         }
@@ -948,7 +1004,7 @@ fn run_single_test(
         info.tx_feedback = tx_fb.snapshot();
     }
 
-    result
+    (result, wait_time)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -965,13 +1021,12 @@ fn inject_test_frames(
     info: &Arc<Mutex<FragInfo>>,
     events: &Arc<EventRing<FragEvent>>,
     attack_start: Instant,
-) -> u64 {
+    attack_id: AttackId,
+) -> (u64, Duration) {
     let mut sent: u64 = 0;
+    let mut wait_time = Duration::ZERO;
     let bssid = &target.bssid;
-    let tx_opts = TxOptions {
-        flags: TxFlags::NO_ACK,
-        ..TxOptions::default()
-    };
+    let tx_opts = TxOptions::injection(shared.current_channel(), shared.caps().contains(ChipCaps::HE));
 
     match variant {
         FragVariant::PlaintextFull => {
@@ -995,6 +1050,7 @@ fn inject_test_frames(
                 sent += 1;
                 if params.fragment_delay > Duration::ZERO {
                     thread::sleep(params.fragment_delay);
+                    wait_time += params.fragment_delay;
                 }
             }
         }
@@ -1062,6 +1118,7 @@ fn inject_test_frames(
                 sent += 1;
                 if params.fragment_delay > Duration::ZERO {
                     thread::sleep(params.fragment_delay);
+                    wait_time += params.fragment_delay;
                 }
             }
         }
@@ -1080,6 +1137,7 @@ fn inject_test_frames(
                 sent += 1;
                 if params.fragment_delay > Duration::ZERO {
                     thread::sleep(params.fragment_delay);
+                    wait_time += params.fragment_delay;
                 }
             }
         }
@@ -1091,9 +1149,9 @@ fn inject_test_frames(
             // AmsduInject: intercept frame, flip QoS bit 7, craft A-MSDU subframes
             // MixedKey: inject frag under old key, trigger rekey, verify reassembly
             // CacheAttack: inject frag, trigger reconnect, monitor cache behavior
-            push_event(events, attack_start, FragEventKind::Error {
+            push_event(shared, events, attack_start, FragEventKind::Error {
                 message: format!("{}: MitM engine required but not yet available", variant.label()),
-            });
+            }, attack_id);
         }
     }
 
@@ -1103,7 +1161,7 @@ fn inject_test_frames(
         info.elapsed = info.start_time.elapsed();
     }
 
-    sent
+    (sent, wait_time)
 }
 
 /// Helper: check running flag and transmit frame.
@@ -1570,23 +1628,61 @@ fn fragment_payload_with_pn_gap(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn push_event(
+    shared: &SharedAdapter,
     events: &Arc<EventRing<FragEvent>>,
     start: Instant,
     kind: FragEventKind,
+    attack_id: AttackId,
 ) {
     let seq = events.seq() + 1;
-    events.push(FragEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Frag(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(FragEvent { seq, timestamp, kind });
 }
 
-#[allow(dead_code)]
-fn update_phase(info: &Arc<Mutex<FragInfo>>, phase: FragPhase) {
+fn update_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<FragInfo>>,
+    phase: FragPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
     info.phase = phase;
     info.elapsed = info.start_time.elapsed();
+}
+
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<FragInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

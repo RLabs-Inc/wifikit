@@ -2191,6 +2191,22 @@ impl Rtl8812bu {
         // DW5: RTY_LMT_EN + retry limit
         buf[0x12] = (1 << 1) | ((retries & 0x3F) << 2); // RTY_LMT_EN + limit
 
+        // DW3: RTS/CTS protection (byte 0x0D)
+        if opts.flags.contains(TxFlags::PROTECT) {
+            buf[0x0D] |= (1 << 4)                     // RTS_ENABLE
+                       | (1 << 5);                     // HW_RTS_ENABLE
+            buf[0x13] = 0x04;                          // RTS_RATE = OFDM 6M
+        }
+
+        // DW5: DATA_BW + DATA_SHORT (byte 0x14)
+        let bw = (opts.bw as u8).min(2);
+        if bw > 0 {
+            buf[0x14] |= (bw & 0x03) << 5;            // DATA_BW [6:5]
+        }
+        if opts.gi > 0 {
+            buf[0x14] |= 1 << 7;                       // DATA_SHORT (short GI)
+        }
+
         // DW5: STBC + LDPC (byte 0x17)
         if opts.flags.contains(TxFlags::STBC) {
             buf[0x17] |= 1 << 4; // DATA_STBC = 1 (single stream)

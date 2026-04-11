@@ -99,6 +99,9 @@ pub fn run(ctx: &mut Ctx, args: &str) {
 
 /// List all discovered adapters with status.
 fn list(ctx: &mut Ctx) {
+    // Fresh USB scan — detect newly plugged/unplugged adapters
+    let _ = ctx.manager.scan_usb();
+
     if ctx.manager.count() == 0 {
         ctx.layout.print(&format!("\n  {} No adapters detected. Plug in a supported USB adapter.\n",
             prism::s().yellow().paint("\u{26a0}")));

@@ -81,6 +81,9 @@ impl<'a> Ctx<'a> {
     /// Prompt user to select an adapter. Auto-selects if only one.
     /// Returns discovered index, or None if cancelled/empty.
     pub fn select_adapter(&mut self, purpose: &str) -> Option<usize> {
+        // Fresh USB scan — detect newly plugged/unplugged adapters
+        let _ = self.manager.scan_usb();
+
         if self.manager.count() == 0 {
             self.layout.print(&format!("  {} No adapters detected. Plug in a supported USB adapter.",
                 prism::s().yellow().paint("\u{26a0}")));

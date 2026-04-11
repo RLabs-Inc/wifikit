@@ -36,9 +36,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
+use crate::attacks::next_attack_id;
 use crate::core::{EventRing, MacAddress, TxOptions};
-use crate::core::frame::TxFlags;
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::ieee80211::fc;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -339,6 +343,18 @@ impl FuzzPhase {
             Self::Monitoring => "Monitoring",
             Self::CrashFound => "Crash Found",
             Self::Done => "Done",
+        }
+    }
+
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::Probing => AttackPhase { label: "Probing", is_active: true, is_terminal: false },
+            Self::Fuzzing => AttackPhase { label: "Fuzzing", is_active: true, is_terminal: false },
+            Self::Monitoring => AttackPhase { label: "Monitoring", is_active: true, is_terminal: false },
+            Self::CrashFound => AttackPhase { label: "CrashFound", is_active: false, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
         }
     }
 }
@@ -1801,10 +1817,7 @@ fn health_check_probe(
     );
 
     if plen > 0 {
-        let tx_opts = TxOptions {
-            retries: 3,
-            ..Default::default()
-        };
+        let tx_opts = TxOptions::max_range_ack(shared.current_channel(), shared.caps().contains(ChipCaps::HE));
         let _ = shared.tx_frame(&probe_buf[..plen], &tx_opts);
         *probes_sent += 1;
     }
@@ -1836,13 +1849,62 @@ fn health_check_probe(
 //  Event helper
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn push_event(events: &Arc<EventRing<FuzzEvent>>, start: Instant, kind: FuzzEventKind) {
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<FuzzEvent>>,
+    start: Instant,
+    kind: FuzzEventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(FuzzEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Fuzz(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(FuzzEvent { seq, timestamp, kind });
+}
+
+fn update_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<FuzzInfo>>,
+    phase: FuzzPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
+    let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+    info.phase = phase;
+    info.elapsed = info.elapsed; // preserve — caller updates elapsed separately
+}
+
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<FuzzInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.probes_answered as u64,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1863,6 +1925,7 @@ fn run_fuzz_attack(
     let start = Instant::now();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
     let our_mac_addr = shared.mac();
     let our_mac = our_mac_addr.0;
     let target_mac = target.bssid.0;
@@ -1883,8 +1946,17 @@ fn run_fuzz_attack(
         info.actual_seed = actual_seed;
     }
 
+    // Emit AttackStarted delta
+    shared.emit_updates(vec![StoreUpdate::AttackStarted {
+        id: attack_id,
+        attack_type: AttackType::Fuzz,
+        target_bssid: target.bssid,
+        target_ssid: ssid.to_string(),
+        target_channel: target.channel,
+    }]);
+
     // Fire attack started event
-    push_event(events, start, FuzzEventKind::AttackStarted {
+    push_event(shared, events, start, FuzzEventKind::AttackStarted {
         bssid: target.bssid,
         ssid: ssid.to_string(),
         channel: target.channel,
@@ -1892,14 +1964,14 @@ fn run_fuzz_attack(
         domain: params.domain,
         frame_type: params.frame_type,
         mutations: params.mutations,
-    });
+    }, attack_id);
 
     // Lock channel to target's channel
     if let Err(e) = shared.lock_channel(target.channel, "fuzz") {
-        push_event(events, start, FuzzEventKind::Error {
+        push_event(shared, events, start, FuzzEventKind::Error {
             message: format!("Failed to lock channel {}: {}", target.channel, e),
-        });
-        push_event(events, start, FuzzEventKind::AttackComplete {
+        }, attack_id);
+        push_event(shared, events, start, FuzzEventKind::AttackComplete {
             iterations: 0,
             frames_sent: 0,
             frames_received: 0,
@@ -1907,19 +1979,25 @@ fn run_fuzz_attack(
             crashes_recovered: 0,
             crashes_permanent: 0,
             elapsed: start.elapsed(),
-        });
+        }, attack_id);
+        shared.emit_updates(vec![StoreUpdate::AttackComplete {
+            id: attack_id,
+            attack_type: AttackType::Fuzz,
+            result: AttackResult::Fuzz {
+                iterations: 0,
+                crashes_found: 0,
+                crashes_permanent: 0,
+            },
+        }]);
         return;
     }
-    push_event(events, start, FuzzEventKind::ChannelLocked { channel: target.channel });
+    push_event(shared, events, start, FuzzEventKind::ChannelLocked { channel: target.channel }, attack_id);
 
     // Channel settle — wait for PLL lock + AGC
     thread::sleep(params.channel_settle);
 
     // ── Phase 1: Establish baseline ──
-    {
-        let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-        info.phase = FuzzPhase::Probing;
-    }
+    update_phase(shared, info, FuzzPhase::Probing, attack_id);
 
     let mut probes_sent: u32 = 0;
     let mut probes_answered: u32 = 0;
@@ -1932,25 +2010,25 @@ fn run_fuzz_attack(
             &mut probes_sent, &mut probes_answered, running, &mut rng,
         );
         if alive { baseline_ok += 1; }
-        push_event(events, start, FuzzEventKind::BaselineProbe {
+        push_event(shared, events, start, FuzzEventKind::BaselineProbe {
             probe_num: i + 1,
             alive,
-        });
+        }, attack_id);
         if i < 2 { thread::sleep(Duration::from_millis(200)); }
     }
 
-    push_event(events, start, FuzzEventKind::BaselineComplete {
+    push_event(shared, events, start, FuzzEventKind::BaselineComplete {
         probes_ok: baseline_ok,
         total: 3,
-    });
+    }, attack_id);
 
     if baseline_ok == 0 {
-        push_event(events, start, FuzzEventKind::Error {
+        push_event(shared, events, start, FuzzEventKind::Error {
             message: "Target not responding to probes, aborting".into(),
-        });
+        }, attack_id);
         shared.unlock_channel();
-        push_event(events, start, FuzzEventKind::ChannelUnlocked);
-        push_event(events, start, FuzzEventKind::AttackComplete {
+        push_event(shared, events, start, FuzzEventKind::ChannelUnlocked, attack_id);
+        push_event(shared, events, start, FuzzEventKind::AttackComplete {
             iterations: 0,
             frames_sent: 0,
             frames_received: 0,
@@ -1958,27 +2036,31 @@ fn run_fuzz_attack(
             crashes_recovered: 0,
             crashes_permanent: 0,
             elapsed: start.elapsed(),
-        });
+        }, attack_id);
+        shared.emit_updates(vec![StoreUpdate::AttackComplete {
+            id: attack_id,
+            attack_type: AttackType::Fuzz,
+            result: AttackResult::Fuzz {
+                iterations: 0,
+                crashes_found: 0,
+                crashes_permanent: 0,
+            },
+        }]);
         return;
     }
 
     // ── Phase 2: Fuzz loop ──
-    {
-        let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-        info.phase = FuzzPhase::Fuzzing;
-    }
-    push_event(events, start, FuzzEventKind::FuzzingStarted);
+    update_phase(shared, info, FuzzPhase::Fuzzing, attack_id);
+    push_event(shared, events, start, FuzzEventKind::FuzzingStarted, attack_id);
 
-    // TX options: no ACK, no retry — fire and forget
-    let tx_opts = TxOptions {
-        retries: 0,
-        flags: TxFlags::NO_ACK | TxFlags::NO_RETRY,
-        ..Default::default()
-    };
+    // TX options: fire and forget with max range modulation
+    let has_he = shared.caps().contains(ChipCaps::HE);
+    let tx_opts = TxOptions::injection(shared.current_channel(), has_he);
 
     // Rate tracking
     let mut rate_start = Instant::now();
     let mut rate_checkpoint: u64 = 0;
+    let mut rate_recovery_elapsed = Duration::ZERO; // recovery time within current window
     let mut frames_sent: u64 = 0;
     let mut iteration: u64 = 0;
     let mut seq_num: u16 = 0;
@@ -2005,11 +2087,8 @@ fn run_fuzz_attack(
                 thread::sleep(Duration::from_millis(50));
             }
             if !running.load(Ordering::SeqCst) { break; }
-            push_event(events, start, FuzzEventKind::Resumed);
-            {
-                let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-                info.phase = FuzzPhase::Fuzzing;
-            }
+            push_event(shared, events, start, FuzzEventKind::Resumed, attack_id);
+            update_phase(shared, info, FuzzPhase::Fuzzing, attack_id);
         }
 
         // Pick frame type and domain
@@ -2074,13 +2153,13 @@ fn run_fuzz_attack(
 
         // Fire mutation event (if logging all frames)
         if params.log_all_frames {
-            push_event(events, start, FuzzEventKind::MutationApplied {
+            push_event(shared, events, start, FuzzEventKind::MutationApplied {
                 iteration,
                 frame_type: ft,
                 domain: dom,
                 mutation: mut_bit,
                 frame_len: flen,
-            });
+            }, attack_id);
         }
 
         // Inject the mutated frame
@@ -2090,12 +2169,12 @@ fn run_fuzz_attack(
             }
 
             if params.log_all_frames {
-                push_event(events, start, FuzzEventKind::FrameInjected {
+                push_event(shared, events, start, FuzzEventKind::FrameInjected {
                     iteration,
                     frame_type: ft,
                     mutation: mut_bit,
                     frame_len: flen,
-                });
+                }, attack_id);
             }
         }
 
@@ -2120,9 +2199,13 @@ fn run_fuzz_attack(
         // ── Rate tracking (once per second) ──
         let now = Instant::now();
         if now.duration_since(rate_start) >= Duration::from_secs(1) {
-            let fps = (frames_sent - rate_checkpoint) as f64;
+            let window = now.duration_since(rate_start);
+            let active = window.saturating_sub(rate_recovery_elapsed);
+            let active_secs = active.as_secs_f64().max(0.001); // guard against zero
+            let fps = (frames_sent - rate_checkpoint) as f64 / active_secs;
             rate_checkpoint = frames_sent;
             rate_start = now;
+            rate_recovery_elapsed = Duration::ZERO;
 
             {
                 let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -2130,13 +2213,16 @@ fn run_fuzz_attack(
                 info.tx_feedback = tx_fb.snapshot();
             }
 
-            push_event(events, start, FuzzEventKind::RateSnapshot {
+            push_event(shared, events, start, FuzzEventKind::RateSnapshot {
                 iteration,
                 frames_sent,
                 frames_per_sec: fps,
                 elapsed: start.elapsed(),
                 crashes_found: crash_count,
-            });
+            }, attack_id);
+
+            // Emit counters delta at rate snapshot frequency
+            emit_counters(shared, attack_id, info, start, &tx_fb);
         }
 
         // ── Health check after each batch ──
@@ -2147,18 +2233,18 @@ fn run_fuzz_attack(
             if since_check >= params.probe_interval {
                 last_health_check = now;
 
-                push_event(events, start, FuzzEventKind::HealthCheckStarted);
+                push_event(shared, events, start, FuzzEventKind::HealthCheckStarted, attack_id);
 
                 let alive = health_check_probe(
                     shared, reader, &target_mac, ssid, params.probe_timeout,
                     &mut probes_sent, &mut probes_answered, running, &mut rng,
                 );
 
-                push_event(events, start, FuzzEventKind::HealthCheckResult {
+                push_event(shared, events, start, FuzzEventKind::HealthCheckResult {
                     alive,
                     probes_sent,
                     probes_answered,
-                });
+                }, attack_id);
 
                 // Update info
                 {
@@ -2169,12 +2255,9 @@ fn run_fuzz_attack(
 
                 if !alive {
                     // ── Potential crash detected ──
-                    {
-                        let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-                        info.phase = FuzzPhase::Monitoring;
-                    }
+                    update_phase(shared, info, FuzzPhase::Monitoring, attack_id);
 
-                    push_event(events, start, FuzzEventKind::CrashDetected {
+                    push_event(shared, events, start, FuzzEventKind::CrashDetected {
                         iteration,
                         frame_type: ft,
                         mutation: mut_bit,
@@ -2184,7 +2267,7 @@ fn run_fuzz_attack(
                             "Target not responding at iteration {} ({} {})",
                             iteration, ft.label(), mutation::label(mut_bit),
                         ),
-                    });
+                    }, attack_id);
 
                     // Wait for recovery
                     let recovery_start = Instant::now();
@@ -2202,6 +2285,9 @@ fn run_fuzz_attack(
                         thread::sleep(Duration::from_millis(500));
                     }
 
+                    // Track recovery wait time so fps calculation excludes it
+                    rate_recovery_elapsed += recovery_start.elapsed();
+
                     crash_count += 1;
 
                     // Record crash
@@ -2217,11 +2303,11 @@ fn run_fuzz_attack(
                             recovery_ms, iteration, ft.label(), mutation::label(mut_bit),
                         );
 
-                        push_event(events, start, FuzzEventKind::CrashRecovery {
+                        push_event(shared, events, start, FuzzEventKind::CrashRecovery {
                             crash_num: crash_count,
                             recovery_ms,
                             description: desc.clone(),
-                        });
+                        }, attack_id);
 
                         let crash = FuzzCrash {
                             crash_num: crash_count,
@@ -2245,10 +2331,10 @@ fn run_fuzz_attack(
                             iteration, ft.label(), mutation::label(mut_bit),
                         );
 
-                        push_event(events, start, FuzzEventKind::CrashPermanent {
+                        push_event(shared, events, start, FuzzEventKind::CrashPermanent {
                             crash_num: crash_count,
                             description: desc.clone(),
-                        });
+                        }, attack_id);
 
                         let crash = FuzzCrash {
                             crash_num: crash_count,
@@ -2275,18 +2361,14 @@ fn run_fuzz_attack(
                     }
 
                     if params.pause_on_crash {
-                        {
-                            let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-                            info.phase = FuzzPhase::CrashFound;
-                        }
+                        update_phase(shared, info, FuzzPhase::CrashFound, attack_id);
                         paused.store(true, Ordering::SeqCst);
-                        push_event(events, start, FuzzEventKind::Paused {
+                        push_event(shared, events, start, FuzzEventKind::Paused {
                             crash_num: crash_count,
-                        });
+                        }, attack_id);
                         // Will be caught by pause handler at top of loop
                     } else {
-                        let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
-                        info.phase = FuzzPhase::Fuzzing;
+                        update_phase(shared, info, FuzzPhase::Fuzzing, attack_id);
                     }
                 }
             }
@@ -2300,9 +2382,9 @@ fn run_fuzz_attack(
 
     // ── Finalize ──
     shared.unlock_channel();
-    push_event(events, start, FuzzEventKind::ChannelUnlocked);
+    push_event(shared, events, start, FuzzEventKind::ChannelUnlocked, attack_id);
 
-    push_event(events, start, FuzzEventKind::AttackComplete {
+    push_event(shared, events, start, FuzzEventKind::AttackComplete {
         iterations: iteration,
         frames_sent,
         frames_received: probes_answered as u64,
@@ -2310,19 +2392,37 @@ fn run_fuzz_attack(
         crashes_recovered,
         crashes_permanent,
         elapsed: start.elapsed(),
-    });
+    }, attack_id);
 
-    // Final info update
+    // Final info update — recalculate fps from the last partial window
     {
+        let final_window = Instant::now().duration_since(rate_start);
+        let final_active = final_window.saturating_sub(rate_recovery_elapsed);
+        let final_active_secs = final_active.as_secs_f64().max(0.001);
+        let final_fps = (frames_sent - rate_checkpoint) as f64 / final_active_secs;
+
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.iteration = iteration;
         info.frames_sent = frames_sent;
+        info.frames_per_sec = final_fps;
         info.crashes_found = crash_count;
         info.crashes_recovered = crashes_recovered;
         info.crashes_permanent = crashes_permanent;
         info.elapsed = start.elapsed();
         info.tx_feedback = tx_fb.snapshot();
     }
+
+    // Emit final counters + AttackComplete delta
+    emit_counters(shared, attack_id, info, start, &tx_fb);
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Fuzz,
+        result: AttackResult::Fuzz {
+            iterations: iteration,
+            crashes_found: crash_count,
+            crashes_permanent,
+        },
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

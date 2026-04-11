@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::core::adapter::{Adapter, AdapterInfo};
 use crate::core::channel::Channel;
-use crate::core::chip::{RxHandle, TxFeedback};
+use crate::core::chip::{ChipCaps, RxHandle, TxFeedback};
 use crate::core::mac::MacAddress;
 use crate::core::Result;
 use crate::pipeline::FrameGate;
@@ -453,6 +453,22 @@ impl SharedAdapter {
         }
         let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
         adapter.driver.scan_dwell_time()
+    }
+
+    /// Get chipset capability flags (HE, BW40, BW80, TX_POWER, etc.).
+    pub fn caps(&self) -> ChipCaps {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return ChipCaps::empty();
+        }
+        let adapter = self.inner.adapter.lock().unwrap_or_else(|e| e.into_inner());
+        adapter.chip_info().caps
+    }
+
+    /// Set TX power level. 0 or negative = hardware max. Positive = explicit dBm.
+    pub fn set_tx_power(&self, dbm: i8) -> Result<()> {
+        self.with_adapter(|adapter| {
+            adapter.driver.set_tx_power(dbm)
+        })
     }
 
     /// Get supported channels from the chipset driver.

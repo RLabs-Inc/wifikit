@@ -3467,7 +3467,8 @@ impl ChipDriver for Rtl8852au {
 
     fn set_tx_power(&mut self, dbm: i8) -> Result<()> {
         // TXAGC index: 2 units per dBm. Clamp to hardware max (31 dBm = 0x3E).
-        let dbm = dbm.clamp(0, 31);
+        // dbm <= 0 means "hardware max" (consistent with other drivers).
+        let dbm = if dbm <= 0 { 31 } else { dbm.min(31) };
         let idx = (dbm as u8) * 2;
 
         // Scale all rates proportionally. Base rate (OFDM 6M) gets full power.

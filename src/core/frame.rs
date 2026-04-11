@@ -483,6 +483,65 @@ impl Default for TxOptions {
     }
 }
 
+impl TxOptions {
+    /// Maximum range TX for broadcast/unidirectional attacks (deauth, beacon flood).
+    /// Uses the most robust modulation: CCK 1M on 2.4GHz, HE_EXT_SU or OFDM 6M on 5/6GHz.
+    /// LDPC + STBC for coding/diversity gain. No ACK.
+    ///
+    /// NOTE: PROTECT (RTS/CTS) is NOT used here — in monitor mode injection the AP
+    /// won't respond to our RTS (we're not associated), causing CTS timeouts that
+    /// kill throughput or drop frames entirely. PROTECT only works for associated STAs.
+    pub fn max_range_noack(channel: u8, has_he: bool) -> Self {
+        Self {
+            rate: TxRate::best_range(channel, has_he),
+            retries: 0,
+            flags: TxFlags::NO_ACK | TxFlags::NO_RETRY
+                 | TxFlags::LDPC | TxFlags::STBC,
+            ..Default::default()
+        }
+    }
+
+    /// Maximum range TX for bidirectional protocols (auth, assoc, EAP, WPS).
+    /// WANT_ACK for delivery confirmation. LDPC + STBC for reliability at range.
+    pub fn max_range_ack(channel: u8, has_he: bool) -> Self {
+        Self {
+            rate: TxRate::best_range(channel, has_he),
+            retries: 15,
+            flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
+            ..Default::default()
+        }
+    }
+
+    /// Fire-and-forget injection (fuzz, frag, protocol testing).
+    /// Robust modulation, no ACK, no retries.
+    pub fn injection(channel: u8, has_he: bool) -> Self {
+        Self {
+            rate: TxRate::best_range(channel, has_he),
+            retries: 0,
+            flags: TxFlags::NO_ACK | TxFlags::NO_RETRY | TxFlags::LDPC | TxFlags::STBC,
+            ..Default::default()
+        }
+    }
+}
+
+impl TxRate {
+    /// Select the best rate for maximum range on a given channel.
+    /// - 2.4GHz: CCK 1M (~6dB better sensitivity than OFDM 6M, ~100m more range)
+    /// - 5/6GHz: OFDM 6M (universally supported by all APs)
+    ///
+    /// NOTE: HE_EXT_SU MCS0 would give ~6dB better range on 5GHz, but only WiFi 6
+    /// APs can decode it. Since PMKID/deauth target ALL APs (including WiFi 5),
+    /// we use OFDM 6M for universal compatibility. HE_EXT_SU can be used when we
+    /// know the target is WiFi 6 (future: per-target rate selection).
+    pub fn best_range(channel: u8, _has_he: bool) -> Self {
+        if channel <= 14 {
+            TxRate::Cck1m
+        } else {
+            TxRate::Ofdm6m
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxRate {
     Cck1m,

@@ -660,58 +660,33 @@ impl ScannerModule {
         }
 
         // Channel with lock indicator — locked state gets distinct yellow styling
+        // Fixed-width ch field (ch:XXX = 6 chars) so status bar doesn't jitter
         let (ch_text, ch_style) = if let Some(ref shared) = self.shared {
             let locked = shared.locked_channel();
             if locked != 0 {
                 let text = if let Some(holder) = shared.lock_holder() {
-                    format!("ch:{} \u{1f512}{}", locked, holder)
+                    format!("ch:{:<3} \u{1f512}{}", locked, holder)
                 } else {
-                    format!("ch:{} \u{1f512}", locked)
+                    format!("ch:{:<3} \u{1f512}", locked)
                 };
                 (text, SegmentStyle::YellowBold)
             } else {
-                (format!("ch:{}", channel), SegmentStyle::Bold)
+                (format!("ch:{:<3}", channel), SegmentStyle::Bold)
             }
         } else {
-            (format!("ch:{}", channel), SegmentStyle::Bold)
+            (format!("ch:{:<3}", channel), SegmentStyle::Bold)
         };
 
-        let round_text = if stats.round > 0 {
-            format!("r:{}", stats.round)
-        } else {
-            "r:0".into()
-        };
+        let round_text = format!("r:{:<3}", stats.round);
 
-        // Pipeline stats: USB-harvested vs parsed frames + queue depth
-        let pipeline_text = if let Some(ref shared) = self.shared {
-            let ps = shared.pipeline_stats();
-            let pending = ps.pending;
-            let peak = ps.peak_pending;
-            if pending > 0 {
-                format!("usb:{} \u{2192} parsed:{} (q:{}/pk:{})",
-                    ps.usb_frames, ps.frames_received, pending, peak)
-            } else {
-                format!("usb:{} \u{2192} parsed:{}",
-                    ps.usb_frames, ps.frames_received)
-            }
-        } else {
-            String::new()
-        };
-
-        let mut segments = vec![
+        vec![
             StatusSegment::new("scan", SegmentStyle::CyanBold),
             StatusSegment::new(counts, SegmentStyle::Bold),
             StatusSegment::new(ch_text, ch_style),
             StatusSegment::new(round_text, SegmentStyle::Dim),
             StatusSegment::new(elapsed, SegmentStyle::Dim),
-            StatusSegment::new(format!("{} fps", stats.frames_per_sec), SegmentStyle::Bold),
-        ];
-
-        if !pipeline_text.is_empty() {
-            segments.push(StatusSegment::new(pipeline_text, SegmentStyle::Dim));
-        }
-
-        segments
+            StatusSegment::new(format!("{:>6} fps", stats.frames_per_sec), SegmentStyle::Bold),
+        ]
     }
 
     /// Handle a keypress in Normal Mode. Returns true if key was consumed.

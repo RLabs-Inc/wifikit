@@ -406,9 +406,17 @@ pub fn status_segments(info: &DosInfo) -> Vec<StatusSegment> {
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Format frames/sec as a styled rate string using prism's compact notation.
+/// Format frames/sec as a styled rate string.
 fn format_rate(fps: f64) -> String {
-    let fps_str = format!("{} fps", prism::format_compact(fps as u64));
+    let fps_str = if fps >= 1000.0 {
+        format!("{} fps", prism::format_compact(fps as u64))
+    } else if fps >= 1.0 {
+        format!("{:.0} fps", fps)
+    } else if fps > 0.0 {
+        format!("{:.1} fps", fps)
+    } else {
+        "0 fps".to_string()
+    };
     if fps > 1000.0 {
         s().yellow().bold().paint(&fps_str)
     } else {
@@ -591,7 +599,7 @@ impl Module for DosModule {
             info.target_bssid,
             info.attack_type.label(),
             prism::format_number(info.frames_sent),
-            prism::format_compact(info.frames_per_sec as u64),
+            if info.frames_per_sec >= 1.0 { prism::format_compact(info.frames_per_sec as u64) } else { format!("{:.1}", info.frames_per_sec) },
             prism::format_time((info.elapsed.as_secs_f64() * 1000.0) as u64),
             prism::format_bytes(info.bytes_sent),
             tx_line,

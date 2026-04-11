@@ -1609,7 +1609,8 @@ impl ChipDriver for Rtl8852bu {
     }
 
     fn set_tx_power(&mut self, dbm: i8) -> Result<()> {
-        let dbm = dbm.clamp(0, 31);
+        // dbm <= 0 means "hardware max" (consistent with other drivers).
+        let dbm = if dbm <= 0 { 31 } else { dbm.min(31) };
         let idx = (dbm as u8) * 2;
 
         let hi = idx;

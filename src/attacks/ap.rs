@@ -27,8 +27,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
-use crate::core::{EventRing, MacAddress, TxFlags, TxOptions, TxRate};
+use crate::attacks::next_attack_id;
+use crate::core::{EventRing, MacAddress, TxOptions};
+use crate::core::chip::ChipCaps;
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::frames;
 use crate::protocol::ie::{self, ApSecurity, BeaconIeConfig};
 use crate::protocol::ieee80211::{self, auth_algo, cap_info, fc_flags};
@@ -197,6 +202,19 @@ pub enum ApPhase {
 impl Default for ApPhase {
     fn default() -> Self {
         Self::Idle
+    }
+}
+
+impl ApPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::Starting => AttackPhase { label: "Starting", is_active: true, is_terminal: false },
+            Self::Broadcasting => AttackPhase { label: "Broadcasting", is_active: true, is_terminal: false },
+            Self::Active => AttackPhase { label: "Active", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
     }
 }
 
@@ -541,6 +559,23 @@ fn run_ap_attack(
     let start = Instant::now();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
+
+    // Emit AttackStarted delta
+    {
+        let (target_bssid, target_ssid, target_channel) = if let Some(t) = target {
+            (t.bssid, t.ssid.clone(), t.channel)
+        } else {
+            (MacAddress::ZERO, String::new(), 0u8)
+        };
+        shared.emit_updates(vec![StoreUpdate::AttackStarted {
+            id: attack_id,
+            attack_type: AttackType::Ap,
+            target_bssid,
+            target_ssid,
+            target_channel,
+        }]);
+    }
 
     // === Determine our AP identity ===
     let ssid = params.ssid.clone().unwrap_or_else(|| {
@@ -548,13 +583,9 @@ fn run_ap_attack(
     });
     let channel = target.map(|t| t.channel).unwrap_or(6);
     let target_bssid = target.map(|t| t.bssid);
-    // TX options optimized for range — own MAC so ACK feedback works
-    let tx_opts = TxOptions {
-        rate: if channel <= 14 { TxRate::Cck1m } else { TxRate::Ofdm6m },
-        retries: 12,
-        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
-        ..Default::default()
-    };
+    // TX options: max range + ACK feedback, chip-aware rate selection
+    let has_he = shared.caps().contains(ChipCaps::HE);
+    let tx_opts = TxOptions::max_range_ack(channel, has_he);
 
     let our_bssid = if let Some(bssid) = params.our_bssid {
         bssid
@@ -584,12 +615,12 @@ fn run_ap_attack(
 
     // === Lock channel ===
     if let Err(e) = shared.lock_channel(channel, "ap") {
-        push_event(events, start, ApEventKind::Error {
+        push_event(shared, events, start, ApEventKind::Error {
             message: format!("Channel lock failed: {}", e),
-        });
+        }, attack_id);
         return;
     }
-    push_event(events, start, ApEventKind::ChannelLocked { channel });
+    push_event(shared, events, start, ApEventKind::ChannelLocked { channel }, attack_id);
     if params.channel_settle > Duration::ZERO {
         thread::sleep(params.channel_settle);
     }
@@ -618,12 +649,12 @@ fn run_ap_attack(
         ies
     };
 
-    set_phase(info, ApPhase::Broadcasting);
-    push_event(events, start, ApEventKind::ApStarted {
+    set_phase(shared, info, ApPhase::Broadcasting, attack_id);
+    push_event(shared, events, start, ApEventKind::ApStarted {
         bssid: our_bssid,
         ssid: ssid.clone(),
         mode: params.mode,
-    });
+    }, attack_id);
 
     if !running.load(Ordering::SeqCst) {
         shared.unlock_channel();
@@ -636,6 +667,7 @@ fn run_ap_attack(
     let mut next_aid: u16 = 1;
     let mut last_beacon = Instant::now() - Duration::from_secs(1); // force immediate
     let mut last_deauth = Instant::now() - Duration::from_secs(10);
+    let mut last_counter_emit = Instant::now();
     #[allow(unused_assignments)]
     let mut tsf: u64 = 0;
     let _seq_num: u16 = 0;
@@ -663,7 +695,7 @@ fn run_ap_attack(
 
         // --- Check overall timeout ---
         if params.timeout > Duration::ZERO && elapsed >= params.timeout {
-            push_event(events, start, ApEventKind::TimeoutReached { elapsed });
+            push_event(shared, events, start, ApEventKind::TimeoutReached { elapsed }, attack_id);
             break;
         }
 
@@ -758,10 +790,10 @@ fn run_ap_attack(
                         frames_sent += 1;
                         deauths_sent += 1;
                     }
-                    push_event(events, start, ApEventKind::DeauthBurst {
+                    push_event(shared, events, start, ApEventKind::DeauthBurst {
                         target_bssid: tb,
                         count: params.deauth_count,
-                    });
+                    }, attack_id);
                     last_deauth = now;
                 }
             }
@@ -814,9 +846,9 @@ fn run_ap_attack(
                                     }
                                 }
 
-                                push_event(events, start, ApEventKind::ProbeRequest {
+                                push_event(shared, events, start, ApEventKind::ProbeRequest {
                                     mac: sta_mac, ssid: req_ssid.clone(), rssi: frame.rssi,
-                                });
+                                }, attack_id);
 
                                 // Determine if we should respond
                                 let should_respond = if params.mode.is_karma_mode() {
@@ -825,11 +857,11 @@ fn run_ap_attack(
                                         let is_new = !karma_ssids.contains(&req_ssid);
                                         if is_new && (karma_ssids.len() as u32) < params.max_karma_ssids {
                                             karma_ssids.push(req_ssid.clone());
-                                            push_event(events, start, ApEventKind::KarmaSsidCollected {
+                                            push_event(shared, events, start, ApEventKind::KarmaSsidCollected {
                                                 ssid: req_ssid.clone(),
                                                 mac: sta_mac,
                                                 total: karma_ssids.len() as u32,
-                                            });
+                                            }, attack_id);
                                         }
                                     }
                                     true
@@ -870,9 +902,9 @@ fn run_ap_attack(
                                         probes_answered += 1;
                                     }
 
-                                    push_event(events, start, ApEventKind::ProbeResponse {
+                                    push_event(shared, events, start, ApEventKind::ProbeResponse {
                                         mac: sta_mac, ssid: resp_ssid.clone(),
-                                    });
+                                    }, attack_id);
                                 }
                             }
 
@@ -909,9 +941,9 @@ fn run_ap_attack(
                                 frames_sent += 1;
                                 auths_accepted += 1;
 
-                                push_event(events, start, ApEventKind::ClientAuthenticated {
+                                push_event(shared, events, start, ApEventKind::ClientAuthenticated {
                                     mac: sta_mac, rssi: frame.rssi,
-                                });
+                                }, attack_id);
                             }
 
                             // --- Assoc Request (subtype 0) or Reassoc (subtype 2) ---
@@ -951,16 +983,16 @@ fn run_ap_attack(
                                 }
 
                                 // Update phase
-                                set_phase(info, ApPhase::Active);
+                                set_phase(shared, info, ApPhase::Active, attack_id);
 
                                 if is_reassoc {
-                                    push_event(events, start, ApEventKind::ClientReassociated {
+                                    push_event(shared, events, start, ApEventKind::ClientReassociated {
                                         mac: sta_mac, aid,
-                                    });
+                                    }, attack_id);
                                 } else {
-                                    push_event(events, start, ApEventKind::ClientAssociated {
+                                    push_event(shared, events, start, ApEventKind::ClientAssociated {
                                         mac: sta_mac, aid, rssi: frame.rssi,
-                                    });
+                                    }, attack_id);
                                 }
                             }
 
@@ -980,9 +1012,9 @@ fn run_ap_attack(
                                     }
                                 }
 
-                                push_event(events, start, ApEventKind::ClientDisconnected {
+                                push_event(shared, events, start, ApEventKind::ClientDisconnected {
                                     mac: sta_mac, reason,
-                                });
+                                }, attack_id);
                             }
 
                             // --- Disassociation (subtype 10) ---
@@ -1074,15 +1106,36 @@ fn run_ap_attack(
             }
             i.tx_feedback = tx_fb.snapshot();
         }
+
+        // Emit counters periodically (~1s batches, not per-frame)
+        if last_counter_emit.elapsed() >= Duration::from_secs(1) {
+            emit_counters(shared, attack_id, info, start, &tx_fb);
+            last_counter_emit = Instant::now();
+        }
     }
 
     // === Cleanup ===
     let final_elapsed = start.elapsed();
-    push_event(events, start, ApEventKind::AttackComplete {
+
+    // Emit final counters
+    emit_counters(shared, attack_id, info, start, &tx_fb);
+
+    push_event(shared, events, start, ApEventKind::AttackComplete {
         clients_total: clients.len() as u32,
         karma_ssids: karma_ssids.len() as u32,
         elapsed: final_elapsed,
-    });
+    }, attack_id);
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Ap,
+        result: AttackResult::Ap {
+            clients_total: clients.len() as u32,
+            karma_ssids: karma_ssids.len() as u32,
+        },
+    }]);
+
     shared.unlock_channel();
 }
 
@@ -1140,19 +1193,66 @@ fn extract_ssid_from_probe(frame_data: &[u8]) -> String {
 }
 
 /// Push an event with auto-incrementing seq and timestamp.
-fn push_event(events: &Arc<EventRing<ApEvent>>, start: Instant, kind: ApEventKind) {
+/// Dual-emits: delta stream (StoreUpdate::AttackEvent) + legacy EventRing.
+fn push_event(
+    shared: &SharedAdapter,
+    events: &Arc<EventRing<ApEvent>>,
+    start: Instant,
+    kind: ApEventKind,
+    attack_id: AttackId,
+) {
     let seq = events.seq() + 1;
-    events.push(ApEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Ap(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(ApEvent { seq, timestamp, kind });
 }
 
 /// Update attack phase.
-fn set_phase(info: &Arc<Mutex<ApInfo>>, phase: ApPhase) {
+/// Dual-emits: delta stream (StoreUpdate::AttackPhaseChanged) + legacy Info struct.
+fn set_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<ApInfo>>,
+    phase: ApPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut i = info.lock().unwrap_or_else(|e| e.into_inner());
     i.phase = phase;
+    i.elapsed = i.start_time.elapsed();
+}
+
+/// Emit attack counters into the delta stream.
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<ApInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -29,11 +29,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::adapter::SharedAdapter;
+use crate::attacks::next_attack_id;
 use crate::core::{EventRing, MacAddress, TxOptions};
-use crate::core::frame::{TxFlags, TxRate};
+use crate::core::chip::ChipCaps;
 use crate::core::parsed_frame::{FrameBody, DataPayload};
 use crate::engine::capture::{self as capture_engine, CaptureDatabase, CaptureEvent};
 use crate::store::Ap;
+use crate::store::update::{
+    AttackId, AttackType, AttackPhase, AttackEventKind, AttackResult, StoreUpdate,
+};
 use crate::protocol::eapol;
 use crate::protocol::frames;
 use crate::protocol::ie::{self, AssocTarget};
@@ -178,6 +182,23 @@ impl Default for PmkidStatus {
     }
 }
 
+impl PmkidPhase {
+    /// Convert to the normalized AttackPhase for delta emission.
+    fn to_attack_phase(&self) -> AttackPhase {
+        match self {
+            Self::Idle => AttackPhase { label: "Idle", is_active: false, is_terminal: false },
+            Self::ChannelLock => AttackPhase { label: "ChannelLock", is_active: true, is_terminal: false },
+            Self::Authenticating => AttackPhase { label: "Authenticating", is_active: true, is_terminal: false },
+            Self::WaitingAuthResp => AttackPhase { label: "WaitingAuthResp", is_active: true, is_terminal: false },
+            Self::Associating => AttackPhase { label: "Associating", is_active: true, is_terminal: false },
+            Self::WaitingAssocResp => AttackPhase { label: "WaitingAssocResp", is_active: true, is_terminal: false },
+            Self::WaitingM1 => AttackPhase { label: "WaitingM1", is_active: true, is_terminal: false },
+            Self::Cleanup => AttackPhase { label: "Cleanup", is_active: true, is_terminal: false },
+            Self::Done => AttackPhase { label: "Done", is_active: false, is_terminal: true },
+        }
+    }
+}
+
 /// Real-time info snapshot for the CLI to render.
 #[derive(Debug, Clone)]
 pub struct PmkidInfo {
@@ -211,6 +232,8 @@ pub struct PmkidInfo {
     // === Timing ===
     pub start_time: Instant,
     pub elapsed: Duration,
+    /// Cumulative time spent in sleeps/waits (not actively sending/receiving frames).
+    pub wait_time: Duration,
     pub frames_per_sec: f64,
 
     // === Results ===
@@ -243,6 +266,7 @@ impl Default for PmkidInfo {
             aps_no_response: 0,
             tx_feedback: Default::default(),
             elapsed: Duration::ZERO,
+            wait_time: Duration::ZERO,
             frames_per_sec: 0.0,
             results: Vec::new(),
             results_count: 0,
@@ -481,17 +505,21 @@ fn run_pmkid_attack(
     let our_mac = shared.mac();
     let tx_fb = shared.tx_feedback();
     tx_fb.reset();
+    let attack_id = next_attack_id();
 
-    // TX options: optimized for max range + ACK feedback
-    // We send as our own MAC → ACKs come back to us → firmware can report delivery.
-    // CCK 1M on 2.4GHz gives ~6dB better sensitivity (longer range) than OFDM 6M.
-    // LDPC/STBC improve reliability at range limits on 2x2 adapters.
-    let base_tx_opts = TxOptions {
-        rate: TxRate::Cck1m, // auth/assoc are mgmt frames; overridden per-target for 5GHz
-        retries: 12,
-        flags: TxFlags::WANT_ACK | TxFlags::LDPC | TxFlags::STBC,
-        ..Default::default()
-    };
+    // Emit AttackStarted — first target info for the initial delta
+    if let Some(first) = targets.first() {
+        shared.emit_updates(vec![StoreUpdate::AttackStarted {
+            id: attack_id,
+            attack_type: AttackType::Pmkid,
+            target_bssid: first.bssid,
+            target_ssid: first.ssid.clone(),
+            target_channel: first.channel,
+        }]);
+    }
+
+    // TX options: max range + ACK feedback, chip-aware rate selection
+    let has_he = shared.caps().contains(ChipCaps::HE);
 
     let mut total_captured: u32 = 0;
     let mut total_failed: u32 = 0;
@@ -515,7 +543,11 @@ fn run_pmkid_attack(
 
         // Inter-target delay — give USB adapter breathing room
         if idx > 0 && params.inter_target_delay > Duration::ZERO {
+            let t = Instant::now();
             thread::sleep(params.inter_target_delay);
+            let waited = t.elapsed();
+            let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
+            info.wait_time += waited;
         }
 
         // Update elapsed so status bar timer works
@@ -524,17 +556,13 @@ fn run_pmkid_attack(
             info.elapsed = start.elapsed();
         }
 
-        // Per-target TX opts: CCK 1M on 2.4GHz, OFDM 6M on 5/6GHz
-        let tx_opts = if target.channel > 14 {
-            TxOptions { rate: TxRate::Ofdm6m, ..base_tx_opts }
-        } else {
-            base_tx_opts
-        };
+        // Per-target TX opts: best range rate for this channel + ACK feedback
+        let tx_opts = TxOptions::max_range_ack(target.channel, has_he);
 
         let result = attack_single_ap(
             shared, reader, target, params, &our_mac,
             info, events, running, start, idx as u32, targets.len() as u32,
-            &tx_fb, &tx_opts,
+            &tx_fb, &tx_opts, attack_id,
         );
 
         match result.status {
@@ -555,16 +583,19 @@ fn run_pmkid_attack(
                 info.results = results[results.len() - MAX_INFO_RESULTS..].to_vec();
             }
         }
+
+        // Emit counters after each target (natural batch point)
+        emit_counters(shared, attack_id, info, start, &tx_fb);
     }
 
     let elapsed = start.elapsed();
 
-    push_event(events, start, PmkidEventKind::AttackComplete {
+    push_event(shared, events, start, PmkidEventKind::AttackComplete {
         captured: total_captured,
         failed: total_failed,
         total: results.len() as u32,
         elapsed,
-    });
+    }, attack_id);
 
     // Update info with final results
     {
@@ -573,11 +604,23 @@ fn run_pmkid_attack(
         info.tx_feedback = tx_fb.snapshot();
         info.results_count = results.len() as u32;
         if results.len() <= MAX_INFO_RESULTS {
-            info.results = results;
+            info.results = results.clone();
         } else {
             info.results = results[results.len() - MAX_INFO_RESULTS..].to_vec();
         }
     }
+
+    // Emit AttackComplete with final results
+    shared.emit_updates(vec![StoreUpdate::AttackComplete {
+        id: attack_id,
+        attack_type: AttackType::Pmkid,
+        result: AttackResult::Pmkid {
+            captured: total_captured,
+            failed: total_failed,
+            total: results.len() as u32,
+            results,
+        },
+    }]);
 }
 
 /// Filter APs to eligible PMKID targets:
@@ -626,8 +669,10 @@ fn attack_single_ap(
     total: u32,
     tx_fb: &Arc<crate::core::TxFeedback>,
     tx_opts: &TxOptions,
+    attack_id: AttackId,
 ) -> PmkidResult {
     let target_start = Instant::now();
+    let mut wait_time = Duration::ZERO;
 
     // Update info with current target
     {
@@ -641,14 +686,14 @@ fn attack_single_ap(
         info.assoc_attempt = 0;
     }
 
-    push_event(events, attack_start, PmkidEventKind::TargetStarted {
+    push_event(shared, events, attack_start, PmkidEventKind::TargetStarted {
         bssid: target.bssid,
         ssid: target.ssid.clone(),
         channel: target.channel,
         rssi: target.rssi,
         index: index + 1,
         total,
-    });
+    }, attack_id);
 
     let mut result = PmkidResult {
         bssid: target.bssid,
@@ -666,26 +711,28 @@ fn attack_single_ap(
 
     // Step 0: Lock channel to target's channel via SharedAdapter.
     // The scanner will pause hopping and stay on this channel.
-    update_phase(info, PmkidPhase::ChannelLock);
+    update_phase(shared, info, PmkidPhase::ChannelLock, attack_id);
     if target.channel > 0 {
         if let Err(e) = shared.lock_channel(target.channel, "pmkid") {
-            push_event(events, attack_start, PmkidEventKind::Error {
+            push_event(shared, events, attack_start, PmkidEventKind::Error {
                 message: format!("channel lock to ch{} failed: {e}", target.channel),
-            });
+            }, attack_id);
             result.status = PmkidStatus::ChannelError;
             result.elapsed = target_start.elapsed();
-            push_target_complete(events, attack_start, &result);
+            push_target_complete(shared, events, attack_start, &result, attack_id);
             return result;
         }
-        push_event(events, attack_start, PmkidEventKind::ChannelLocked {
+        push_event(shared, events, attack_start, PmkidEventKind::ChannelLocked {
             channel: target.channel,
-        });
+        }, attack_id);
         // Let radio settle — PLL lock + AGC stabilization
+        let t = Instant::now();
         thread::sleep(params.channel_settle);
+        wait_time += t.elapsed();
     }
 
     // Step 1: Authentication (Open System) with retries
-    update_phase(info, PmkidPhase::Authenticating);
+    update_phase(shared, info, PmkidPhase::Authenticating, attack_id);
     let mut auth_ok = false;
 
     for attempt in 0..=params.auth_retries {
@@ -693,12 +740,14 @@ fn attack_single_ap(
             result.status = PmkidStatus::Stopped;
             result.elapsed = target_start.elapsed();
             shared.unlock_channel();
-            push_target_complete(events, attack_start, &result);
+            push_target_complete(shared, events, attack_start, &result, attack_id);
             return result;
         }
 
         if attempt > 0 {
+            let t = Instant::now();
             thread::sleep(params.retry_delay);
+            wait_time += t.elapsed();
         }
 
         let auth_frame = frames::build_auth(
@@ -719,27 +768,30 @@ fn attack_single_ap(
             info.auth_attempt = attempt + 1;
         }
 
-        push_event(events, attack_start, PmkidEventKind::AuthSent {
+        push_event(shared, events, attack_start, PmkidEventKind::AuthSent {
             bssid: target.bssid,
             attempt: attempt + 1,
-        });
+        }, attack_id);
 
         // Wait for auth response via PipelineSubscriber (no USB mutex contention)
-        update_phase(info, PmkidPhase::WaitingAuthResp);
-        match wait_auth_response(
+        update_phase(shared, info, PmkidPhase::WaitingAuthResp, attack_id);
+        let t = Instant::now();
+        let auth_result = wait_auth_response(
             reader, &target.bssid, params.auth_timeout, running, info,
-        ) {
+        );
+        wait_time += t.elapsed();
+        match auth_result {
             Some((status, seq)) => {
-                push_event(events, attack_start, PmkidEventKind::AuthResponse {
+                push_event(shared, events, attack_start, PmkidEventKind::AuthResponse {
                     bssid: target.bssid,
                     status,
-                });
+                }, attack_id);
 
                 if status == 0 && seq == 2 {
                     auth_ok = true;
-                    push_event(events, attack_start, PmkidEventKind::AuthSuccess {
+                    push_event(shared, events, attack_start, PmkidEventKind::AuthSuccess {
                         bssid: target.bssid,
-                    });
+                    }, attack_id);
                     break;
                 }
             }
@@ -749,27 +801,27 @@ fn attack_single_ap(
 
     if !auth_ok {
         if running.load(Ordering::SeqCst) {
-            push_event(events, attack_start, PmkidEventKind::AuthFailed {
+            push_event(shared, events, attack_start, PmkidEventKind::AuthFailed {
                 bssid: target.bssid,
-            });
+            }, attack_id);
             result.status = PmkidStatus::NoResponse;
-            push_event(events, attack_start, PmkidEventKind::NoResponse {
+            push_event(shared, events, attack_start, PmkidEventKind::NoResponse {
                 bssid: target.bssid,
                 ssid: target.ssid.clone(),
-            });
+            }, attack_id);
         } else {
             result.status = PmkidStatus::Stopped;
         }
         result.elapsed = target_start.elapsed();
-        disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info, tx_opts);
+        disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info, tx_opts, attack_id);
         shared.unlock_channel();
-        push_event(events, attack_start, PmkidEventKind::ChannelUnlocked);
-        push_target_complete(events, attack_start, &result);
+        push_event(shared, events, attack_start, PmkidEventKind::ChannelUnlocked, attack_id);
+        push_target_complete(shared, events, attack_start, &result, attack_id);
         return result;
     }
 
     // Step 2: Association Request with retries
-    update_phase(info, PmkidPhase::Associating);
+    update_phase(shared, info, PmkidPhase::Associating, attack_id);
     let mut assoc_ok = false;
 
     let assoc_target = AssocTarget {
@@ -791,7 +843,7 @@ fn attack_single_ap(
             result.status = PmkidStatus::Stopped;
             result.elapsed = target_start.elapsed();
             shared.unlock_channel();
-            push_target_complete(events, attack_start, &result);
+            push_target_complete(shared, events, attack_start, &result, attack_id);
             return result;
         }
 
@@ -812,34 +864,39 @@ fn attack_single_ap(
             info.assoc_attempt = attempt + 1;
         }
 
-        push_event(events, attack_start, PmkidEventKind::AssocSent {
+        push_event(shared, events, attack_start, PmkidEventKind::AssocSent {
             bssid: target.bssid,
             attempt: attempt + 1,
-        });
+        }, attack_id);
 
         // Wait for assoc response — parse via protocol layer
-        update_phase(info, PmkidPhase::WaitingAssocResp);
-        match wait_assoc_response(
+        update_phase(shared, info, PmkidPhase::WaitingAssocResp, attack_id);
+        let t = Instant::now();
+        let assoc_result = wait_assoc_response(
             reader, &target.bssid, params.assoc_timeout, running, info,
-        ) {
+        );
+        wait_time += t.elapsed();
+        match assoc_result {
             Some((status, aid)) => {
-                push_event(events, attack_start, PmkidEventKind::AssocResponse {
+                push_event(shared, events, attack_start, PmkidEventKind::AssocResponse {
                     bssid: target.bssid,
                     status,
                     aid,
-                });
+                }, attack_id);
 
                 if status == 0 {
                     assoc_ok = true;
-                    push_event(events, attack_start, PmkidEventKind::AssocSuccess {
+                    push_event(shared, events, attack_start, PmkidEventKind::AssocSuccess {
                         bssid: target.bssid,
-                    });
+                    }, attack_id);
                     break;
                 }
             }
             None => {
                 if attempt < params.assoc_retries {
+                    let t = Instant::now();
                     thread::sleep(params.retry_delay);
+                    wait_time += t.elapsed();
                 }
                 continue;
             }
@@ -847,20 +904,23 @@ fn attack_single_ap(
     }
 
     if !assoc_ok {
-        push_event(events, attack_start, PmkidEventKind::AssocFailed {
+        push_event(shared, events, attack_start, PmkidEventKind::AssocFailed {
             bssid: target.bssid,
-        });
+        }, attack_id);
         // Don't give up — some APs send M1 after auth alone (hcxdumptool style)
     }
 
     // Step 3: Wait for EAPOL M1 with PMKID
-    update_phase(info, PmkidPhase::WaitingM1);
+    update_phase(shared, info, PmkidPhase::WaitingM1, attack_id);
 
-    match wait_eapol_m1(
+    let t = Instant::now();
+    let m1_result = wait_eapol_m1(
         reader, &target.bssid, our_mac,
         params.m1_timeout, running, info, events, attack_start,
-        &mut capture_db, &target.ssid,
-    ) {
+        &mut capture_db, &target.ssid, shared, attack_id,
+    );
+    wait_time += t.elapsed();
+    match m1_result {
         EapolResult::PmkidCaptured { pmkid, anonce, key_version } => {
             result.status = PmkidStatus::Captured;
             result.pmkid = Some(pmkid);
@@ -872,14 +932,14 @@ fn attack_single_ap(
                 info.pmkids_captured += 1;
             }
 
-            push_event(events, attack_start, PmkidEventKind::PmkidCaptured {
+            push_event(shared, events, attack_start, PmkidEventKind::PmkidCaptured {
                 bssid: target.bssid,
                 ssid: target.ssid.clone(),
                 pmkid,
                 channel: target.channel,
                 rssi: target.rssi,
                 elapsed_ms: target_start.elapsed().as_millis() as u64,
-            });
+            }, attack_id);
         }
         EapolResult::M1NoPmkid { anonce, key_version } => {
             result.status = PmkidStatus::NoPmkid;
@@ -891,10 +951,10 @@ fn attack_single_ap(
                 info.aps_no_pmkid += 1;
             }
 
-            push_event(events, attack_start, PmkidEventKind::NoPmkid {
+            push_event(shared, events, attack_start, PmkidEventKind::NoPmkid {
                 bssid: target.bssid,
                 ssid: target.ssid.clone(),
-            });
+            }, attack_id);
         }
         EapolResult::Timeout => {
             result.status = if assoc_ok {
@@ -908,10 +968,10 @@ fn attack_single_ap(
                 info.pmkids_failed += 1;
             }
 
-            push_event(events, attack_start, PmkidEventKind::M1Timeout {
+            push_event(shared, events, attack_start, PmkidEventKind::M1Timeout {
                 bssid: target.bssid,
                 ssid: target.ssid.clone(),
-            });
+            }, attack_id);
         }
         EapolResult::Stopped => {
             result.status = PmkidStatus::Stopped;
@@ -919,9 +979,9 @@ fn attack_single_ap(
     }
 
     // Step 4: Cleanup + unlock channel
-    disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info, tx_opts);
+    disassoc_cleanup(shared, our_mac, target, params, events, attack_start, info, tx_opts, attack_id);
     shared.unlock_channel();
-    push_event(events, attack_start, PmkidEventKind::ChannelUnlocked);
+    push_event(shared, events, attack_start, PmkidEventKind::ChannelUnlocked, attack_id);
 
     result.elapsed = target_start.elapsed();
 
@@ -929,14 +989,15 @@ fn attack_single_ap(
     {
         let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
         info.elapsed = attack_start.elapsed();
-        let secs = info.elapsed.as_secs_f64();
-        if secs > 0.0 {
-            info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / secs;
+        info.wait_time += wait_time;
+        let active_secs = info.elapsed.saturating_sub(info.wait_time).as_secs_f64();
+        if active_secs > 0.0 {
+            info.frames_per_sec = (info.frames_sent + info.frames_received) as f64 / active_secs;
         }
         info.tx_feedback = tx_fb.snapshot();
     }
 
-    push_target_complete(events, attack_start, &result);
+    push_target_complete(shared, events, attack_start, &result, attack_id);
     result
 }
 
@@ -1037,6 +1098,8 @@ fn wait_eapol_m1(
     attack_start: Instant,
     capture_db: &mut CaptureDatabase,
     ssid: &str,
+    shared: &SharedAdapter,
+    attack_id: AttackId,
 ) -> EapolResult {
     let deadline = Instant::now() + timeout;
 
@@ -1065,10 +1128,10 @@ fn wait_eapol_m1(
                         for event in capture_events {
                             match event {
                                 CaptureEvent::PmkidCaptured { pmkid, .. } => {
-                                    push_event(events, attack_start, PmkidEventKind::EapolM1Received {
+                                    push_event(shared, events, attack_start, PmkidEventKind::EapolM1Received {
                                         bssid: *bssid,
                                         has_pmkid: true,
-                                    });
+                                    }, attack_id);
 
                                     if let Some(hs) = capture_db.best_handshake(bssid) {
                                         if let Some(anonce) = hs.anonce {
@@ -1082,10 +1145,10 @@ fn wait_eapol_m1(
                                 }
                                 CaptureEvent::HandshakeMessage { message, .. } => {
                                     if message == eapol::HandshakeMessage::M1 {
-                                        push_event(events, attack_start, PmkidEventKind::EapolM1Received {
+                                        push_event(shared, events, attack_start, PmkidEventKind::EapolM1Received {
                                             bssid: *bssid,
                                             has_pmkid: false,
-                                        });
+                                        }, attack_id);
                                         if let Some(hs) = capture_db.best_handshake(bssid) {
                                             if let Some(anonce) = hs.anonce {
                                                 if hs.has_pmkid {
@@ -1169,12 +1232,13 @@ fn disassoc_cleanup(
     attack_start: Instant,
     info: &Arc<Mutex<PmkidInfo>>,
     tx_opts: &TxOptions,
+    attack_id: AttackId,
 ) {
     if !params.disassoc_after {
         return;
     }
 
-    update_phase(info, PmkidPhase::Cleanup);
+    update_phase(shared, info, PmkidPhase::Cleanup, attack_id);
 
     let disassoc = frames::build_disassoc(
         our_mac,
@@ -1188,9 +1252,9 @@ fn disassoc_cleanup(
         info.frames_sent += 1;
     }
 
-    push_event(events, attack_start, PmkidEventKind::DisassocSent {
+    push_event(shared, events, attack_start, PmkidEventKind::DisassocSent {
         bssid: target.bssid,
-    });
+    }, attack_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1198,35 +1262,76 @@ fn disassoc_cleanup(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn push_event(
+    shared: &SharedAdapter,
     events: &Arc<EventRing<PmkidEvent>>,
     start: Instant,
     kind: PmkidEventKind,
+    attack_id: AttackId,
 ) {
     let seq = events.seq() + 1;
-    events.push(PmkidEvent {
+    let timestamp = start.elapsed();
+
+    // Emit into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackEvent {
+        id: attack_id,
         seq,
-        timestamp: start.elapsed(),
-        kind,
-    });
+        timestamp,
+        event: AttackEventKind::Pmkid(kind.clone()),
+    }]);
+
+    // Push to legacy EventRing (still consumed by CLI polling path)
+    events.push(PmkidEvent { seq, timestamp, kind });
 }
 
 fn push_target_complete(
+    shared: &SharedAdapter,
     events: &Arc<EventRing<PmkidEvent>>,
     start: Instant,
     result: &PmkidResult,
+    attack_id: AttackId,
 ) {
-    push_event(events, start, PmkidEventKind::TargetComplete {
+    push_event(shared, events, start, PmkidEventKind::TargetComplete {
         bssid: result.bssid,
         ssid: result.ssid.clone(),
         status: result.status,
         elapsed_ms: result.elapsed.as_millis() as u64,
-    });
+    }, attack_id);
 }
 
-fn update_phase(info: &Arc<Mutex<PmkidInfo>>, phase: PmkidPhase) {
+fn update_phase(
+    shared: &SharedAdapter,
+    info: &Arc<Mutex<PmkidInfo>>,
+    phase: PmkidPhase,
+    attack_id: AttackId,
+) {
+    // Emit phase change into the delta stream
+    shared.emit_updates(vec![StoreUpdate::AttackPhaseChanged {
+        id: attack_id,
+        phase: phase.to_attack_phase(),
+    }]);
+
+    // Update legacy Info struct (still consumed by CLI polling path)
     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
     info.phase = phase;
     info.elapsed = info.start_time.elapsed();
+}
+
+fn emit_counters(
+    shared: &SharedAdapter,
+    attack_id: AttackId,
+    info: &Arc<Mutex<PmkidInfo>>,
+    start: Instant,
+    tx_fb: &Arc<crate::core::TxFeedback>,
+) {
+    let info = info.lock().unwrap_or_else(|e| e.into_inner());
+    shared.emit_updates(vec![StoreUpdate::AttackCountersUpdate {
+        id: attack_id,
+        frames_sent: info.frames_sent,
+        frames_received: info.frames_received,
+        frames_per_sec: info.frames_per_sec,
+        elapsed: start.elapsed(),
+        tx_feedback: tx_fb.snapshot(),
+    }]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
