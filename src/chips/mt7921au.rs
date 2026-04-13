@@ -3442,27 +3442,19 @@ impl Mt7921au {
         } else {
             MCU_EXT_CMD_CHANNEL_SWITCH
         };
-        // DPD (Digital Pre-Distortion) calibration control:
-        //   CH_SWITCH_NORMAL (0) — full calibration including DPD, ~100-300ms extra
-        //   CH_SWITCH_SCAN_BYPASS_DPD (9) — skip DPD for faster switch
+        // Switch reason — from Linux mt7921_mcu_set_chan_info() (mcu.c:899):
+        //   CH_SWITCH_NORMAL (0) — full calibration including DPD + AGC
+        //   CH_SWITCH_SCAN_BYPASS_DPD (9) — skip DPD for faster switch (STA scan mode)
         //
-        // DPD is only needed for accurate TX power linearity. Use BYPASS for:
-        //   - Passive monitor/scanning (RX only)
-        //   - Rapid channel hopping (speed > TX accuracy)
-        // Use NORMAL for:
-        //   - AP mode (beacons must be properly powered)
-        //   - Band transitions (new RF frontend needs calibration)
-        //   - SET_RX_PATH commands (6GHz always needs full cal)
+        // CRITICAL: Linux uses CH_SWITCH_NORMAL for ALL switches in monitor mode!
+        //   if (cmd == SET_RX_PATH || flags & IEEE80211_CONF_MONITOR)
+        //       req.switch_reason = CH_SWITCH_NORMAL;
+        //
+        // CH_SWITCH_NORMAL triggers full RX calibration including AGC — without it,
+        // the receiver sensitivity may be degraded, especially on 2.4GHz where AGC
+        // tuning matters more due to interference. BYPASS_DPD skips this.
         const CH_SWITCH_NORMAL: u8 = 0;
-        const CH_SWITCH_SCAN_BYPASS_DPD: u8 = 9;
-        let is_band_change = channel.band != prev_band;
-        let switch_reason = if cmd == MCU_EXT_CMD_SET_RX_PATH {
-            CH_SWITCH_NORMAL // SET_RX_PATH always uses full cal
-        } else if is_band_change {
-            CH_SWITCH_NORMAL // Band transitions need DPD recalibration
-        } else {
-            CH_SWITCH_SCAN_BYPASS_DPD // Same-band hops: skip DPD for speed
-        };
+        let switch_reason = CH_SWITCH_NORMAL; // Monitor mode: always full cal (matches Linux)
         self.mcu_set_chan_info(cmd, channel, switch_reason)?;
 
         // Set band-specific MAC timing — CCA, PLCP, SIFS, slot time.
