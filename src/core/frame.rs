@@ -277,6 +277,9 @@ pub struct RxFrame {
     pub is_dl_ofdma: bool,
     /// Dual carrier modulation (HE-specific).
     pub is_dcm: bool,
+    /// FCS (CRC) error detected — frame may be corrupted.
+    /// Useful for jamming detection, interference analysis, partial captures.
+    pub is_fcs_error: bool,
     /// Doppler detected.
     pub is_doppler: bool,
     /// Packet extension. 3-bit.
@@ -387,6 +390,7 @@ impl Default for RxFrame {
             is_mu_mimo: false,
             is_dl_ofdma: false,
             is_dcm: false,
+            is_fcs_error: false,
             is_doppler: false,
             pkt_extension: 0,
             coarse_cfo_i: 0,

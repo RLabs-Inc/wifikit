@@ -1406,6 +1406,7 @@ fn build_complete_frame(slot: &PendingFrame, phy: &PhyStatus) -> RxFrame {
         is_mu_mimo: if phy.ie2_present { phy.ie2_is_mu_mimo } else { false },
         is_dl_ofdma: if phy.ie2_present { phy.ie2_is_dl_ofdma } else { false },
         is_dcm: if phy.ie2_present { phy.ie2_is_dcm } else { false },
+        is_fcs_error: false, // RTL8852AU drops FCS errors before reaching here
         is_doppler: if phy.ie2_present { phy.ie2_is_doppler } else { false },
         pkt_extension: if phy.ie2_present { phy.ie2_pkt_extension } else { 0 },
         coarse_cfo_i: if phy.ie2_present { phy.ie2_coarse_cfo_i } else { 0 },

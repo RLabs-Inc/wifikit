@@ -3315,6 +3315,67 @@ impl Mt7921au {
         Ok(())
     }
 
+    /// Send STA_REC_UPDATE — register a station record in firmware.
+    /// Matches mt7921_mcu_sta_update() → mt76_connac_mcu_sta_cmd() from Linux.
+    ///
+    /// For monitor mode, Linux creates a broadcast station record (sta=NULL, offload_fw=true)
+    /// with CONNECTION_INFRA_BC to handle broadcast/multicast frames. This is called from
+    /// mt7921_bss_info_changed() with BSS_CHANGED_ASSOC.
+    ///
+    /// The command structure is:
+    ///   sta_req_hdr (8 bytes) + sta_rec_basic TLV (20 bytes)
+    /// Sent via MCU_UNI_CMD(STA_REC_UPDATE) = 0x03
+    fn mcu_sta_update(&mut self, enable: bool) -> Result<()> {
+        const MCU_UNI_CMD_STA_REC_UPDATE: u16 = 0x03;
+        const STA_REC_BASIC: u16 = 0; // tag
+
+        let bss_idx: u8 = 0;
+        let omac_idx: u8 = 0;
+        let wcid_idx: u16 = 543; // MT792x_WTBL_RESERVED - bss_idx
+
+        // CONNECTION_INFRA_BC = STA_TYPE_BC(BIT(4)) | NETWORK_INFRA(BIT(16))
+        let conn_type: u32 = (1u32 << 4) | (1u32 << 16); // 0x10010
+        let conn_state: u8 = if enable { 2 } else { 0 }; // CONN_STATE_PORT_SECURE / DISCONNECT
+
+        // sta_req_hdr (8 bytes)
+        // [0]   bss_idx
+        // [1]   wlan_idx_lo (lower 8 bits of WCID)
+        // [2-3] tlv_num (le16) — number of TLVs following
+        // [4]   is_tlv_append = 1
+        // [5]   muar_idx = 0xe (for broadcast STA, not associated)
+        // [6]   wlan_idx_hi (upper 8 bits of WCID)
+        // [7]   rsv
+        let hdr_len = 8;
+        let basic_len = 20;
+        let total = hdr_len + basic_len;
+        let mut req = vec![0u8; total];
+
+        // Header
+        req[0] = bss_idx;
+        req[1] = (wcid_idx & 0xFF) as u8; // wlan_idx_lo
+        req[2..4].copy_from_slice(&1u16.to_le_bytes()); // tlv_num = 1
+        req[4] = 1; // is_tlv_append
+        req[5] = 0x0e; // muar_idx = 0xe for broadcast (non-associated) STA
+        req[6] = ((wcid_idx >> 8) & 0xFF) as u8; // wlan_idx_hi
+
+        // STA_REC_BASIC TLV (20 bytes)
+        let t = hdr_len;
+        req[t..t+2].copy_from_slice(&STA_REC_BASIC.to_le_bytes()); // tag
+        req[t+2..t+4].copy_from_slice(&(basic_len as u16).to_le_bytes()); // len
+        req[t+4..t+8].copy_from_slice(&conn_type.to_le_bytes()); // conn_type
+        req[t+8] = conn_state; // conn_state
+        req[t+9] = 1; // qos = true (WMM enabled)
+        req[t+10..t+12].copy_from_slice(&0u16.to_le_bytes()); // aid = 0 (broadcast)
+        // peer_addr[6] at t+12..t+18 = broadcast FF:FF:FF:FF:FF:FF
+        req[t+12..t+18].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        // extra_info: EXTRA_INFO_VER(bit 0) | EXTRA_INFO_NEW(bit 1) if newly created
+        let extra = if enable { 0x03u16 } else { 0x01u16 }; // VER + NEW
+        req[t+18..t+20].copy_from_slice(&extra.to_le_bytes());
+
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_STA_REC_UPDATE, &req, true)?;
+        Ok(())
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     //  Monitor / Sniffer Mode
     // ══════════════════════════════════════════════════════════════════════════
@@ -3896,7 +3957,12 @@ impl ChipDriver for Mt7921au {
         // This sends DEV_INFO_UPDATE + BSS_INFO_UPDATE (BASIC + QOS + RLM TLVs).
         self.mcu_add_dev()?;
 
-        // STEP 1b: Set EDCA QoS parameters — channel access timing per AC.
+        // STEP 1b: Register broadcast station record in firmware.
+        // Matches Linux mt7921_mcu_sta_update(dev, NULL, vif, true, STATE_NONE).
+        // Firmware needs a STA_REC entry to know how to route received frames.
+        self.mcu_sta_update(true)?;
+
+        // STEP 1c: Set EDCA QoS parameters — channel access timing per AC.
         // Matches Linux mt7921_mcu_set_tx() called during BSS_CHANGED_QOS.
         // Without this, firmware uses conservative defaults that affect frame delivery.
         self.mcu_set_edca()?;
@@ -4485,11 +4551,13 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
     let has_group3 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_3) != 0;
     let has_group4 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_4) != 0;
     let has_group5 = (rxd_dw1 & MT_RXD1_NORMAL_GROUP_5) != 0;
-    // Drop FCS errors — corrupted frames create phantom APs/stations.
+    // FCS error flag — frame may be corrupted but still valuable for:
+    // - Jamming/interference detection
+    // - Partial frame capture analysis
+    // - Signal quality assessment
+    // The frame is passed through with is_fcs_error=true, letting the
+    // scanner/store decide whether to use it.
     let fcs_err = (rxd_dw1 & MT_RXD1_NORMAL_FCS_ERR) != 0;
-    if fcs_err {
-        return (consumed, ParsedPacket::Skip);
-    }
 
     let rxd_dw2 = u32::from_le_bytes([rxd[8], rxd[9], rxd[10], rxd[11]]);
     let hdr_trans = (rxd_dw2 & MT_RXD2_NORMAL_HDR_TRANS) != 0;
@@ -4776,6 +4844,7 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
         is_amsdu,
         rx_path_en,
         is_dcm,
+        is_fcs_error: fcs_err,
         ..Default::default()
     }))
 }
