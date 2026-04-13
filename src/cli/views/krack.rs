@@ -1,12 +1,17 @@
 //! CLI renderer + Module implementation for the KRACK attack.
 
+use std::collections::VecDeque;
+
 use crate::attacks::krack::{
     KrackAttack, KrackEvent, KrackEventKind, KrackFinalResult, KrackInfo, KrackParams,
     KrackPhase, KrackVerdict,
 };
 use crate::core::MacAddress;
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::s;
+use super::{fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -140,7 +145,7 @@ pub fn format_event(event: &KrackEvent) -> String {
 //  Active zone render
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn render_krack_view(info: &KrackInfo, width: u16, _height: u16, scroll_offset: usize) -> Vec<String> {
+pub fn render_krack_view(info: &KrackInfo, width: u16, _height: u16, scroll_offset: usize, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
 
@@ -154,6 +159,9 @@ pub fn render_krack_view(info: &KrackInfo, width: u16, _height: u16, scroll_offs
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
+
+    // Breathing room above the frame
+    lines.push(String::new());
 
     // ═══ Header border with title ═══
     let title = s().red().bold().paint(" krack ");
@@ -188,6 +196,13 @@ pub fn render_krack_view(info: &KrackInfo, width: u16, _height: u16, scroll_offs
     } else if !info.running {
         lines.push(vline(&s().dim().paint("Idle"), inner_w));
     }
+
+    // TX stats line
+    if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+        lines.push(vline(&tx_line, inner_w));
+    }
+
+    lines.push(empty_line());
 
     // ═══ Step progress ═══
     if info.running || info.phase == KrackPhase::Done {
@@ -225,7 +240,14 @@ pub fn render_krack_view(info: &KrackInfo, width: u16, _height: u16, scroll_offs
 
         let arrow = s().dim().paint(" \u{2192} ");
         let steps = format!("{}{}{}{}{}", deauth_step, arrow, hs_step, arrow, replay_step);
-        lines.push(vline(&steps, inner_w));
+
+        // Append FPS sparkline to the step line when we have throughput data
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -414,21 +436,97 @@ use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyl
 pub struct KrackModule {
     attack: KrackAttack,
     cached_info: Option<KrackInfo>,
-    pending_events: Vec<KrackEvent>,
     scroll_offset: usize,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl KrackModule {
     pub fn new(params: KrackParams) -> Self {
-        Self { attack: KrackAttack::new(params), cached_info: None, pending_events: Vec::new(), scroll_offset: 0 }
+        Self {
+            attack: KrackAttack::new(params),
+            cached_info: None,
+            scroll_offset: 0,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
+        }
     }
 
     pub fn attack(&self) -> &KrackAttack { &self.attack }
 
-    pub fn drain_events(&mut self) -> Vec<KrackEvent> {
-        let events = self.attack.events();
-        self.pending_events.extend(events.iter().cloned());
-        events
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("krack-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Krack, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Krack(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    let event = KrackEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Krack, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, frames_received, nonce reuses update continuously.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 }
 
@@ -437,7 +535,8 @@ impl Module for KrackModule {
     fn description(&self) -> &str { "KRACK key reinstallation — 11 variants" }
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
-    fn start(&mut self, _shared: crate::adapter::SharedAdapter) {
+    fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("krack-ui"));
         panic!("KrackModule: use attack().start(shared, target) instead");
     }
 
@@ -447,9 +546,8 @@ impl Module for KrackModule {
     fn views(&self) -> &[ViewDef] { &[] }
 
     fn render(&mut self, _view: usize, width: u16, height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_krack_view(&info, width, height, self.scroll_offset)
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_krack_view(&info, width, height, self.scroll_offset, &self.fps_history)
     }
 
     fn handle_key(&mut self, key: &prism::KeyEvent, _view: usize) -> bool {
@@ -464,12 +562,15 @@ impl Module for KrackModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned().unwrap_or_else(|| self.attack.info());
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
         let final_result = KrackFinalResult {
             results: info.results.clone(),
             variants_tested: info.variants_tested,
@@ -520,6 +621,7 @@ impl Module for KrackModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::time::Duration;
     use crate::attacks::krack::{KrackTestResult, KrackVariant};
     use crate::core::MacAddress;
@@ -541,7 +643,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = KrackInfo::default();
-        let lines = render_krack_view(&info, 80, 40, 0);
+        let lines = render_krack_view(&info, 80, 40, 0, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 
@@ -617,7 +719,7 @@ mod tests {
         }).collect();
         info.results[0].verdict = KrackVerdict::Vulnerable;
         info.results[0].nonce_reuses = 2;
-        let lines = render_krack_view(&info, 120, 40, 0);
+        let lines = render_krack_view(&info, 120, 40, 0, &VecDeque::new());
         // bordered view with target, steps, progress, results table, bottom border
         // In test env, term_height may be small so results get scroll-capped
         assert!(lines.len() >= 5, "expected >= 5 lines, got {}", lines.len());

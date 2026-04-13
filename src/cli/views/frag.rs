@@ -6,12 +6,17 @@
 //! - Results table showing verdicts (vulnerable/not/skipped)
 //! - Event log scrollback with injection and response details
 
+use std::collections::VecDeque;
+
 use crate::attacks::frag::{
     FragAttack, FragEvent, FragEventKind, FragFinalResult, FragInfo, FragParams,
     FragPhase, FragVerdict,
 };
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate};
+use super::{signal_bar, fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -172,7 +177,7 @@ pub fn format_event(event: &FragEvent) -> String {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Render the FragAttacks test progress view for the Layout active zone.
-pub fn render_frag_view(info: &FragInfo, width: u16, _height: u16, scroll_offset: usize) -> Vec<String> {
+pub fn render_frag_view(info: &FragInfo, width: u16, _height: u16, scroll_offset: usize, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
 
@@ -185,6 +190,9 @@ pub fn render_frag_view(info: &FragInfo, width: u16, _height: u16, scroll_offset
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
+
+    // Breathing room above the frame
+    lines.push(String::new());
 
     // ═══ Header border ═══
     let title = s().red().bold().paint(" fragattacks ");
@@ -201,22 +209,18 @@ pub fn render_frag_view(info: &FragInfo, width: u16, _height: u16, scroll_offset
             s().bold().paint(&prism::truncate(&info.target_ssid, 24, "\u{2026}"))
         };
 
-        // RSSI bar
-        fn rssi_green(t: &str) -> String { s().green().paint(t) }
-        fn rssi_yellow(t: &str) -> String { s().yellow().paint(t) }
-        fn rssi_red(t: &str) -> String { s().red().paint(t) }
-        let rssi_val = (info.target_rssi + 100).max(0).min(60) as u64;
-        let rssi_bar = prism::render_progress_bar(rssi_val, &prism::RenderOptions {
-            total: 60, width: 8, style: prism::BarStyle::Bar,
-            color: Some(if info.target_rssi > -50 { rssi_green }
-                else if info.target_rssi > -70 { rssi_yellow }
-                else { rssi_red }),
-            ..Default::default()
-        });
+        // Signal bars (same style as PMKID — compact 4-char blocks)
+        let signal = signal_bar(info.target_rssi);
 
-        lines.push(vline(&format!("{}  {}  ch{}  {} dBm {}",
+        lines.push(vline(&format!("{}  {}  ch{}  {}  {}dBm",
             ssid_display, s().dim().paint(&info.target_bssid.to_string()),
-            info.target_channel, info.target_rssi, rssi_bar), inner_w));
+            info.target_channel, signal,
+            s().dim().paint(&format!("{}", info.target_rssi))), inner_w));
+
+        // TX stats line
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        }
     }
 
     // ═══ Step progress ═══
@@ -244,7 +248,15 @@ pub fn render_frag_view(info: &FragInfo, width: u16, _height: u16, scroll_offset
         };
 
         let arrow = s().dim().paint(" \u{2192} ");
-        lines.push(vline(&format!("{}{}{}{}{}", lock_step, arrow, inject_step, arrow, monitor_step), inner_w));
+        let steps = format!("{}{}{}{}{}", lock_step, arrow, inject_step, arrow, monitor_step);
+
+        // Append FPS sparkline to the step line when we have throughput data
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -426,11 +438,24 @@ pub fn status_segments(info: &FragInfo) -> Vec<StatusSegment> {
 use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyle};
 
 /// FragModule wraps FragAttack with the Module trait for the shell's focus stack.
+///
+/// Delta-driven: subscribes to the streaming pipeline via UpdateSubscriber.
+/// Events arrive as AttackEvent deltas, counters as AttackCountersUpdate, etc.
+/// The module processes deltas in tick(), caches info, and queues scrollback lines.
 pub struct FragModule {
     attack: FragAttack,
     cached_info: Option<FragInfo>,
-    pending_events: Vec<FragEvent>,
     scroll_offset: usize,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl FragModule {
@@ -439,8 +464,12 @@ impl FragModule {
         Self {
             attack,
             cached_info: None,
-            pending_events: Vec::new(),
             scroll_offset: 0,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -449,11 +478,68 @@ impl FragModule {
         &self.attack
     }
 
-    /// Drain new events since last call.
-    pub fn drain_events(&mut self) -> Vec<FragEvent> {
-        let events = self.attack.events();
-        self.pending_events.extend(events.iter().cloned());
-        events
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("frag-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Frag, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Frag(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    let event = FragEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Frag, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, frames_received update continuously.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 
     /// Get current attack info. Used by the shell for external state access.
@@ -468,11 +554,8 @@ impl Module for FragModule {
     fn description(&self) -> &str { "FragAttacks — 12 CVE vulnerability tests" }
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
-    fn start(&mut self, _shared: crate::adapter::SharedAdapter) {
-        // Target should be set before calling start().
-        // The shell calls attack().start(shared, target) directly.
-        // This fallback creates a dummy target — shell should use
-        // attack().start(shared, target) for proper operation.
+    fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("frag-ui"));
         panic!("FragModule: use attack().start(shared, target) instead");
     }
 
@@ -493,9 +576,8 @@ impl Module for FragModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_frag_view(&info, width, height, self.scroll_offset)
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_frag_view(&info, width, height, self.scroll_offset, &self.fps_history)
     }
 
     fn handle_key(&mut self, key: &prism::KeyEvent, _view: usize) -> bool {
@@ -510,12 +592,15 @@ impl Module for FragModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
         let final_result = FragFinalResult {
             results: info.results.clone(),
@@ -569,6 +654,7 @@ impl Module for FragModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::time::Duration;
     use crate::attacks::frag::{FragTestResult, FragVariant};
     use crate::core::MacAddress;
@@ -595,7 +681,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = FragInfo::default();
-        let lines = render_frag_view(&info, 80, 40, 0);
+        let lines = render_frag_view(&info, 80, 40, 0, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 
@@ -635,7 +721,7 @@ mod tests {
             r
         }).collect();
 
-        let lines = render_frag_view(&info, 120, 40, 0);
+        let lines = render_frag_view(&info, 120, 40, 0, &VecDeque::new());
         // Bordered view with target, steps, progress, results, bottom border
         // In test env, term_height may be small so results get scroll-capped
         assert!(lines.len() >= 5, "expected >= 5 lines, got {}", lines.len());

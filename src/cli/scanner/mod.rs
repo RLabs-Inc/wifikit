@@ -767,14 +767,13 @@ impl ScannerModule {
     }
 
     /// Status bar segments for the scanner (shown even when not focused).
-    /// Uses cached snapshot if available; falls back to reading stats directly.
-    /// Returns StatusSegment directly — no lossy prism::Segment bridge.
+    /// Always reads fresh stats from the store — stats() is cheap (atomics +
+    /// one small mutex). The cached_snapshot is only refreshed during render(),
+    /// which only runs for the focused module, so relying on it here would
+    /// freeze the status bar whenever an attack has focus.
     pub fn status_segments(&self) -> Vec<StatusSegment> {
-        let (stats, channel) = if let Some(ref snap) = self.cached_snapshot {
-            (snap.stats.clone(), snap.channel)
-        } else {
-            (self.store.stats(), self.scanner.current_channel())
-        };
+        let stats = self.store.stats();
+        let channel = self.store.current_channel();
         let elapsed = style::format_elapsed_precise(stats.elapsed);
 
         // Discovery counts with handshakes/PMKIDs when captured

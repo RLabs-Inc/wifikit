@@ -601,6 +601,7 @@ impl FrameStore {
                             sta.is_randomized = *is_randomized;
                             sta.last_channel = *channel;
                             sta.rssi = *rssi;
+                            sta.rssi_samples.push_back((elapsed, *rssi));
                             sta
                         });
                     });
@@ -627,6 +628,10 @@ impl FrameStore {
                         if let Some(r) = rssi {
                             sta.rssi = *r;
                             if *r > sta.rssi_best { sta.rssi_best = *r; }
+                            if sta.rssi_samples.len() >= MAX_RSSI_SAMPLES {
+                                sta.rssi_samples.pop_front();
+                            }
+                            sta.rssi_samples.push_back((elapsed, *r));
                         }
                         sta.last_channel = *channel;
                         sta.last_seen = now;

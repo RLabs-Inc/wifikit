@@ -8,12 +8,17 @@
 //! - PIN/PSK result when found
 //! - Event log scrollback
 
+use std::collections::VecDeque;
+
 use crate::attacks::wps::{
     SubAttackInfo, WpsAttack, WpsAttackType, WpsEvent, WpsEventKind, WpsInfo,
     WpsParams, WpsPhase, WpsStatus,
 };
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate, BorderStyle, FrameOptions};
+use super::{signal_bar, fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -370,27 +375,6 @@ fn fmt_elapsed(secs: f64) -> String {
     prism::format_time((secs * 1000.0) as u64)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Signal Intelligence rendering helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Render signal strength as bar characters.
-fn signal_bar(rssi: i8) -> String {
-    let bars = match rssi {
-        -50..=0 => "\u{2582}\u{2584}\u{2586}\u{2588}",
-        -60..=-51 => "\u{2582}\u{2584}\u{2586}\u{2591}",
-        -70..=-61 => "\u{2582}\u{2584}\u{2591}\u{2591}",
-        -80..=-71 => "\u{2582}\u{2591}\u{2591}\u{2591}",
-        _ => "\u{2591}\u{2591}\u{2591}\u{2591}",
-    };
-    let color_fn = match rssi {
-        -50..=0 => |t: &str| s().green().paint(t),
-        -70..=-51 => |t: &str| s().yellow().paint(t),
-        _ => |t: &str| s().red().paint(t),
-    };
-    color_fn(bars)
-}
-
 /// Render a sub-attack line for the active zone.
 fn render_sub_attack(sub: &SubAttackInfo, spinner_frame: &str, inner_w: usize) -> String {
     if sub.active {
@@ -466,7 +450,7 @@ fn render_trophy(pin: &str, psk: &str, inner_w: usize) -> Vec<String> {
 ///   9. Trophy box (on success)
 ///   10. Dashed separator
 ///   11. Footer: result counts + total metrics + key hints
-pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset: usize) -> Vec<String> {
+pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset: usize, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
     // Cap active zone: max 80% of terminal height (spec), leave room for scrollback + REPL
@@ -729,9 +713,15 @@ pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset:
         lines.push(empty_line());
         let pipeline_str = pipeline_parts.join(&format!(" {} ", arr));
 
-        // Elapsed for the pipeline
+        // Elapsed for the pipeline + FPS sparkline
         let elapsed_str = fmt_elapsed(info.start_time.elapsed().as_secs_f64());
-        let pipeline_line = format!("      {}          {}", pipeline_str, s().dim().paint(&elapsed_str));
+        let spark_str = if fps_history.len() > 1 {
+            format!("  {}", fps_sparkline(fps_history, 12))
+        } else {
+            String::new()
+        };
+        let pipeline_line = format!("      {}          {}{}",
+            pipeline_str, s().dim().paint(&elapsed_str), spark_str);
         let pipeline_w = prism::measure_width(&pipeline_line);
 
         if pipeline_w <= inner_w {
@@ -739,22 +729,24 @@ pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset:
         } else {
             // Two lines if too wide
             lines.push(vline(&format!("      {}", pipeline_str), inner_w));
-            lines.push(vline(&format!("      {}", s().dim().paint(&elapsed_str)), inner_w));
+            lines.push(vline(&format!("      {}{}",
+                s().dim().paint(&elapsed_str), spark_str), inner_w));
         }
 
-        // ═══ 7. Live metrics line ═══
-        let mut metrics = Vec::new();
-        if info.frames_sent > 0 {
-            metrics.push(format!("tx: {}", info.frames_sent));
-        }
-        if info.frames_received > 0 {
-            metrics.push(format!("rx: {}", info.frames_received));
-        }
-        if let Some(pct) = info.tx_feedback.delivery_pct() {
-            metrics.push(format!("ack: {}%", pct as u64));
-        }
-        if !metrics.is_empty() {
-            lines.push(vline(&format!("      {}", s().dim().paint(&metrics.join("  "))), inner_w));
+        // ═══ 7. Live metrics line (TX delivery bar + stats) ═══
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        } else {
+            let mut metrics = Vec::new();
+            if info.frames_sent > 0 {
+                metrics.push(format!("tx: {}", info.frames_sent));
+            }
+            if info.frames_received > 0 {
+                metrics.push(format!("rx: {}", info.frames_received));
+            }
+            if !metrics.is_empty() {
+                lines.push(vline(&format!("      {}", s().dim().paint(&metrics.join("  "))), inner_w));
+            }
         }
     }
 
@@ -1063,10 +1055,22 @@ pub struct WpsModule {
     attack: WpsAttack,
     /// Target APs for starting the attack. Single or multi-target.
     targets: Vec<Ap>,
-    /// Cached info for rendering — refreshed each render cycle.
+    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<WpsInfo>,
     /// Scroll offset for results table (j/k navigation).
     scroll_offset: usize,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
+    /// Set when a TargetComplete event is seen — triggers freeze summary in tick().
+    pending_target_complete: bool,
 }
 
 impl WpsModule {
@@ -1077,6 +1081,12 @@ impl WpsModule {
             targets: Vec::new(),
             cached_info: None,
             scroll_offset: 0,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
+            pending_target_complete: false,
         }
     }
 
@@ -1096,15 +1106,99 @@ impl WpsModule {
         self.targets = targets;
     }
 
-    /// Drain new events since last call. Used by the shell to print to scrollback.
-    pub fn drain_events(&mut self) -> Vec<WpsEvent> {
-        self.attack.events()
-    }
-
     /// Get current attack info.
     #[allow(dead_code)]
     pub fn info(&self) -> WpsInfo {
         self.attack.info()
+    }
+
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("wps-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    /// Filters for this attack's deltas, marks dirty, and accumulates scrollback lines.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Wps, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Wps(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    // Detect TargetComplete events for freeze summary generation
+                    if matches!(kind, WpsEventKind::TargetComplete { .. }) {
+                        self.pending_target_complete = true;
+                    }
+                    let event = WpsEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Wps, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    ///
+    /// Called by poll_modules() every frame. This is the single entry point for
+    /// delta processing -- render() and status_segments() just read cached_info.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, frames_received, fps update continuously between
+        // delta emissions.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        // Generate freeze summary for completed targets
+        if self.pending_target_complete {
+            self.pending_target_complete = false;
+            if let Some(ref info) = self.cached_info {
+                if let Some(result) = info.results.last() {
+                    let summary = freeze_target_summary(info, result);
+                    self.scrollback_lines.extend(summary);
+                }
+            }
+        }
+
+        std::mem::take(&mut self.scrollback_lines)
+    }
+
+    /// Get a reference to cached info (for app.rs freeze summary generation).
+    pub fn cached_info_ref(&self) -> Option<&WpsInfo> {
+        self.cached_info.as_ref()
     }
 }
 
@@ -1114,6 +1208,10 @@ impl Module for WpsModule {
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting attack thread
+        // so we don't miss any early deltas (like AttackStarted).
+        self.update_sub = Some(shared.gate().subscribe_updates("wps-ui"));
+
         let targets = std::mem::take(&mut self.targets);
         if !targets.is_empty() {
             self.attack.start(shared, targets);
@@ -1137,9 +1235,10 @@ impl Module for WpsModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_wps_view(&info, width, height, self.scroll_offset)
+        // tick() is called by poll_modules() before render, so cached_info is fresh.
+        // Fallback: if no cached info yet (first frame), read directly.
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_wps_view(&info, width, height, self.scroll_offset, &self.fps_history)
     }
 
     fn handle_key(&mut self, key: &prism::KeyEvent, _view: usize) -> bool {
@@ -1167,12 +1266,15 @@ impl Module for WpsModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
 
         let result_str = if let Some(ref pin) = info.pin_found {
@@ -1268,7 +1370,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = WpsInfo::default();
-        let lines = render_wps_view(&info, 80, 40, 0);
+        let lines = render_wps_view(&info, 80, 40, 0, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 
@@ -1346,7 +1448,7 @@ mod tests {
         info.channel = 6;
         info.pin_found = Some("48563290".to_string());
         info.psk_found = Some("SecretPassword".to_string());
-        let lines = render_wps_view(&info, 100, 40, 0);
+        let lines = render_wps_view(&info, 100, 40, 0, &VecDeque::new());
         assert!(lines.len() >= 4);
     }
 
@@ -1363,7 +1465,7 @@ mod tests {
         info.attempts = 1234;
         info.frames_sent = 5000;
         info.frames_received = 3000;
-        let lines = render_wps_view(&info, 100, 40, 0);
+        let lines = render_wps_view(&info, 100, 40, 0, &VecDeque::new());
         assert!(lines.len() >= 4);
     }
 }

@@ -103,7 +103,8 @@ pub fn run(ctx: &mut Ctx, args: &str) {
         None => return,
     };
 
-    let wpa3_module = Wpa3Module::new(params);
+    let mut wpa3_module = Wpa3Module::new(params);
+    wpa3_module.subscribe(&attack_adapter);
     wpa3_module.attack().start(attack_adapter, target);
     ctx.layout.print(&format!("  {} Attack started. {} to stop.",
         prism::s().green().paint("\u{25cf}"),

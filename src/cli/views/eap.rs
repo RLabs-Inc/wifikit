@@ -7,12 +7,17 @@
 //! - Per-client EAP exchange progress
 //! - Event log scrollback
 
+use std::collections::VecDeque;
+
 use crate::attacks::eap::{
     EapAttack, EapEvent, EapEventKind, EapInfo,
     EapParams, EapPhase,
 };
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate};
+use super::{fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -171,7 +176,7 @@ pub fn format_event(event: &EapEvent) -> String {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Render the EAP attack progress view for the Layout active zone.
-pub fn render_eap_view(info: &EapInfo, width: u16) -> Vec<String> {
+pub fn render_eap_view(info: &EapInfo, width: u16, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
 
@@ -185,6 +190,9 @@ pub fn render_eap_view(info: &EapInfo, width: u16) -> Vec<String> {
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
+
+    // Breathing room above the frame
+    lines.push(String::new());
 
     // ═══ Header border with mode title ═══
     let title = format!(" {} ", info.mode.name());
@@ -211,7 +219,14 @@ pub fn render_eap_view(info: &EapInfo, width: u16) -> Vec<String> {
             }
         }
         lines.push(vline(&target_line, inner_w));
+
+        // TX stats line
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        }
     }
+
+    lines.push(empty_line());
 
     // ═══ Step progress ═══
     if info.running || info.phase == EapPhase::Done {
@@ -241,7 +256,15 @@ pub fn render_eap_view(info: &EapInfo, width: u16) -> Vec<String> {
         };
 
         let arrow = s().dim().paint(" \u{2192} ");
-        lines.push(vline(&format!("{}{}{}{}{}", setup_step, arrow, listen_step, arrow, harvest_step), inner_w));
+        let steps = format!("{}{}{}{}{}", setup_step, arrow, listen_step, arrow, harvest_step);
+
+        // Append FPS sparkline to the step line when we have throughput data
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -440,8 +463,18 @@ pub struct EapModule {
     attack: EapAttack,
     /// Target AP for starting the attack.
     target: Option<Ap>,
-    /// Cached info for rendering — refreshed each render cycle.
+    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<EapInfo>,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl EapModule {
@@ -451,6 +484,11 @@ impl EapModule {
             attack,
             target: None,
             cached_info: None,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -464,9 +502,69 @@ impl EapModule {
         self.target = Some(target);
     }
 
-    /// Drain new events since last call. Used by the shell to print to scrollback.
-    pub fn drain_events(&mut self) -> Vec<EapEvent> {
-        self.attack.events()
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("eap-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    /// Filters for this attack's deltas, marks dirty, and accumulates scrollback lines.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Eap, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Eap(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    let event = EapEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Eap, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, frames_received update continuously.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 
     /// Get current attack info.
@@ -482,6 +580,8 @@ impl Module for EapModule {
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting attack thread
+        self.update_sub = Some(shared.gate().subscribe_updates("eap-ui"));
         if let Some(target) = self.target.take() {
             self.attack.start(shared, target);
         }
@@ -504,9 +604,8 @@ impl Module for EapModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, _height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_eap_view(&info, width)
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_eap_view(&info, width, &self.fps_history)
     }
 
     fn handle_key(&mut self, _key: &prism::KeyEvent, _view: usize) -> bool {
@@ -514,12 +613,15 @@ impl Module for EapModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
 
         let mut lines = Vec::new();
@@ -630,7 +732,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = EapInfo::default();
-        let lines = render_eap_view(&info, 80);
+        let lines = render_eap_view(&info, 80, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 

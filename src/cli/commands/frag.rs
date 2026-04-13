@@ -120,7 +120,8 @@ pub fn run(ctx: &mut Ctx, args: &str) {
     };
 
     // Create FragModule and start
-    let frag_module = FragModule::new(params);
+    let mut frag_module = FragModule::new(params);
+    frag_module.subscribe(&attack_adapter);
     frag_module.attack().start(attack_adapter, target);
 
     ctx.layout.print(&format!("  {} Test suite started. {} to stop.",

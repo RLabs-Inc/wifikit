@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 //! Station struct — one tracked WiFi client.
 
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::core::MacAddress;
 use crate::protocol::ieee80211::WifiGeneration;
@@ -68,6 +69,9 @@ pub struct Station {
 
     // QoS TID usage
     pub tid_counts: [u32; 8],
+
+    // RSSI history for sparkline rendering (elapsed since scan start, rssi)
+    pub rssi_samples: VecDeque<(Duration, i8)>,
 }
 
 impl Station {
@@ -114,6 +118,7 @@ impl Station {
             probe_intervals: Vec::new(),
             handshake_state: 0,
             tid_counts: [0; 8],
+            rssi_samples: VecDeque::with_capacity(super::MAX_RSSI_SAMPLES),
         }
     }
 }

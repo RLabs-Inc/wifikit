@@ -10,6 +10,7 @@
 //! the locked channel during the attack. Stations that stop sending frames
 //! have likely been disconnected by the DoS.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::attacks::dos::{
@@ -17,8 +18,12 @@ use crate::attacks::dos::{
     DosPhase, StopReason,
 };
 use crate::core::MacAddress;
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate, FrameOptions, BorderStyle};
+use crate::cli::scanner::style::rssi_sparkline;
+use super::{signal_bar, fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -132,10 +137,12 @@ pub struct ClientSnapshot {
     /// When the client was last seen quiet (>5s) before coming back.
     /// Set by update_target_clients when it detects a reconnection.
     pub reconnect_at: Option<Instant>,
+    /// RSSI history for sparkline rendering — pulled from Station.rssi_samples.
+    pub rssi_samples: VecDeque<(Duration, i8)>,
 }
 
 /// Render the DoS attack progress view for the Layout active zone.
-pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -> Vec<String> {
+pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
 
@@ -150,6 +157,9 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
 
     let mut lines = Vec::new();
 
+    // Breathing room above the frame
+    lines.push(String::new());
+
     // ═══ Header border with attack type title ═══
     let title = format!(" {} ", info.attack_type.label());
     let title_styled = s().red().bold().paint(&title);
@@ -158,6 +168,8 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
     lines.push(format!("  {}{}{}{}", bc("\u{256d}\u{2500}"), title_styled,
         bc(&"\u{2500}".repeat(remaining)), bc("\u{256e}")));
 
+    lines.push(empty_line());
+
     // ═══ Target info ═══
     let ssid_display = if info.target_ssid.is_empty() {
         s().dim().italic().paint("(hidden)")
@@ -165,25 +177,15 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
         s().bold().paint(&prism::truncate(&info.target_ssid, 24, "\u{2026}"))
     };
 
-    // RSSI bar
-    fn rssi_green(t: &str) -> String { s().green().paint(t) }
-    fn rssi_yellow(t: &str) -> String { s().yellow().paint(t) }
-    fn rssi_red(t: &str) -> String { s().red().paint(t) }
-    let rssi_val = (info.target_rssi + 100).max(0).min(60) as u64;
-    let rssi_bar = prism::render_progress_bar(rssi_val, &prism::RenderOptions {
-        total: 60, width: 8, style: prism::BarStyle::Bar,
-        color: Some(if info.target_rssi > -50 { rssi_green }
-            else if info.target_rssi > -70 { rssi_yellow }
-            else { rssi_red }),
-        ..Default::default()
-    });
+    // Signal bar (shared helper)
+    let signal = signal_bar(info.target_rssi);
 
-    let target_line = format!("{}  {}  ch{}  {} dBm {}",
+    let target_line = format!("{}  {}  ch{}  {}  {}dBm",
         ssid_display,
         s().dim().paint(&info.target_bssid.to_string()),
         info.target_channel,
-        info.target_rssi,
-        rssi_bar,
+        signal,
+        s().dim().paint(&format!("{}", info.target_rssi)),
     );
     lines.push(vline(&target_line, inner_w));
 
@@ -221,7 +223,14 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
 
         let arrow = s().dim().paint(" \u{2192} ");
         let steps = format!("{}{}{}{}{}", lock_step, arrow, flood_step, arrow, cooldown_step);
-        lines.push(vline(&steps, inner_w));
+
+        // Append FPS sparkline to the step line when we have throughput data
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -244,6 +253,11 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
                 s().bold().paint(&format!("{:.0}", pct))));
         }
         lines.push(vline(&stats, inner_w));
+
+        // TX delivery bar + compact stats (shared helper)
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        }
     }
 
     // Cooldown progress bar
@@ -273,51 +287,69 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16) -
 
     lines.push(empty_line());
 
-    // ═══ Client table ═══
+    // ═══ Client table — attack-semantic status ═══
+    //
+    // Status colors are INVERTED from scanner context:
+    //   ⟳ yellow  = reconnect cycle — deauth landing but client keeps coming back (EAPOL window!)
+    //   ✗ red     = still active (<5s) — deauth NOT working on this client
+    //   ○ dim     = going quiet (5-15s) — might be dropping, watch sparkline
+    //   ✓ green   = dropped (>15s silence) — deauth SUCCESS
     if !clients.is_empty() {
         lines.push(vline(
             &format!("{}  {}  {}  {}  {}",
                 s().bold().dim().paint(&prism::pad("CLIENT", 17, "left")),
-                s().bold().dim().paint(&prism::pad("RSSI", 5, "left")),
+                s().bold().dim().paint(&prism::pad("SIGNAL", 13, "left")),
                 s().bold().dim().paint(&prism::pad("FRAMES", 8, "left")),
-                s().bold().dim().paint(&prism::pad("LAST SEEN", 8, "left")),
+                s().bold().dim().paint(&prism::pad("STATUS", 10, "left")),
                 s().bold().dim().paint(&prism::pad("VENDOR", 15, "left"))),
             inner_w));
 
         let now = Instant::now();
         for client in clients {
             let age = now.duration_since(client.last_seen);
-            let age_str = format_age(age);
 
             let is_reconnecting = client.reconnect_at
                 .map(|t| now.duration_since(t) < Duration::from_secs(4))
                 .unwrap_or(false);
 
-            let (status_icon, mac_styled) = if is_reconnecting {
-                (s().white().bold().paint("\u{27f3}"),
-                 s().white().bold().paint(&client.mac.to_string()))
+            // Attack-semantic status: inverted from scanner
+            let (status_icon, status_label, mac_styled) = if is_reconnecting {
+                // Reconnect cycle — deauth lands, client comes back. EAPOL capture window!
+                (s().yellow().bold().paint("\u{27f3}"),
+                 s().yellow().bold().paint("reconnect"),
+                 s().yellow().bold().paint(&client.mac.to_string()))
             } else if age < Duration::from_secs(5) {
-                (s().green().paint("\u{25cf}"),
-                 s().green().paint(&client.mac.to_string()))
-            } else if age < Duration::from_secs(15) {
-                (s().yellow().paint("\u{25cb}"),
-                 s().yellow().paint(&client.mac.to_string()))
-            } else {
-                (s().red().paint("\u{2717}"),
+                // Still active — deauth not working
+                (s().red().paint("\u{25cf}"),
+                 s().red().paint("active"),
                  s().red().paint(&client.mac.to_string()))
+            } else if age < Duration::from_secs(15) {
+                // Going quiet — might be dropping
+                (s().dim().paint("\u{25cb}"),
+                 s().dim().paint("quiet"),
+                 s().dim().paint(&client.mac.to_string()))
+            } else {
+                // Dropped — deauth success!
+                (s().green().bold().paint("\u{2713}"),
+                 s().green().bold().paint("dropped"),
+                 s().green().bold().paint(&client.mac.to_string()))
             };
 
+            // RSSI sparkline + current value
+            let spark = rssi_sparkline(&client.rssi_samples, 8);
+            let rssi_num = format!("{}", client.rssi);
+            let signal_col = format!("{} {}", spark, prism::pad(&rssi_num, 4, "left"));
+
             let vendor_display = truncate(&client.vendor, 15, "\u{2026}");
-            let rssi_str = format!("{}", client.rssi);
             let frames_str = prism::format_number(client.frame_count as u64);
 
             lines.push(vline(
                 &format!("{} {}  {}  {}  {}  {}",
                     status_icon,
                     prism::pad(&mac_styled, 17, "left"),
-                    prism::pad(&s().dim().paint(&rssi_str), 5, "right"),
+                    prism::pad(&signal_col, 13, "left"),
                     prism::pad(&frames_str, 8, "right"),
-                    prism::pad(&s().dim().paint(&age_str), 8, "left"),
+                    prism::pad(&status_label, 10, "left"),
                     s().dim().paint(&vendor_display)),
                 inner_w));
         }
@@ -462,10 +494,20 @@ pub struct DosModule {
     target: Option<Ap>,
     /// Target station for targeted attacks.
     target_station: Option<Station>,
-    /// Cached info for rendering — refreshed each render cycle.
+    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<DosInfo>,
     /// Connected clients of the target AP (updated by shell from scanner).
     target_clients: Vec<ClientSnapshot>,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 use crate::store::Ap;
@@ -479,6 +521,11 @@ impl DosModule {
             target_station: None,
             cached_info: None,
             target_clients: Vec::new(),
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -493,14 +540,78 @@ impl DosModule {
         self.target_station = station;
     }
 
-    /// Drain new events since last call. Used by the shell to print to scrollback.
-    pub fn drain_events(&mut self) -> Vec<DosEvent> {
-        self.attack.events()
-    }
-
     /// Get current attack info.
     pub fn info(&self) -> DosInfo {
         self.attack.info()
+    }
+
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("dos-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    /// Filters for this attack's deltas, marks dirty, and accumulates scrollback lines.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Dos, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Dos(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    let event = DosEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Dos, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    ///
+    /// Called by poll_modules() every frame. This is the single entry point for
+    /// delta processing -- render() and status_segments() just read cached_info.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, frames_received, fps update continuously between
+        // delta emissions (e.g. during burst pauses in deauth).
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 
     /// Update connected clients of the target AP (called by shell from scanner data).
@@ -538,6 +649,10 @@ impl Module for DosModule {
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting attack thread
+        // so we don't miss any early deltas (like AttackStarted).
+        self.update_sub = Some(shared.gate().subscribe_updates("dos-ui"));
+
         if let Some(target) = self.target.take() {
             let station = self.target_station.take();
             self.attack.start(shared, target, station);
@@ -561,9 +676,10 @@ impl Module for DosModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, _height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_dos_view(&info, &self.target_clients, width)
+        // tick() is called by poll_modules() before render, so cached_info is fresh.
+        // Fallback: if no cached info yet (first frame), read directly.
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_dos_view(&info, &self.target_clients, width, &self.fps_history)
     }
 
     fn handle_key(&mut self, _key: &prism::KeyEvent, _view: usize) -> bool {
@@ -571,12 +687,15 @@ impl Module for DosModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
 
         let reason_str = info.stop_reason
@@ -671,7 +790,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = DosInfo::default();
-        let lines = render_dos_view(&info, &[], 80);
+        let lines = render_dos_view(&info, &[], 80, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 
@@ -696,6 +815,7 @@ mod tests {
                 frame_count: 247,
                 vendor: "Apple".to_string(),
                 reconnect_at: None,
+                rssi_samples: VecDeque::new(),
             },
             ClientSnapshot {
                 mac: MacAddress::new([0x8C, 0x85, 0x90, 0xAB, 0xCD, 0xEF]),
@@ -704,10 +824,11 @@ mod tests {
                 frame_count: 12,
                 vendor: "Samsung".to_string(),
                 reconnect_at: None,
+                rssi_samples: VecDeque::new(),
             },
         ];
 
-        let lines = render_dos_view(&info, &clients, 100);
+        let lines = render_dos_view(&info, &clients, 100, &VecDeque::new());
         // Should have header + counters + separator + column header + 2 client rows
         assert!(lines.len() >= 6);
     }

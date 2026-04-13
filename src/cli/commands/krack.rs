@@ -112,7 +112,8 @@ pub fn run(ctx: &mut Ctx, args: &str) {
         None => return,
     };
 
-    let krack_module = krack_cli::KrackModule::new(params);
+    let mut krack_module = krack_cli::KrackModule::new(params);
+    krack_module.subscribe(&attack_adapter);
     krack_module.attack().start(attack_adapter, target);
 
     ctx.layout.print(&format!("  {} Attack started. {} to stop.",

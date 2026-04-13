@@ -7,12 +7,17 @@
 //! - Results table showing all attempted targets
 //! - Event log scrollback
 
+use std::collections::VecDeque;
+
 use crate::attacks::pmkid::{
     PmkidAttack, PmkidEvent, PmkidEventKind, PmkidInfo, PmkidParams,
     PmkidPhase, PmkidStatus,
 };
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate};
+use super::{signal_bar, fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -187,12 +192,12 @@ pub fn format_event(event: &PmkidEvent) -> String {
 /// Render the PMKID attack progress view for the Layout active zone.
 ///
 /// Layout (inside exec-style bordered frame):
-///   1. Current target header (SSID, BSSID, channel, RSSI)
-///   2. Step progress: ✔ AUTH → ✔ ASSOC → ⠋ M1...
+///   1. Current target header (SSID, BSSID, channel, RSSI) + TX delivery bar
+///   2. Step progress: ✔ AUTH → ✔ ASSOC → ⠋ M1... + FPS sparkline
 ///   3. Progress bar (multi-target only)
 ///   4. Results scroll table
 ///   5. Footer with stats in border
-pub fn render_pmkid_view(info: &PmkidInfo, width: u16, _height: u16, scroll_offset: usize) -> Vec<String> {
+pub fn render_pmkid_view(info: &PmkidInfo, width: u16, _height: u16, scroll_offset: usize, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6); // border + padding
 
@@ -208,52 +213,83 @@ pub fn render_pmkid_view(info: &PmkidInfo, width: u16, _height: u16, scroll_offs
 
     let mut lines = Vec::new();
 
-    // ═══ Header border with title ═══
-    let title = s().cyan().bold().paint(" pmkid ");
-    let title_plain_w = 7; // " pmkid "
-    let remaining = inner_w.saturating_sub(title_plain_w + 1);
-    lines.push(format!("  {}{}{}{}", bc("\u{256d}\u{2500}"), title,
-        bc(&"\u{2500}".repeat(remaining)), bc("\u{256e}")));
+    // Breathing room above the frame
+    lines.push(String::new());
+
+    // ═══ Header: ╭─ pmkid ──────── [3/126] ▸▸▸░░░░░░░  2.4% ─╮ ═══
+    let title_text = " pmkid ";
+    let title = s().cyan().bold().paint(title_text);
+    let title_plain_w = title_text.len();
+
+    // Multi-target progress bar in header (like WPS)
+    let header_right = if info.target_total > 1 {
+        let idx_text = format!("[{}/{}]", info.target_index, info.target_total);
+        let pct = if info.target_total > 0 {
+            info.target_index as f64 / info.target_total as f64 * 100.0
+        } else { 0.0 };
+        fn cyan_bar(t: &str) -> String { s().cyan().paint(t) }
+        let bar_w = 20.min(inner_w / 4);
+        let bar = prism::render_progress_bar(info.target_index as u64, &prism::RenderOptions {
+            total: info.target_total as u64,
+            width: bar_w,
+            style: prism::BarStyle::Arrows,
+            color: Some(cyan_bar),
+            ..Default::default()
+        });
+        format!("{}  {}  {}",
+            s().dim().paint(&idx_text),
+            bar,
+            s().dim().paint(&format!("{:.1}%", pct)))
+    } else {
+        String::new()
+    };
+
+    let right_plain_w = prism::measure_width(&prism::strip_ansi(&header_right));
+    let fill_w = inner_w.saturating_sub(title_plain_w + right_plain_w + 2);
+    lines.push(format!("  {}{}{}{}{}",
+        bc("\u{256d}\u{2500}"), title,
+        bc(&"\u{2500}".repeat(fill_w)),
+        header_right,
+        bc(&format!("{}\u{256e}", if right_plain_w > 0 { "" } else { "\u{2500}" }))));
 
     // ═══ Current target ═══
     if let Some(bssid) = &info.current_bssid {
+        lines.push(empty_line());
+
         let ssid_display = if info.current_ssid.is_empty() {
             s().dim().italic().paint("(hidden)")
         } else {
-            s().bold().paint(&truncate(&info.current_ssid, 24, "\u{2026}"))
+            s().white().bold().paint(&truncate(&info.current_ssid, 24, "\u{2026}"))
         };
 
-        // RSSI bar
-        fn rssi_green(t: &str) -> String { s().green().paint(t) }
-        fn rssi_yellow(t: &str) -> String { s().yellow().paint(t) }
-        fn rssi_red(t: &str) -> String { s().red().paint(t) }
-        let rssi_val = (info.current_rssi + 100).max(0).min(60) as u64;
-        let rssi_bar = prism::render_progress_bar(rssi_val, &prism::RenderOptions {
-            total: 60,
-            width: 8,
-            style: prism::BarStyle::Bar,
-            color: Some(if info.current_rssi > -50 { rssi_green }
-                else if info.current_rssi > -70 { rssi_yellow }
-                else { rssi_red }),
-            ..Default::default()
-        });
+        // Signal bars (same style as WPS — compact 4-char blocks)
+        let signal = signal_bar(info.current_rssi);
+        let ch_str = s().cyan().paint(&format!("ch{}", info.current_channel));
 
-        let target_line = format!("{}  {}  ch{}  {} dBm {}",
+        let target_line = format!("  {}  {}  {}  {}  {}dBm",
             ssid_display,
             s().dim().paint(&bssid.to_string()),
-            info.current_channel,
-            info.current_rssi,
-            rssi_bar,
+            ch_str,
+            signal,
+            s().dim().paint(&format!("{}", info.current_rssi)),
         );
         lines.push(vline(&target_line, inner_w));
+
+        // TX delivery bar — shows how well frames are reaching the AP
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        }
     } else if !info.running && info.phase == PmkidPhase::Done {
-        lines.push(vline(&s().dim().paint("Attack complete"), inner_w));
+        lines.push(empty_line());
+        lines.push(vline(&s().dim().paint("  Attack complete"), inner_w));
     } else if !info.running {
-        lines.push(vline(&s().dim().paint("Idle"), inner_w));
+        lines.push(empty_line());
+        lines.push(vline(&s().dim().paint("  Idle"), inner_w));
     }
 
-    // ═══ Step progress: ✔ AUTH → ✔ ASSOC → ⠋ M1... ═══
+    // ═══ Step progress: ✔ AUTH → ✔ ASSOC → ⠋ M1... + FPS sparkline ═══
     if info.running || info.phase == PmkidPhase::Done {
+        lines.push(empty_line());
         let spinner = prism::get_spinner("dots");
         let spin_frame = spinner.as_ref().map(|sp| {
             let idx = (info.start_time.elapsed().as_millis() / sp.interval_ms as u128) as usize % sp.frames.len();
@@ -286,28 +322,17 @@ pub fn render_pmkid_view(info: &PmkidInfo, width: u16, _height: u16, scroll_offs
 
         let arrow = s().dim().paint(" \u{2192} ");
         let steps = format!("{}{}{}{}{}", auth_step, arrow, assoc_step, arrow, m1_step);
-        lines.push(vline(&steps, inner_w));
+
+        // Append FPS sparkline to the step line when we have throughput data
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
     }
 
     lines.push(empty_line());
-
-    // ═══ Progress bar (multi-target) ═══
-    if info.target_total > 1 {
-        let bar_w = inner_w.saturating_sub(16); // space for "3/126 targets"
-        fn cyan_bar(t: &str) -> String { s().cyan().paint(t) }
-        let bar = prism::render_progress_bar(info.target_index as u64, &prism::RenderOptions {
-            total: info.target_total as u64,
-            width: bar_w,
-            style: prism::BarStyle::Smooth,
-            color: Some(cyan_bar),
-            ..Default::default()
-        });
-
-        let label = format!("{}/{} targets", info.target_index, info.target_total);
-        let bar_line = format!("{}  {}", bar, s().dim().paint(&label));
-        lines.push(vline(&bar_line, inner_w));
-        lines.push(empty_line());
-    }
 
     // ═══ Results scroll table ═══
     // Cap the view: use at most 40% of terminal height for this module
@@ -560,14 +585,26 @@ use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyl
 ///
 /// Uses SharedAdapter architecture: the attack spawns its own thread via start(),
 /// locks the channel for each target, and shares the adapter with the scanner.
+///
+/// Delta-driven: subscribes to the streaming pipeline via UpdateSubscriber.
+/// Events arrive as AttackEvent deltas, counters as AttackCountersUpdate, etc.
+/// The module processes deltas in tick(), caches info, and queues scrollback lines.
 pub struct PmkidModule {
     attack: PmkidAttack,
-    /// Cached info for rendering — refreshed each render cycle.
+    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<PmkidInfo>,
-    /// Accumulated events for scrollback printing.
-    pending_events: Vec<PmkidEvent>,
     /// Scroll offset for results table (j/k navigation).
     scroll_offset: usize,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl PmkidModule {
@@ -576,8 +613,12 @@ impl PmkidModule {
         Self {
             attack,
             cached_info: None,
-            pending_events: Vec::new(),
             scroll_offset: 0,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -586,13 +627,76 @@ impl PmkidModule {
         &self.attack
     }
 
-    /// Drain new events since last call. Used by the shell to print to scrollback.
-    pub fn drain_events(&mut self) -> Vec<PmkidEvent> {
-        let events = self.attack.events();
-        self.pending_events.extend(events.iter().cloned());
-        events
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("pmkid-ui"));
     }
 
+    /// Process pending deltas from the subscriber.
+    /// Filters for this attack's deltas, marks dirty, and accumulates scrollback lines.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Pmkid, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    // Accumulate FPS history for sparkline
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60; // ~60 seconds of history at 1 update/sec
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Pmkid(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    // Format the event for scrollback output
+                    let event = PmkidEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Pmkid, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {} // ignore scanner deltas, other attacks, etc.
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    ///
+    /// Called by poll_modules() every frame. This is the single entry point for
+    /// delta processing — render() and status_segments() just read cached_info.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, frames_received, fps update continuously between
+        // delta emissions (e.g. during burst pauses in deauth).
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
+    }
 }
 
 impl Module for PmkidModule {
@@ -601,6 +705,10 @@ impl Module for PmkidModule {
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting attack thread
+        // so we don't miss any early deltas (like AttackStarted).
+        self.update_sub = Some(shared.gate().subscribe_updates("pmkid-ui"));
+
         // Targets should be set before calling start().
         // The shell gathers targets from the scanner and passes them in.
         // For now, start with empty targets — the shell will call
@@ -628,9 +736,10 @@ impl Module for PmkidModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_pmkid_view(&info, width, height, self.scroll_offset)
+        // tick() is called by poll_modules() before render, so cached_info is fresh.
+        // Fallback: if no cached info yet (first frame), read directly.
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_pmkid_view(&info, width, height, self.scroll_offset, &self.fps_history)
     }
 
     fn handle_key(&mut self, key: &prism::KeyEvent, _view: usize) -> bool {
@@ -648,12 +757,19 @@ impl Module for PmkidModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        // Use cached info (refreshed by tick() in poll_modules).
+        // Avoids mutex lock on every status bar render.
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        // Use cached info if available (should be, since tick() runs every frame).
+        // Fallback to direct read for safety.
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
 
         let elapsed_secs = info.start_time.elapsed().as_secs_f64();
@@ -782,7 +898,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = PmkidInfo::default();
-        let lines = render_pmkid_view(&info, 80, 40, 0);
+        let lines = render_pmkid_view(&info, 80, 40, 0, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 
@@ -868,7 +984,7 @@ mod tests {
             key_version: 0,
             elapsed: Duration::from_millis(3200),
         });
-        let lines = render_pmkid_view(&info, 100, 40, 0);
+        let lines = render_pmkid_view(&info, 100, 40, 0, &VecDeque::new());
         assert!(lines.len() >= 5);
     }
 }

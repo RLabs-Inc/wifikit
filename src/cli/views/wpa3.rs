@@ -1,12 +1,17 @@
 //! CLI renderer + Module implementation for the WPA3/Dragonblood attack.
 
+use std::collections::VecDeque;
+
 use crate::attacks::wpa3::{
     Wpa3Attack, Wpa3Event, Wpa3EventKind, Wpa3FinalResult, Wpa3Info, Wpa3Mode, Wpa3Params,
     Wpa3Phase, Wpa3Verdict,
 };
 use crate::core::MacAddress;
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::s;
+use super::{fps_sparkline, tx_stats_line};
 
 fn phase_label(phase: Wpa3Phase) -> &'static str {
     match phase {
@@ -126,7 +131,7 @@ pub fn format_event(event: &Wpa3Event) -> String {
     }
 }
 
-pub fn render_wpa3_view(info: &Wpa3Info, width: u16, _height: u16, scroll_offset: usize) -> Vec<String> {
+pub fn render_wpa3_view(info: &Wpa3Info, width: u16, _height: u16, scroll_offset: usize, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6); // border + padding
 
@@ -140,6 +145,9 @@ pub fn render_wpa3_view(info: &Wpa3Info, width: u16, _height: u16, scroll_offset
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
+
+    // Breathing room above the frame
+    lines.push(String::new());
 
     // ═══ Header border with title ═══
     let title = s().red().bold().paint(" dragonblood ");
@@ -179,6 +187,13 @@ pub fn render_wpa3_view(info: &Wpa3Info, width: u16, _height: u16, scroll_offset
         lines.push(vline(&s().dim().paint("Idle"), inner_w));
     }
 
+    // TX stats line
+    if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+        lines.push(vline(&tx_line, inner_w));
+    }
+
+    lines.push(empty_line());
+
     // ═══ Step progress: ○ LOCK → ● PROBE → ⠋ TEST... ═══
     if info.running || info.phase == Wpa3Phase::Done {
         let spinner = prism::get_spinner("dots");
@@ -209,7 +224,14 @@ pub fn render_wpa3_view(info: &Wpa3Info, width: u16, _height: u16, scroll_offset
 
         let arrow = s().dim().paint(" \u{2192} ");
         let steps = format!("{}{}{}{}{}", lock_step, arrow, probe_step, arrow, test_step);
-        lines.push(vline(&steps, inner_w));
+
+        // Append FPS sparkline to the step line when we have throughput data
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -396,22 +418,103 @@ pub fn status_segments(info: &Wpa3Info) -> Vec<StatusSegment> {
 
 use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyle};
 
+/// Delta-driven: subscribes to the streaming pipeline via UpdateSubscriber.
+/// Events arrive as AttackEvent deltas, counters as AttackCountersUpdate, etc.
+/// The module processes deltas in tick(), caches info, and queues scrollback lines.
 pub struct Wpa3Module {
     attack: Wpa3Attack,
     cached_info: Option<Wpa3Info>,
-    pending_events: Vec<Wpa3Event>,
     scroll_offset: usize,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl Wpa3Module {
     pub fn new(params: Wpa3Params) -> Self {
-        Self { attack: Wpa3Attack::new(params), cached_info: None, pending_events: Vec::new(), scroll_offset: 0 }
+        Self {
+            attack: Wpa3Attack::new(params),
+            cached_info: None,
+            scroll_offset: 0,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
+        }
     }
+
     pub fn attack(&self) -> &Wpa3Attack { &self.attack }
-    pub fn drain_events(&mut self) -> Vec<Wpa3Event> {
-        let events = self.attack.events();
-        self.pending_events.extend(events.iter().cloned());
-        events
+
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("wpa3-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Wpa3, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Wpa3(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    let event = Wpa3Event { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Wpa3, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, commits_sent, fps update continuously.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 }
 
@@ -419,15 +522,17 @@ impl Module for Wpa3Module {
     fn name(&self) -> &str { "wpa3" }
     fn description(&self) -> &str { "WPA3/Dragonblood — 8 attack modes" }
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
-    fn start(&mut self, _shared: crate::adapter::SharedAdapter) { panic!("use attack().start()"); }
+    fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("wpa3-ui"));
+        panic!("use attack().start()");
+    }
     fn signal_stop(&self) { self.attack.signal_stop(); }
     fn is_running(&self) -> bool { self.attack.is_running() }
     fn is_done(&self) -> bool { self.attack.is_done() }
     fn views(&self) -> &[ViewDef] { &[] }
     fn render(&mut self, _view: usize, width: u16, height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_wpa3_view(&info, width, height, self.scroll_offset)
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_wpa3_view(&info, width, height, self.scroll_offset, &self.fps_history)
     }
     fn handle_key(&mut self, key: &prism::KeyEvent, _view: usize) -> bool {
         if key.ctrl || key.meta { return false; }
@@ -440,11 +545,14 @@ impl Module for Wpa3Module {
         }
     }
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned().unwrap_or_else(|| self.attack.info());
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
         let final_result = Wpa3FinalResult {
             results: info.results.clone(),
             modes_tested: info.modes_tested,
@@ -495,13 +603,14 @@ impl Module for Wpa3Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::time::Duration;
     use crate::attacks::wpa3::{Wpa3Mode, Wpa3TestResult};
     use crate::core::MacAddress;
 
     #[test] fn test_phase_labels() { assert_eq!(phase_label(Wpa3Phase::Probing), "probing"); }
     #[test] fn test_verdict_icons() { let _ = verdict_icon(Wpa3Verdict::Vulnerable); }
-    #[test] fn test_render_empty() { assert!(!render_wpa3_view(&Wpa3Info::default(), 80, 40, 0).is_empty()); }
+    #[test] fn test_render_empty() { assert!(!render_wpa3_view(&Wpa3Info::default(), 80, 40, 0, &VecDeque::new()).is_empty()); }
     #[test] fn test_status_idle() { assert!(status_segments(&Wpa3Info::default()).is_empty()); }
     #[test] fn test_module_new() { let m = Wpa3Module::new(Wpa3Params::default()); assert_eq!(m.name(), "wpa3"); }
 
@@ -528,7 +637,7 @@ mod tests {
         }).collect();
         info.results[3].verdict = Wpa3Verdict::Vulnerable;
         info.results[3].detail = "AP accepted invalid curve point".to_string();
-        let lines = render_wpa3_view(&info, 120, 40, 0);
+        let lines = render_wpa3_view(&info, 120, 40, 0, &VecDeque::new());
         assert!(lines.len() >= 9);
     }
 }

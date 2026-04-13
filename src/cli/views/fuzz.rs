@@ -8,6 +8,7 @@
 //! - Health check results
 //! - Event log scrollback
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::attacks::fuzz::{
@@ -15,8 +16,11 @@ use crate::attacks::fuzz::{
     FuzzFrameType, FuzzInfo, FuzzParams, FuzzPhase,
     mutation as FuzzMutation, detect as FuzzDetect,
 };
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate};
+use super::{fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -417,7 +421,7 @@ pub fn format_crash_table(crashes: &[FuzzCrash]) -> Vec<String> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Render the fuzz attack progress view for the Layout active zone.
-pub fn render_fuzz_view(info: &FuzzInfo, crashes: &[FuzzCrash], width: u16) -> Vec<String> {
+pub fn render_fuzz_view(info: &FuzzInfo, crashes: &[FuzzCrash], width: u16, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
 
@@ -430,6 +434,9 @@ pub fn render_fuzz_view(info: &FuzzInfo, crashes: &[FuzzCrash], width: u16) -> V
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
+
+    // Breathing room above the frame
+    lines.push(String::new());
 
     // ═══ Header border ═══
     let title = s().yellow().bold().paint(" fuzzer ");
@@ -477,7 +484,20 @@ pub fn render_fuzz_view(info: &FuzzInfo, crashes: &[FuzzCrash], width: u16) -> V
         };
 
         let arrow = s().dim().paint(" \u{2192} ");
-        lines.push(vline(&format!("{}{}{}{}{}", probe_step, arrow, fuzz_step, arrow, monitor_step), inner_w));
+        let steps = format!("{}{}{}{}{}", probe_step, arrow, fuzz_step, arrow, monitor_step);
+
+        // Append FPS sparkline — especially valuable for fuzz since throughput = coverage speed
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
+
+        // TX stats line
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -737,10 +757,20 @@ pub struct FuzzModule {
     attack: FuzzAttack,
     /// Target AP for fuzzing.
     target: Option<Ap>,
-    /// Cached info for rendering — refreshed each render cycle.
+    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<FuzzInfo>,
     /// Cached crashes for rendering and freeze summary.
     cached_crashes: Vec<FuzzCrash>,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl FuzzModule {
@@ -751,6 +781,11 @@ impl FuzzModule {
             target: None,
             cached_info: None,
             cached_crashes: Vec::new(),
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -764,9 +799,93 @@ impl FuzzModule {
         self.target = Some(target);
     }
 
-    /// Drain new events since last call. Used by the shell to print to scrollback.
-    pub fn drain_events(&mut self) -> Vec<FuzzEvent> {
-        self.attack.events()
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("fuzz-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    /// Filters for this attack's deltas, marks dirty, and accumulates scrollback lines.
+    /// CrashDetected events also accumulate into cached_crashes for the crash table.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Fuzz, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Fuzz(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    // Accumulate crash data from delta events (replaces render()-side crash accumulation)
+                    if let FuzzEventKind::CrashDetected { iteration, frame_type, mutation, domain, detect_method, description } = kind {
+                        let crash_num = (self.cached_crashes.len() + 1) as u32;
+                        self.cached_crashes.push(FuzzCrash {
+                            crash_num,
+                            iteration: *iteration,
+                            frame_type: *frame_type,
+                            mutation: *mutation,
+                            domain: *domain,
+                            detect_method: *detect_method,
+                            elapsed: *timestamp,
+                            target_bssid: crate::core::MacAddress::ZERO,
+                            trigger_frame: Vec::new(),
+                            description: description.clone(),
+                            recovery_ms: None,
+                        });
+                    }
+                    if let FuzzEventKind::CrashRecovery { crash_num, recovery_ms, .. } = kind {
+                        if let Some(crash) = self.cached_crashes.get_mut(*crash_num as usize - 1) {
+                            crash.recovery_ms = Some(*recovery_ms);
+                        }
+                    }
+
+                    let event = FuzzEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Fuzz, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, iterations, fps update continuously.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 
     /// Get current attack info.
@@ -782,6 +901,8 @@ impl Module for FuzzModule {
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting attack thread
+        self.update_sub = Some(shared.gate().subscribe_updates("fuzz-ui"));
         if let Some(target) = self.target.take() {
             self.attack.start(shared, target);
         }
@@ -804,34 +925,9 @@ impl Module for FuzzModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, _height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        // Accumulate crashes from events
-        for event in self.attack.events() {
-            if let FuzzEventKind::CrashDetected { iteration, frame_type, mutation, domain, detect_method, description } = &event.kind {
-                let crash_num = (self.cached_crashes.len() + 1) as u32;
-                self.cached_crashes.push(FuzzCrash {
-                    crash_num,
-                    iteration: *iteration,
-                    frame_type: *frame_type,
-                    mutation: *mutation,
-                    domain: *domain,
-                    detect_method: *detect_method,
-                    elapsed: event.timestamp,
-                    target_bssid: crate::core::MacAddress::ZERO,
-                    trigger_frame: Vec::new(),
-                    description: description.clone(),
-                    recovery_ms: None,
-                });
-            }
-            if let FuzzEventKind::CrashRecovery { crash_num, recovery_ms, .. } = &event.kind {
-                if let Some(crash) = self.cached_crashes.get_mut(*crash_num as usize - 1) {
-                    crash.recovery_ms = Some(*recovery_ms);
-                }
-            }
-            // CrashPermanent: recovery_ms stays None (already indicates permanent)
-        }
-        self.cached_info = Some(info.clone());
-        render_fuzz_view(&info, &self.cached_crashes, width)
+        // tick() is called by poll_modules() before render, so cached_info is fresh.
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_fuzz_view(&info, &self.cached_crashes, width, &self.fps_history)
     }
 
     fn handle_key(&mut self, _key: &prism::KeyEvent, _view: usize) -> bool {
@@ -839,12 +935,15 @@ impl Module for FuzzModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
         freeze_summary(&info, &self.cached_crashes, width)
     }

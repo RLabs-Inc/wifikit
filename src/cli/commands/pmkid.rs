@@ -84,7 +84,8 @@ pub fn run(ctx: &mut Ctx, args: &str) {
 
     // Create PMKID module and start via SharedAdapter.
     // Scanner keeps running — the attack locks channels as needed.
-    let pmkid_module = PmkidModule::new(params);
+    let mut pmkid_module = PmkidModule::new(params);
+    pmkid_module.subscribe(&attack_adapter);  // subscribe BEFORE starting so we catch AttackStarted
     pmkid_module.attack().start(attack_adapter, targets);
 
     ctx.layout.print(&format!("  {} Attack started. Scanner continues on locked channel. {} to stop.",

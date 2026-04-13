@@ -7,12 +7,17 @@
 //! - KARMA SSID collection (for KARMA/MANA modes)
 //! - Event log scrollback
 
+use std::collections::VecDeque;
+
 use crate::attacks::ap::{
     ApAttack, ApEvent, ApEventKind, ApFinalResult, ApInfo,
     ApMode, ApParams, ApPhase, ApResult, ClientApState,
 };
+use crate::pipeline::UpdateSubscriber;
+use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate};
+use super::{fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase display
@@ -141,7 +146,7 @@ pub fn format_event(event: &ApEvent) -> String {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Render the AP attack progress view for the Layout active zone.
-pub fn render_ap_view(info: &ApInfo, width: u16) -> Vec<String> {
+pub fn render_ap_view(info: &ApInfo, width: u16, fps_history: &VecDeque<f64>) -> Vec<String> {
     let w = width as usize;
     let inner_w = w.saturating_sub(6);
 
@@ -155,6 +160,9 @@ pub fn render_ap_view(info: &ApInfo, width: u16) -> Vec<String> {
     let empty_line = || vline("", inner_w);
 
     let mut lines = Vec::new();
+
+    // Breathing room above the frame
+    lines.push(String::new());
 
     // ═══ Header border with mode title ═══
     let title = format!(" {} ", info.mode.name());
@@ -213,7 +221,20 @@ pub fn render_ap_view(info: &ApInfo, width: u16) -> Vec<String> {
         };
 
         let arrow = s().dim().paint(" \u{2192} ");
-        lines.push(vline(&format!("{}{}{}{}{}", start_step, arrow, beacon_step, arrow, active_step), inner_w));
+        let steps = format!("{}{}{}{}{}", start_step, arrow, beacon_step, arrow, active_step);
+
+        // Append FPS sparkline for beacon/frame rate
+        if fps_history.len() > 1 {
+            let spark = fps_sparkline(fps_history, 12);
+            lines.push(vline(&format!("{}  {}", steps, spark), inner_w));
+        } else {
+            lines.push(vline(&steps, inner_w));
+        }
+
+        // TX stats line (rogue AP sends beacons/probes — TX feedback shows reach)
+        if let Some(tx_line) = tx_stats_line(&info.tx_feedback, info.frames_sent, info.frames_per_sec) {
+            lines.push(vline(&tx_line, inner_w));
+        }
     }
 
     lines.push(empty_line());
@@ -417,12 +438,26 @@ use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyl
 use crate::store::Ap;
 
 /// ApModule wraps ApAttack with the Module trait for the shell's focus stack.
+///
+/// Delta-driven: subscribes to the streaming pipeline via UpdateSubscriber.
+/// Events arrive as AttackEvent deltas, counters as AttackCountersUpdate, etc.
+/// The module processes deltas in tick(), caches info, and queues scrollback lines.
 pub struct ApModule {
     attack: ApAttack,
     /// Target AP for Evil Twin mode.
     target: Option<Ap>,
-    /// Cached info for rendering.
+    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<ApInfo>,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    update_sub: Option<UpdateSubscriber>,
+    /// Attack ID learned from the first AttackStarted delta.
+    attack_id: Option<AttackId>,
+    /// Dirty flag — set when deltas arrive, cleared after info refresh.
+    dirty: bool,
+    /// Formatted scrollback lines accumulated from AttackEvent deltas.
+    scrollback_lines: Vec<String>,
+    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
+    fps_history: VecDeque<f64>,
 }
 
 impl ApModule {
@@ -432,6 +467,11 @@ impl ApModule {
             attack,
             target: None,
             cached_info: None,
+            update_sub: None,
+            attack_id: None,
+            dirty: false,
+            scrollback_lines: Vec::new(),
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -445,9 +485,69 @@ impl ApModule {
         self.target = Some(target);
     }
 
-    /// Drain new events since last call. Used by the shell to print to scrollback.
-    pub fn drain_events(&mut self) -> Vec<ApEvent> {
-        self.attack.events()
+    /// Subscribe to the delta stream. Call BEFORE starting the attack
+    /// so we don't miss early deltas (AttackStarted, first events).
+    pub fn subscribe(&mut self, shared: &crate::adapter::SharedAdapter) {
+        self.update_sub = Some(shared.gate().subscribe_updates("ap-ui"));
+    }
+
+    /// Process pending deltas from the subscriber.
+    /// Filters for this attack's deltas, marks dirty, and accumulates scrollback lines.
+    fn process_deltas(&mut self) {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => return,
+        };
+
+        for update in sub.drain_flat() {
+            match &update {
+                StoreUpdate::AttackStarted { id, attack_type: AttackType::Ap, .. } => {
+                    self.attack_id = Some(*id);
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackPhaseChanged { id, .. } if self.is_our_attack(*id) => {
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackCountersUpdate { id, frames_per_sec, .. } if self.is_our_attack(*id) => {
+                    self.fps_history.push_back(*frames_per_sec);
+                    const MAX_FPS_SAMPLES: usize = 60;
+                    while self.fps_history.len() > MAX_FPS_SAMPLES {
+                        self.fps_history.pop_front();
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackEvent { id, event: AttackEventKind::Ap(kind), timestamp, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    let event = ApEvent { seq: 0, timestamp: *timestamp, kind: kind.clone() };
+                    self.scrollback_lines.push(format_event(&event));
+                    self.dirty = true;
+                }
+                StoreUpdate::AttackComplete { id, attack_type: AttackType::Ap, .. }
+                    if self.is_our_attack(*id) =>
+                {
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Check if an AttackId belongs to this module's attack.
+    fn is_our_attack(&self, id: AttackId) -> bool {
+        self.attack_id.is_some_and(|our_id| our_id == id)
+    }
+
+    /// Per-frame tick: process deltas, refresh cached info if dirty, return scrollback lines.
+    pub fn tick(&mut self) -> Vec<String> {
+        self.process_deltas();
+
+        // Always refresh — attack info() is a cheap mutex clone, and values
+        // like elapsed, beacons_sent, clients update continuously.
+        self.cached_info = Some(self.attack.info());
+        self.dirty = false;
+
+        std::mem::take(&mut self.scrollback_lines)
     }
 
     /// Get current attack info. Used by the shell for external state access.
@@ -463,6 +563,8 @@ impl Module for ApModule {
     fn module_type(&self) -> ModuleType { ModuleType::Attack }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting attack thread
+        self.update_sub = Some(shared.gate().subscribe_updates("ap-ui"));
         let target = self.target.take();
         self.attack.start(shared, target);
     }
@@ -484,9 +586,8 @@ impl Module for ApModule {
     }
 
     fn render(&mut self, _view: usize, width: u16, _height: u16) -> Vec<String> {
-        let info = self.attack.info();
-        self.cached_info = Some(info.clone());
-        render_ap_view(&info, width)
+        let info = self.cached_info.clone().unwrap_or_else(|| self.attack.info());
+        render_ap_view(&info, width, &self.fps_history)
     }
 
     fn handle_key(&mut self, _key: &prism::KeyEvent, _view: usize) -> bool {
@@ -494,12 +595,15 @@ impl Module for ApModule {
     }
 
     fn status_segments(&self) -> Vec<StatusSegment> {
-        let info = self.attack.info();
-        status_segments(&info)
+        if let Some(ref info) = self.cached_info {
+            status_segments(info)
+        } else {
+            vec![]
+        }
     }
 
     fn freeze_summary(&self, width: u16) -> Vec<String> {
-        let info = self.cached_info.as_ref().cloned()
+        let info = self.cached_info.clone()
             .unwrap_or_else(|| self.attack.info());
         let elapsed = info.start_time.elapsed();
         let ap_result = ApResult {
@@ -574,7 +678,7 @@ mod tests {
     #[test]
     fn test_render_empty_info() {
         let info = ApInfo::default();
-        let lines = render_ap_view(&info, 80);
+        let lines = render_ap_view(&info, 80, &VecDeque::new());
         assert!(!lines.is_empty());
     }
 

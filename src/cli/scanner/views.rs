@@ -377,7 +377,7 @@ const CLI_COL_AGE: usize = 4;      // last-seen age ("3s", "1m", "5m")
 /// Core (never drop): MAC, AP, RSSI, FRAMES
 /// Drop order (first to go): VENDOR → AGE → PS → GEN → DATA → PROBES
 fn auto_columns_clients(width: usize) -> (bool, bool, bool, bool, bool, bool) {
-    let core = 1 + COL_SEL + CLI_COL_MAC + CLI_COL_AP_MIN + COL_RSSI + CLI_COL_FRAMES + (3 * COL_SEP);
+    let core = 1 + COL_SEL + CLI_COL_MAC + CLI_COL_AP_MIN + AP_COL_RSSI + CLI_COL_FRAMES + (3 * COL_SEP);
     let budget = width.saturating_sub(core);
     let mut remaining = budget;
 
@@ -417,7 +417,7 @@ pub fn render_clients(
     });
 
     // AP column absorbs remaining width (like SSID in APs table)
-    let mut fixed = 1 + COL_SEL + CLI_COL_MAC + COL_RSSI + CLI_COL_FRAMES;
+    let mut fixed = 1 + COL_SEL + CLI_COL_MAC + AP_COL_RSSI + CLI_COL_FRAMES;
     let mut sep_count = 3; // mac|ap, ap|rssi, rssi|frames
     if show_data { fixed += CLI_COL_DATA; sep_count += 1; }
     if show_gen { fixed += CLI_COL_GEN; sep_count += 1; }
@@ -433,7 +433,7 @@ pub fn render_clients(
     let mut cols = vec![
         ScrollCol::new("  MAC", COL_SEL + CLI_COL_MAC),
         ScrollCol::new("AP", ap_w),
-        ScrollCol::new("RSSI", COL_RSSI),
+        ScrollCol::new("RSSI", AP_COL_RSSI),
         ScrollCol::right("FRAMES", CLI_COL_FRAMES),
     ];
     if show_data { cols.push(ScrollCol::right("DATA", CLI_COL_DATA)); }
@@ -480,10 +480,10 @@ pub fn render_clients(
             s().dim().italic().paint("(unassoc)")
         };
 
-        // RSSI — number + bar (same as APs table)
+        // RSSI — sparkline + number (same pattern as APs table)
+        let spark = rssi_sparkline(&sta.rssi_samples, COL_SPARKLINE);
         let num = style_rssi(sta.rssi);
-        let bar = rssi_bar(sta.rssi, COL_RSSI_BAR);
-        let rssi_combined = format!("{} {}", prism::pad(&num, 4, "right"), bar);
+        let rssi_combined = format!("{} {}", spark, prism::pad(&num, 4, "left"));
 
         // Frames — activity indicator, cyan when selected
         let frames = {

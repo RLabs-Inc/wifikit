@@ -24,7 +24,6 @@ use crate::cli::banner;
 use crate::cli::commands::{self, Ctx, ShellState, Mode, AdapterStatus};
 use crate::cli::views::pmkid as pmkid_cli;
 use crate::cli::views::dos as dos_cli;
-use crate::attacks::wps::WpsEventKind;
 use crate::cli::views::wps as wps_cli;
 use crate::cli::views::eap as eap_cli;
 use crate::cli::views::fuzz as fuzz_cli;
@@ -278,12 +277,11 @@ impl Shell {
     // ── Module polling ────────────────────────────────────────────────────
 
     fn poll_modules(&mut self) {
-        // Drain events from PMKID attack modules → print to scrollback
+        // PMKID: delta-driven — tick() processes deltas, returns formatted scrollback lines
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(pmkid_mod) = state.focus_stack.find_as_mut::<pmkid_cli::PmkidModule>("pmkid") {
-                let events = pmkid_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| pmkid_cli::format_event(e)).collect();
+                let lines = pmkid_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
@@ -291,16 +289,14 @@ impl Shell {
             }
         }
 
-        // Drain events from DoS attack modules → print to scrollback
+        // DoS: delta-driven — tick() processes deltas, returns formatted scrollback lines
         // Also update target clients from scanner for the client monitoring view
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(dos_mod) = state.focus_stack.find_as_mut::<dos_cli::DosModule>("dos") {
-                let events = dos_mod.drain_events();
+                let lines = dos_mod.tick();
                 let dos_info = dos_mod.info();
                 let target_bssid = dos_info.target_bssid;
-
-                let lines: Vec<String> = events.iter().map(|e| dos_cli::format_event(e)).collect();
 
                 // Get scanner clients associated with target AP for client monitoring
                 let clients: Vec<dos_cli::ClientSnapshot> =
@@ -315,6 +311,7 @@ impl Shell {
                                 frame_count: sta.frame_count,
                                 vendor: sta.vendor.clone(),
                                 reconnect_at: None,
+                                rssi_samples: sta.rssi_samples.clone(),
                             })
                             .collect()
                     } else {
@@ -360,37 +357,24 @@ impl Shell {
             }
         }
 
-        // Drain events from WPS attack modules → print to scrollback + freeze summaries
+        // WPS: delta-driven — tick() processes deltas, returns formatted scrollback lines
+        // (including freeze summaries for TargetComplete events)
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(wps_mod) = state.focus_stack.find_as_mut::<wps_cli::WpsModule>("wps") {
-                let events = wps_mod.drain_events();
-                let info = wps_mod.info();
+                let lines = wps_mod.tick();
                 drop(state);
-                for event in &events {
-                    // Print every event to scrollback (the real-time story)
-                    let line = wps_cli::format_event(event);
-                    self.layout.print(&line);
-
-                    // Additionally, freeze a summary on target complete
-                    if matches!(&event.kind, WpsEventKind::TargetComplete { .. }) {
-                        if let Some(result) = info.results.last() {
-                            let summary = wps_cli::freeze_target_summary(&info, result);
-                            for sline in &summary {
-                                self.layout.print(sline);
-                            }
-                        }
-                    }
+                for line in &lines {
+                    self.layout.print(line);
                 }
             }
         }
 
-        // Drain events from EAP attack modules → print to scrollback
+        // EAP: delta-driven
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(eap_mod) = state.focus_stack.find_as_mut::<eap_cli::EapModule>("eap") {
-                let events = eap_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| eap_cli::format_event(e)).collect();
+                let lines = eap_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
@@ -398,12 +382,11 @@ impl Shell {
             }
         }
 
-        // Drain events from Fuzz attack modules → print to scrollback
+        // Fuzz: delta-driven
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(fuzz_mod) = state.focus_stack.find_as_mut::<fuzz_cli::FuzzModule>("fuzz") {
-                let events = fuzz_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| fuzz_cli::format_event(e)).collect();
+                let lines = fuzz_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
@@ -411,12 +394,11 @@ impl Shell {
             }
         }
 
-        // Drain events from FragAttacks modules → print to scrollback
+        // FragAttacks: delta-driven — tick() processes deltas, returns formatted scrollback lines
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(frag_mod) = state.focus_stack.find_as_mut::<frag_cli::FragModule>("frag") {
-                let events = frag_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| frag_cli::format_event(e)).collect();
+                let lines = frag_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
@@ -424,12 +406,11 @@ impl Shell {
             }
         }
 
-        // Drain events from KRACK attack modules → print to scrollback
+        // KRACK: delta-driven — tick() processes deltas, returns formatted scrollback lines
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(krack_mod) = state.focus_stack.find_as_mut::<krack_cli::KrackModule>("krack") {
-                let events = krack_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| krack_cli::format_event(e)).collect();
+                let lines = krack_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
@@ -437,12 +418,11 @@ impl Shell {
             }
         }
 
-        // Drain events from WPA3 attack modules
+        // WPA3: delta-driven — tick() processes deltas, returns formatted scrollback lines
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(wpa3_mod) = state.focus_stack.find_as_mut::<wpa3_cli::Wpa3Module>("wpa3") {
-                let events = wpa3_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| wpa3_cli::format_event(e)).collect();
+                let lines = wpa3_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
@@ -450,12 +430,11 @@ impl Shell {
             }
         }
 
-        // Drain events from AP attack modules → print to scrollback
+        // AP: delta-driven
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ap_mod) = state.focus_stack.find_as_mut::<ap_cli::ApModule>("ap") {
-                let events = ap_mod.drain_events();
-                let lines: Vec<String> = events.iter().map(|e| ap_cli::format_event(e)).collect();
+                let lines = ap_mod.tick();
                 drop(state);
                 for line in &lines {
                     self.layout.print(line);
