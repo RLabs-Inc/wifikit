@@ -256,14 +256,19 @@ impl Handshake {
             self.quality = HandshakeQuality::M1M2M3;
         } else if self.has_m1 && self.has_m2 {
             self.quality = HandshakeQuality::M1M2;
+        } else if self.has_m2 && self.has_m3 && self.anonce.is_some() {
+            // M2+M3 without M1: M3 carries ANonce, M2 has SNonce+MIC.
+            // This is crackable — hashcat can work with this pair.
+            // Common during deauth when we miss M1 but catch the rest.
+            self.quality = HandshakeQuality::M1M2; // same cracking capability
         } else if self.has_pmkid {
             self.quality = HandshakeQuality::Pmkid;
         } else {
             self.quality = HandshakeQuality::None;
         }
 
-        // Determine message pair for hccapx when we have M1+M2
-        if self.has_m1 && self.has_m2 {
+        // Determine message pair for hccapx when we have crackable data
+        if self.has_m2 && self.anonce.is_some() {
             self.message_pair = Some(eapol::determine_message_pair(
                 self.replay_counter_m1,
                 self.replay_counter_m2,
@@ -640,18 +645,18 @@ fn process_eapol_key(
         return process_m1(db, ap_mac, sta_mac, ssid, eapol_version, key, raw_eapol, timestamp);
     }
 
-    // ── M2/M3/M4/Group: find the right entry for this pair ──
+    // ── M2/M3/M4/Group: store-first, match-later architecture ──
     //
-    // During deauth, overlapping handshake attempts are common: a new M1 arrives
-    // between M2 and M3 of the previous attempt. If we always use the latest entry,
-    // M3 for the previous attempt gets silently dropped because the ANonce check
-    // (line ~706) fails against the new entry's nonce.
+    // NEVER reject an EAPOL frame because of missing predecessors.
+    // During deauth, overlapping handshake attempts are the norm — M3 arrives
+    // without M2, M2 arrives from a different attempt, etc. Store everything
+    // and let update_quality() determine what we have.
     //
-    // Fix: for M3, find the entry whose ANonce matches this frame's nonce.
-    // For M4, find the most recent entry that already has M3 (M4 carries zero/SNonce,
-    // not the ANonce, so we can't match by nonce — but the M3-bearing entry is the
-    // one this M4 belongs to).
-    // For M2/Group, use the latest entry (standard behavior).
+    // Routing: find the best entry for this frame, or create one.
+    //   M2: find entry with M1 whose replay_counter matches, or latest, or create new
+    //   M3: find entry whose ANonce matches this frame's nonce, or create new
+    //   M4: find entry that has M3, or latest, or create new
+    //   Group: latest entry (standard)
     let hs = match message {
         HandshakeMessage::M3 => {
             // Find entry whose ANonce matches this M3's nonce
@@ -661,7 +666,21 @@ fn process_eapol_key(
             );
             match idx {
                 Some(i) => &mut db.handshakes[i],
-                None => return events, // no matching handshake attempt
+                None => {
+                    // No matching ANonce — store in a new entry anyway.
+                    // We have the ANonce from this M3 itself; if M2 arrives later
+                    // we can still assemble a crackable pair.
+                    match db.find_or_create(ap_mac, sta_mac, ssid) {
+                        Some(hs) => {
+                            // Store the ANonce from this M3 so future M2s can match
+                            if hs.anonce.is_none() {
+                                hs.anonce = Some(key.nonce);
+                            }
+                            hs
+                        }
+                        None => return events,
+                    }
+                }
             }
         }
         HandshakeMessage::M4 => {
@@ -671,7 +690,13 @@ fn process_eapol_key(
             );
             match idx {
                 Some(i) => &mut db.handshakes[i],
-                None => return events, // no M3 to complete
+                None => {
+                    // No M3 yet — store M4 on latest entry anyway
+                    match db.find_or_create(ap_mac, sta_mac, ssid) {
+                        Some(hs) => hs,
+                        None => return events,
+                    }
+                }
             }
         }
         _ => {
@@ -711,18 +736,15 @@ fn process_eapol_key(
         HandshakeMessage::M1 => unreachable!(), // handled above
 
         // ── M2: STA -> AP (SNonce + MIC) ──
+        // Store-first: no M1 prerequisite. M2 carries the SNonce + MIC
+        // needed for cracking. If M1 arrives later, we'll have a pair.
         HandshakeMessage::M2 => {
-            // Must have M1 first
-            if !hs.has_m1 {
-                return events;
-            }
-
             // Check for retransmission (same replay counter)
             if hs.has_m2 && hs.replay_counter_m2 == key.replay_counter {
                 return events; // retransmission
             }
 
-            // Store SNonce and MIC
+            // Store SNonce and MIC — the critical cracking data
             hs.snonce = Some(key.nonce);
             hs.replay_counter_m2 = key.replay_counter;
             hs.m2_timestamp = Some(timestamp);
@@ -731,18 +753,13 @@ fn process_eapol_key(
             hs.has_m2 = true;
         }
 
-        // ── M3: AP -> STA (GTK encrypted in Key Data) ──
+        // ── M3: AP -> STA (GTK encrypted in Key Data, carries ANonce) ──
+        // Store-first: no M2 prerequisite. M3 carries the ANonce, confirming
+        // which handshake attempt this belongs to. Routing already matched by ANonce.
         HandshakeMessage::M3 => {
-            // Must have M1+M2
-            if !hs.has_m2 {
-                return events;
-            }
-
-            // Verify ANonce matches M1 (same handshake attempt)
-            if let Some(ref anonce) = hs.anonce {
-                if *anonce != key.nonce {
-                    return events; // different handshake
-                }
+            // Store ANonce from M3 if we don't have it from M1
+            if hs.anonce.is_none() {
+                hs.anonce = Some(key.nonce);
             }
 
             hs.m3_timestamp = Some(timestamp);
@@ -751,11 +768,8 @@ fn process_eapol_key(
         }
 
         // ── M4: STA -> AP (ACK — handshake complete) ──
+        // Store-first: no M3 prerequisite.
         HandshakeMessage::M4 => {
-            // Must have M1+M2+M3
-            if !hs.has_m3 {
-                return events;
-            }
 
             hs.m4_timestamp = Some(timestamp);
             hs.m4_frame = Some(raw_eapol);
@@ -1134,27 +1148,23 @@ mod tests {
     }
 
     #[test]
-    fn test_m2_without_m1_ignored() {
+    fn test_m2_without_m1_stored() {
         let mut db = CaptureDatabase::new();
         let snonce = [0xBB; 32];
         let frame = build_m2(1, &snonce);
 
         let events = process_eapol_frame(&mut db, AP, STA, SSID, &frame, 2000);
 
-        // M2 without prior M1 creates the entry but doesn't set has_m2
-        // because the state machine requires M1 first
-        // Actually it won't find_or_create with has_m1=false check
-        // Let's verify: the entry IS created (find_or_create runs) but M2 is rejected
-        // Actually looking at the code: find_or_create creates the entry,
-        // then process_eapol_key checks has_m1 and returns early.
-        // The entry still exists but with no useful data.
-        let hs = db.find(&AP, &STA);
-        // The entry was created but M2 was not stored
-        if let Some(hs) = hs {
-            assert!(!hs.has_m2);
-        }
-        // Only the message event for M2 should NOT be emitted (returned early)
-        assert!(events.is_empty() || !events.iter().any(|e| matches!(e,
+        // Store-first: M2 is stored even without M1.
+        // SNonce + MIC are preserved — if M1 arrives later, we have a crackable pair.
+        let hs = db.find(&AP, &STA).unwrap();
+        assert!(hs.has_m2);
+        assert_eq!(hs.snonce, Some(snonce));
+        assert!(hs.key_mic.is_some());
+        // Quality is None since we don't have ANonce yet (no M1 or M3)
+        assert_eq!(hs.quality, HandshakeQuality::None);
+        // Event IS emitted (frame was stored)
+        assert!(events.iter().any(|e| matches!(e,
             CaptureEvent::HandshakeMessage { message: HandshakeMessage::M2, .. }
         )));
     }
@@ -1282,7 +1292,7 @@ mod tests {
     // ── M3 nonce verification ──
 
     #[test]
-    fn test_m3_wrong_anonce_rejected() {
+    fn test_m3_wrong_anonce_stored() {
         let mut db = CaptureDatabase::new();
         let anonce = [0xAA; 32];
         let wrong_anonce = [0xFF; 32];
@@ -1291,17 +1301,25 @@ mod tests {
         process_eapol_frame(&mut db, AP, STA, SSID, &build_m1(1, &anonce, &[]), 1000);
         process_eapol_frame(&mut db, AP, STA, SSID, &build_m2(1, &snonce), 2000);
 
-        // M3 with wrong ANonce
+        // M3 with different ANonce — store-first: stored even though ANonce
+        // doesn't match M1. In practice this means the M3 frame is from a
+        // different handshake attempt, but we keep it rather than dropping.
         let events = process_eapol_frame(&mut db, AP, STA, SSID, &build_m3(2, &wrong_anonce), 3000);
-        // Should be rejected — no M3 stored
-        assert!(events.is_empty());
-        assert!(!db.find(&AP, &STA).unwrap().has_m3);
+        // Event IS emitted (frame was stored)
+        assert!(events.iter().any(|e| matches!(e,
+            CaptureEvent::HandshakeMessage { message: HandshakeMessage::M3, .. }
+        )));
+        // M3 stored — quality bumps even though ANonce doesn't match M1.
+        // The hc22000 export uses the M1's ANonce + M2's raw frame, so
+        // this mismatched M3 doesn't affect cracking — it's harmless metadata.
+        let hs = db.find(&AP, &STA).unwrap();
+        assert!(hs.has_m3);
     }
 
     // ── M4 without M3 ──
 
     #[test]
-    fn test_m4_without_m3_rejected() {
+    fn test_m4_without_m3_stored() {
         let mut db = CaptureDatabase::new();
         let anonce = [0xAA; 32];
         let snonce = [0xBB; 32];
@@ -1309,10 +1327,15 @@ mod tests {
         process_eapol_frame(&mut db, AP, STA, SSID, &build_m1(1, &anonce, &[]), 1000);
         process_eapol_frame(&mut db, AP, STA, SSID, &build_m2(1, &snonce), 2000);
 
-        // Skip M3, send M4
+        // Skip M3, send M4 — store-first: M4 stored even without M3
         let events = process_eapol_frame(&mut db, AP, STA, SSID, &build_m4(2), 4000);
-        assert!(events.is_empty());
-        assert!(!db.find(&AP, &STA).unwrap().has_m4);
+        assert!(events.iter().any(|e| matches!(e,
+            CaptureEvent::HandshakeMessage { message: HandshakeMessage::M4, .. }
+        )));
+        let hs = db.find(&AP, &STA).unwrap();
+        assert!(hs.has_m4);
+        // Quality stays M1M2 (M4 alone doesn't improve without M3)
+        assert_eq!(hs.quality, HandshakeQuality::M1M2);
     }
 
     // ── Group key handshake ──
