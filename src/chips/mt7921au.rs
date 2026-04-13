@@ -1719,6 +1719,125 @@ impl Mt7921au {
         Ok(0)
     }
 
+    /// Send an EXT MCU QUERY command — returns raw response data.
+    /// Same as mcu_send_ext_cmd but with set_query=0 (MCU_Q_QUERY) and raw response.
+    /// Used for EFUSE_ACCESS and other data-returning EXT commands.
+    fn mcu_send_ext_query(&mut self, ext_cmd: u8, data: &[u8]) -> Result<Vec<u8>> {
+        let seq = self.next_mcu_seq();
+
+        let mut txd = [0u8; MT_SDIO_TXD_SIZE];
+        let msg_len = MT_SDIO_TXD_SIZE + data.len();
+
+        let txd_dw0: u32 = (msg_len as u32 & 0xFFFF)
+            | (1u32 << 23) | (0x20u32 << 25);
+        txd[0..4].copy_from_slice(&txd_dw0.to_le_bytes());
+        let txd_dw1: u32 = (1u32 << 16) | (1u32 << 31);
+        txd[4..8].copy_from_slice(&txd_dw1.to_le_bytes());
+
+        let m = 32;
+        let mcu_len = (msg_len - 32) as u16;
+        txd[m..m+2].copy_from_slice(&mcu_len.to_le_bytes());
+        let pq_id: u16 = (1 << 15) | (0x20 << 10);
+        txd[m+2..m+4].copy_from_slice(&pq_id.to_le_bytes());
+        txd[m+4] = MCU_CMD_EXT_CID;
+        txd[m+5] = MCU_PKT_ID;
+        txd[m+6] = 0;           // set_query = MCU_Q_QUERY (NOT MCU_Q_SET!)
+        txd[m+7] = seq;
+        txd[m+9] = ext_cmd;
+        txd[m+10] = MCU_S2D_H2N;
+        txd[m+11] = 1;          // ext_cid_ack
+
+        let total_len = MT_SDIO_HDR_SIZE + msg_len;
+        let padded_len = (total_len + 3) & !3;
+        let final_len = padded_len + MT_USB_TAIL_SIZE;
+        let mut pkt = vec![0u8; final_len];
+        let sdio_hdr: u32 = (msg_len as u32) & 0xFFFF;
+        pkt[0..4].copy_from_slice(&sdio_hdr.to_le_bytes());
+        pkt[MT_SDIO_HDR_SIZE..MT_SDIO_HDR_SIZE + MT_SDIO_TXD_SIZE].copy_from_slice(&txd);
+        if !data.is_empty() {
+            let off = MT_SDIO_HDR_SIZE + MT_SDIO_TXD_SIZE;
+            pkt[off..off + data.len()].copy_from_slice(data);
+        }
+
+        self.handle.write_bulk(self.ep_mcu_out, &pkt, USB_BULK_TIMEOUT)?;
+        self.mcu_recv_response_raw(seq)
+    }
+
+    /// Read 16 bytes of EEPROM/eFuse data at a given offset.
+    /// Matches mt7921_mcu_read_eeprom() using MCU_EXT_QUERY(EFUSE_ACCESS).
+    ///
+    /// The eFuse is organized in 16-byte blocks. The offset is automatically
+    /// aligned to a 16-byte boundary.
+    ///
+    /// Returns 16 bytes of eFuse data at the aligned offset.
+    fn mcu_read_eeprom(&mut self, offset: u32) -> Result<[u8; 16]> {
+        // Request payload: mt7921_mcu_eeprom_info = addr(le32) + valid(le32) + data(16) = 24B
+        const EFUSE_ACCESS: u8 = 0x01;
+        let aligned = offset & !0xF; // 16-byte aligned
+
+        let mut req = [0u8; 24];
+        req[0..4].copy_from_slice(&aligned.to_le_bytes()); // addr
+        // valid[4..8] = 0, data[8..24] = 0
+
+        let resp = self.mcu_send_ext_query(EFUSE_ACCESS, &req)?;
+
+        // Response: RXD(24) + MCU_RXD(8) + payload
+        // Payload: addr(4) + valid(4) + data(16)
+        let mut data = [0u8; 16];
+        if resp.len() >= 32 + 24 {
+            let payload = &resp[32..];
+            let valid = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            if valid != 0 {
+                data.copy_from_slice(&payload[8..24]);
+            }
+        }
+        Ok(data)
+    }
+
+    /// Read and apply eFuse calibration data for this specific device.
+    /// Called during radio_init after mcu_set_eeprom() tells firmware to use eFuse.
+    ///
+    /// Reads:
+    ///   - MT_EE_WIFI_CONF (0x07C): antenna config, band selection
+    ///   - MT_EE_TX_POWER (0x0D0+): per-band TX power offsets
+    ///
+    /// This is the per-device calibration that varies between Fenvi, EDUP, ALFA, etc.
+    fn mcu_read_efuse_cal(&mut self) -> Result<()> {
+        // Read WiFi config block (offset 0x070, 16-byte aligned)
+        // MT_EE_WIFI_CONF is at offset 0x07C within the EEPROM map
+        let wifi_conf_block = self.mcu_read_eeprom(0x070)?;
+
+        // MT_EE_WIFI_CONF at byte 0x0C within this block (0x07C - 0x070 = 0x0C)
+        let wifi_conf = wifi_conf_block[0x0C];
+        // Extract antenna config: bits[7:4] = tx_mask, bits[3:0] = rx_mask
+        // If non-zero, these override the NIC_CAPS defaults
+        let efuse_tx_ant = (wifi_conf >> 4) & 0xF;
+        let efuse_rx_ant = wifi_conf & 0xF;
+        if efuse_tx_ant != 0 && efuse_tx_ant != 0xF {
+            self.nic_phy_tx_ant = efuse_tx_ant;
+            self.nic_phy_nss = hweight8(efuse_tx_ant);
+        }
+        if efuse_rx_ant != 0 && efuse_rx_ant != 0xF {
+            self.nic_phy_rx_ant = efuse_rx_ant;
+        }
+
+        // Read TX power offset block (offset 0x0D0)
+        // Contains per-band power offsets that vary per device
+        let _tx_power_block = self.mcu_read_eeprom(0x0D0)?;
+
+        // Read 2.4GHz TX power targets (offset 0x0E0)
+        let _tx_power_2g = self.mcu_read_eeprom(0x0E0)?;
+
+        // Read 5GHz TX power targets (offset 0x120)
+        let _tx_power_5g = self.mcu_read_eeprom(0x120)?;
+
+        // For now, the firmware applies these internally via EFUSE_BUFFER_MODE.
+        // We read them to update driver-side antenna config and can extend
+        // to apply TX power corrections to mcu_set_rate_txpower() later.
+
+        Ok(())
+    }
+
     /// Send a CE (Community Engine) MCU command.
     /// CE commands use the standard TXD with set_query=MCU_Q_SET instead of MCU_Q_NA.
     fn mcu_send_ce_cmd(&mut self, cmd: u8, data: &[u8], wait_resp: bool) -> Result<i32> {
@@ -3172,6 +3291,12 @@ impl Mt7921au {
     fn radio_init(&mut self, channel: Channel) -> Result<()> {
         // Phase 1: __mt7921_init_hardware() — EEPROM calibration
         self.mcu_set_eeprom()?;
+
+        // Phase 1b: Read per-device eFuse calibration data.
+        // The firmware loaded eFuse internally from mcu_set_eeprom(), but we also
+        // need the antenna config and TX power offsets for driver-side decisions.
+        // Non-fatal: if eFuse read fails, NIC_CAPS defaults are used.
+        let _ = self.mcu_read_efuse_cal();
 
         // Phase 2: __mt7921_start() — enable MAC, init hardware, set channels
         self.mcu_mac_enable(0, true)?;
