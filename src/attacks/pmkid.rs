@@ -725,6 +725,7 @@ fn attack_single_ap(
         push_event(shared, events, attack_start, PmkidEventKind::ChannelLocked {
             channel: target.channel,
         }, attack_id);
+        shared.set_attack_target(&target.bssid.0);
         // Let radio settle — PLL lock + AGC stabilization
         let t = Instant::now();
         thread::sleep(params.channel_settle);

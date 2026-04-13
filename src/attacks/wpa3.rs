@@ -544,6 +544,7 @@ fn run_wpa3_attack(
         return;
     }
     push_event(shared, events, start, Wpa3EventKind::ChannelLocked { channel: target.channel }, attack_id);
+    shared.set_attack_target(&target.bssid.0);
     tracked_sleep(params.channel_settle, info);
 
 

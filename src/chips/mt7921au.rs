@@ -5121,6 +5121,10 @@ impl ChipDriver for Mt7921au {
         Ok(())
     }
 
+    fn set_monitor_target(&mut self, bssid: Option<&[u8; 6]>) -> Result<()> {
+        Mt7921au::set_monitor_target(self, bssid)
+    }
+
     fn channel_settle_time(&self) -> Duration {
         // MT7921AU: set_channel() sends MCU_EXT_CMD(CHANNEL_SWITCH) and WAITS
         // for the firmware response. The firmware blocks 140-500ms for PLL retune

@@ -245,6 +245,14 @@ pub trait ChipDriver: Send {
     fn tx_frame(&mut self, frame: &[u8], opts: &TxOptions) -> Result<()>;
     fn rx_frame(&mut self, timeout: Duration) -> Result<Option<RxFrame>>;
 
+    // Active monitor — per-AP targeting for ACK + beamformee
+    /// Set a target AP for active monitor mode. Firmware will ACK frames from this
+    /// AP and enable beamformee signal steering (3-6 dB gain). Pass None to disable.
+    /// Default: no-op (adapters that don't support it ignore this silently).
+    fn set_monitor_target(&mut self, _bssid: Option<&[u8; 6]>) -> Result<()> {
+        Ok(()) // No-op for adapters that don't support active monitor
+    }
+
     // MAC
     fn mac(&self) -> MacAddress;
     fn set_mac(&mut self, mac: MacAddress) -> Result<()>;

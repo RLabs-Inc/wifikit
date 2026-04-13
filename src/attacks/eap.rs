@@ -775,6 +775,7 @@ fn run_eap_attack(
         return;
     }
     push_event(shared, events, start, EapEventKind::ChannelLocked { channel }, attack_id);
+    shared.set_attack_target(&target.bssid.0);
     if params.channel_settle > Duration::ZERO {
         thread::sleep(params.channel_settle);
         wait_time += params.channel_settle;

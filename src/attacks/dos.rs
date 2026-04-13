@@ -621,6 +621,9 @@ fn run_dos_attack(
     }
     push_event(shared, events, start, DosEventKind::ChannelLocked { channel: target.channel }, attack_id);
 
+    // Enable active monitor for target AP (beamformee + ACK on supporting adapters)
+    shared.set_attack_target(&target.bssid.0);
+
     // Channel settle — wait for PLL lock + AGC
     thread::sleep(params.channel_settle);
 

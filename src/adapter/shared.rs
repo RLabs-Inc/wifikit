@@ -1,13 +1,13 @@
 //! SharedAdapter — shared access to a USB adapter with independent TX/RX paths.
 //!
-//! Architecture (FrameGate):
-//!   - One dedicated RX thread reads USB bulk IN continuously
-//!   - RX frames are submitted to FrameGate via gate.submit()
-//!   - FrameGate handles parsing, pcap, and distribution
+//! Architecture (two-thread RX pipeline):
+//!   - rx-usb thread: tight loop reading USB bulk IN, sends raw buffers over channel
+//!   - rx-parse thread: receives buffers, chip-parses into RxFrames, submits to FrameGate
+//!   - No gap between USB reads — rx-usb never parses, just reads and hands off
 //!   - TX goes through Mutex<Adapter> (attacks, channel control)
 //!   - RX and TX never contend — separate USB endpoints, separate code paths
 //!
-//! The RX thread starts immediately after SharedAdapter::spawn(). From that
+//! The RX pipeline starts immediately after SharedAdapter::spawn(). From that
 //! moment, every frame the adapter receives is read, chip-parsed into RxFrames,
 //! and submitted to the FrameGate. The gate handles all downstream processing
 //! (802.11 parsing, pcap writes, subscriber broadcast).
@@ -315,9 +315,28 @@ impl SharedAdapter {
         }
     }
 
+    /// Set the active monitor target AP for this attack.
+    /// Enables firmware ACK + beamformee for adapters that support it (MT7921AU).
+    /// Other adapters silently ignore this (trait default is no-op).
+    ///
+    /// Call AFTER lock_channel(). For --all attacks that cycle through APs,
+    /// call this each time the target changes. Automatically cleared on unlock.
+    pub fn set_attack_target(&self, bssid: &[u8; 6]) {
+        let mut adapter = self.inner.adapter.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = adapter.driver.set_monitor_target(Some(bssid));
+    }
+
     /// Unlock the channel. Called by attacks when they finish.
     /// Scanner will resume hopping on its next iteration.
+    /// Also clears any active monitor target.
     pub fn unlock_channel(&self) {
+        // Clear active monitor target first
+        {
+            let mut adapter = self.inner.adapter.lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = adapter.driver.set_monitor_target(None);
+        }
         self.inner.locked_channel.store(NO_CHANNEL_LOCK, Ordering::SeqCst);
         let mut lh = self.inner.lock_holder.lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -598,18 +617,19 @@ impl SharedAdapter {
 // DriverMessages (MCU responses for MediaTek adapters) are routed directly
 // to the driver via driver_msg_tx — they never enter the FrameGate.
 
-/// Start the dedicated RX thread: USB reader → chip parse_fn → FrameGate.
+/// Start the RX pipeline: two threads, zero gap between USB reads.
 ///
-/// The thread reads bulk IN continuously, calls the chip-specific parse_fn
-/// to extract RxFrames, and submits them to the FrameGate. The gate handles
-/// all downstream processing (parsing, pcap, distribution).
+/// Thread 1 (rx-usb): reads bulk IN in a tight loop, copies data into a Vec,
+/// sends it over an unbounded channel. Does NOTHING else — no parsing, no stats
+/// beyond read counting. Always has the next read_bulk() submitted immediately
+/// after the previous one completes.
 ///
-/// NOTE: Multi-URB approaches (rusb-async TransferPool, multi-thread read_bulk)
-/// were tested and showed NO improvement over single-thread sync reads. All
-/// approaches hit the same ~850 reads/sec ceiling — the bottleneck is in
-/// libusb/IOKit event processing, not in our read pattern. See bench_radio_vs_usb
-/// A/B/C test results for evidence. The only path to more frames/sec is
-/// aggregation (multiple frames per USB transfer).
+/// Thread 2 (rx-parse): receives buffers from the channel, parses all frames
+/// via the chip-specific parse_fn, submits to FrameGate, updates stats, routes
+/// driver messages. Runs independently — the channel absorbs bursts.
+///
+/// Returns the reader thread handle (the parser thread is detached — it exits
+/// when the channel closes, which happens when the reader thread drops its sender).
 fn start_rx_thread(
     rx_handle: RxHandle,
     gate: FrameGate,
@@ -617,49 +637,25 @@ fn start_rx_thread(
 ) -> thread::JoinHandle<()> {
     let stats = Arc::clone(&inner.rx_stats);
     let tx_feedback = Arc::clone(&inner.tx_feedback);
+
+    // Unbounded channel: reader never blocks on send, parser drains at own pace.
+    // Each message is (data: Vec<u8>, channel: u8).
+    let (buf_tx, buf_rx) = std::sync::mpsc::channel::<(Vec<u8>, u8)>();
+
+    // Thread 2: parser — receives raw USB buffers, parses, submits to gate
+    let parse_fn = rx_handle.parse_fn;
+    let driver_msg_tx = rx_handle.driver_msg_tx.clone();
     thread::Builder::new()
-        .name("rx-usb".into())
+        .name("rx-parse".into())
         .spawn(move || {
-            let mut buf = vec![0u8; rx_handle.rx_buf_size];
-
-            loop {
-                if !inner.alive.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                // Read USB bulk IN — this is the ONLY blocking point
-                let actual = match rx_handle.device.read_bulk(
-                    rx_handle.ep_in,
-                    &mut buf,
-                    RX_POLL_TIMEOUT,
-                ) {
-                    Ok(n) => n,
-                    Err(rusb::Error::Timeout
-                        | rusb::Error::Interrupted
-                        | rusb::Error::Overflow) => continue,
-                    Err(_) => break,
-                };
-
-                if actual == 0 {
-                    continue;
-                }
-
-                stats.usb_reads.fetch_add(1, Ordering::Relaxed);
-                stats.usb_bytes.fetch_add(actual as u64, Ordering::Relaxed);
-                let prev_max = stats.max_read_size.load(Ordering::Relaxed);
-                if actual as u32 > prev_max {
-                    stats.max_read_size.store(actual as u32, Ordering::Relaxed);
-                }
-
-                let channel = inner.current_channel.load(Ordering::Relaxed);
-
-                // Parse all frames from the USB bulk transfer
-                // (USB aggregation means one transfer can contain multiple frames)
+            while let Ok((data, channel)) = buf_rx.recv() {
+                let actual = data.len();
                 let mut pos = 0;
                 let mut frames_this_read = 0u32;
+
                 while pos < actual {
-                    let remaining = &buf[pos..actual];
-                    let (consumed, packet) = (rx_handle.parse_fn)(remaining, channel);
+                    let remaining = &data[pos..actual];
+                    let (consumed, packet) = parse_fn(remaining, channel);
 
                     if consumed == 0 {
                         stats.consumed_zero.fetch_add(1, Ordering::Relaxed);
@@ -677,20 +673,20 @@ fn start_rx_thread(
                         }
                         crate::core::chip::ParsedPacket::DriverMessage(msg) => {
                             stats.driver_messages.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref tx) = rx_handle.driver_msg_tx {
+                            if let Some(ref tx) = driver_msg_tx {
                                 let _ = tx.send(msg);
                             }
                         }
                         crate::core::chip::ParsedPacket::TxStatus(rpt) => {
                             stats.tx_status.fetch_add(1, Ordering::Relaxed);
                             tx_feedback.record(&rpt);
-                            if let Some(ref tx) = rx_handle.driver_msg_tx {
+                            if let Some(ref tx) = driver_msg_tx {
                                 let _ = tx.send(rpt.raw);
                             }
                         }
                         crate::core::chip::ParsedPacket::C2hEvent(evt) => {
                             stats.c2h_events.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref tx) = rx_handle.driver_msg_tx {
+                            if let Some(ref tx) = driver_msg_tx {
                                 let _ = tx.send(evt.raw);
                             }
                         }
@@ -719,6 +715,54 @@ fn start_rx_thread(
                     stats.multi_frame_reads.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // Channel closed — reader thread exited, we're done
+        })
+        .expect("failed to spawn rx-parse thread");
+
+    // Thread 1: USB reader — tight loop, nothing but read_bulk + send
+    let reader_stats = Arc::clone(&inner.rx_stats);
+    let buf_size = rx_handle.rx_buf_size;
+    thread::Builder::new()
+        .name("rx-usb".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; buf_size];
+
+            loop {
+                if !inner.alive.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let actual = match rx_handle.device.read_bulk(
+                    rx_handle.ep_in,
+                    &mut buf,
+                    RX_POLL_TIMEOUT,
+                ) {
+                    Ok(n) => n,
+                    Err(rusb::Error::Timeout
+                        | rusb::Error::Interrupted
+                        | rusb::Error::Overflow) => continue,
+                    Err(_) => break,
+                };
+
+                if actual == 0 {
+                    continue;
+                }
+
+                reader_stats.usb_reads.fetch_add(1, Ordering::Relaxed);
+                reader_stats.usb_bytes.fetch_add(actual as u64, Ordering::Relaxed);
+                let prev_max = reader_stats.max_read_size.load(Ordering::Relaxed);
+                if actual as u32 > prev_max {
+                    reader_stats.max_read_size.store(actual as u32, Ordering::Relaxed);
+                }
+
+                let channel = inner.current_channel.load(Ordering::Relaxed);
+
+                // Copy data and send — back to read_bulk immediately
+                if buf_tx.send((buf[..actual].to_vec(), channel)).is_err() {
+                    break; // parser thread gone
+                }
+            }
+            // buf_tx drops here → channel closes → parser thread exits
         })
         .expect("failed to spawn rx-usb thread")
 }

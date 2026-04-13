@@ -581,6 +581,7 @@ fn run_krack_attack(
         return;
     }
     push_event(shared, events, start, KrackEventKind::ChannelLocked { channel: target.channel }, attack_id);
+    shared.set_attack_target(&target.bssid.0);
     let t = Instant::now(); thread::sleep(params.channel_settle); wait_time += t.elapsed();
 
 

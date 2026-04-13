@@ -734,6 +734,7 @@ fn run_frag_attack(
     push_event(shared, events, start, FragEventKind::ChannelLocked {
         channel: target.channel,
     }, attack_id);
+    shared.set_attack_target(&target.bssid.0);
     thread::sleep(params.channel_settle);
     wait_time += params.channel_settle;
 

@@ -1992,6 +1992,7 @@ fn run_fuzz_attack(
         return;
     }
     push_event(shared, events, start, FuzzEventKind::ChannelLocked { channel: target.channel }, attack_id);
+    shared.set_attack_target(&target.bssid.0);
 
     // Channel settle — wait for PLL lock + AGC
     thread::sleep(params.channel_settle);
