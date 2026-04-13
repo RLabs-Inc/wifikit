@@ -632,6 +632,12 @@ fn channel_to_freq(ch: u8, band: Band) -> u16 {
 }
 
 /// Map band to NL80211 band index for MCU commands.
+/// Count set bits in a byte — hardware population count.
+/// Matches Linux hweight8() used throughout mt76 for antenna mask → stream count.
+fn hweight8(v: u8) -> u8 {
+    v.count_ones() as u8
+}
+
 /// Using Band enum is authoritative — channel_number alone is ambiguous
 /// (e.g., channel 1 exists in both 2.4GHz and 6GHz).
 fn band_to_idx(band: Band) -> u8 {
@@ -2786,19 +2792,25 @@ impl Mt7921au {
     fn mcu_wtbl_update(&mut self, wcid: u16, peer_mac: &[u8; 6], operation: u8) -> Result<()> {
         let bss_idx: u8 = 0;
 
-        // WTBL_GENERIC TLV (tag 0) — 32 bytes
-        // Layout: tag(2) + len(2) + peer_addr(6) + muar_idx(1) + skip_tx(1) +
-        //         cf_ack(1) + qos(1) + mesh(1) + adm(1) + max_len(2) +
-        //         aad_om(1) + pad(11)
-        let wtbl_generic_len: u16 = 32;
+        // WTBL TLV tags from mt76_connac_mcu.h
+        const WTBL_GENERIC: u16 = 0;
+        const WTBL_RX: u16 = 1;
+        const WTBL_HT: u16 = 2;
+        const WTBL_VHT: u16 = 3;
 
-        // WTBL_RX TLV (tag 1) — 8 bytes
-        // Layout: tag(2) + len(2) + rcpi(1) + pad(3)
-        let wtbl_rx_len: u16 = 8;
+        // WTBL_GENERIC TLV (tag 0) — 32 bytes
+        let wtbl_generic_len: u16 = 32;
+        // WTBL_RX TLV (tag 1) — 12 bytes (NOT 8! Linux struct has rcid+rca1+rca2+rv+rsv)
+        let wtbl_rx_len: u16 = 12;
+        // WTBL_HT TLV (tag 2) — 12 bytes
+        let wtbl_ht_len: u16 = 12;
+        // WTBL_VHT TLV (tag 3) — 12 bytes
+        let wtbl_vht_len: u16 = 12;
 
         let hdr_len = 16;
-        let n_tlvs: u8 = 2;
-        let total = hdr_len + wtbl_generic_len as usize + wtbl_rx_len as usize;
+        let n_tlvs: u8 = 4;
+        let total = hdr_len + wtbl_generic_len as usize + wtbl_rx_len as usize
+            + wtbl_ht_len as usize + wtbl_vht_len as usize;
         let mut req = vec![0u8; total];
 
         // Header
@@ -2807,25 +2819,208 @@ impl Mt7921au {
         req[2..4].copy_from_slice(&wcid.to_le_bytes());
         req[4] = n_tlvs;
 
-        // WTBL_GENERIC TLV
+        // ── WTBL_GENERIC TLV (32 bytes) ──
         let t = hdr_len;
-        req[t..t+2].copy_from_slice(&0u16.to_le_bytes()); // tag = WTBL_GENERIC
+        req[t..t+2].copy_from_slice(&WTBL_GENERIC.to_le_bytes());
         req[t+2..t+4].copy_from_slice(&wtbl_generic_len.to_le_bytes());
-        req[t+4..t+10].copy_from_slice(peer_mac); // peer_addr
+        req[t+4..t+10].copy_from_slice(peer_mac);
         req[t+10] = 0x0e; // muar_idx = 0xe (broadcast/non-associated)
         req[t+11] = 0; // skip_tx = false
         req[t+12] = 0; // cf_ack
         req[t+13] = 1; // qos = true (WMM)
-        // mesh, adm = 0
-        // max_len at [t+16..t+18]: 0 = use default (firmware decides based on HT caps)
 
-        // WTBL_RX TLV
+        // ── WTBL_RX TLV (12 bytes) ──
+        // Layout: tag(2)+len(2)+rcid(1)+rca1(1)+rca2(1)+rv(1)+rsv(4)
+        // rca1: RX Class 1 address check = MAC address matching for ACK
+        // rca2: RX Class 2 address check
+        // rv: RX Valid — marks this WTBL entry as active for RX
         let r = t + wtbl_generic_len as usize;
-        req[r..r+2].copy_from_slice(&1u16.to_le_bytes()); // tag = WTBL_RX
+        req[r..r+2].copy_from_slice(&WTBL_RX.to_le_bytes());
         req[r+2..r+4].copy_from_slice(&wtbl_rx_len.to_le_bytes());
-        req[r+4] = 0; // rcpi = 0 (firmware updates this from received frames)
+        req[r+4] = 0; // rcid
+        req[r+5] = 1; // rca1 = enable MAC address matching
+        req[r+6] = 1; // rca2 = enable
+        req[r+7] = 1; // rv = RX valid
+
+        // ── WTBL_HT TLV (12 bytes) ──
+        // Layout: tag(2)+len(2)+ht(1)+ldpc(1)+af(1)+mm(1)+rsv(4)
+        // af: A-MPDU factor (0=8K, 1=16K, 2=32K, 3=64K)
+        // mm: MPDU density minimum spacing
+        let h = r + wtbl_rx_len as usize;
+        req[h..h+2].copy_from_slice(&WTBL_HT.to_le_bytes());
+        req[h+2..h+4].copy_from_slice(&wtbl_ht_len.to_le_bytes());
+        req[h+4] = 1; // ht = true
+        req[h+5] = 1; // ldpc = true
+        req[h+6] = 3; // af = 3 (64KB A-MPDU)
+        req[h+7] = 0; // mm = 0 (no minimum spacing)
+
+        // ── WTBL_VHT TLV (12 bytes) ──
+        // Layout: tag(2)+len(2)+ldpc(1)+dyn_bw(1)+vht(1)+txop_ps(1)+rsv(4)
+        let v = h + wtbl_ht_len as usize;
+        req[v..v+2].copy_from_slice(&WTBL_VHT.to_le_bytes());
+        req[v+2..v+4].copy_from_slice(&wtbl_vht_len.to_le_bytes());
+        req[v+4] = 1; // ldpc = true
+        req[v+5] = 1; // dyn_bw = true (dynamic bandwidth)
+        req[v+6] = 1; // vht = true
+        req[v+7] = 0; // txop_ps
 
         self.mcu_send_ext_cmd(MCU_EXT_CMD_WTBL_UPDATE, &req, true)?;
+        Ok(())
+    }
+
+    /// Create a per-AP WTBL entry for active monitor mode.
+    /// Unlike the broadcast WTBL (muar_idx=0x0e), this entry uses muar_idx=0
+    /// (our VIF's OMAC) so firmware can match incoming frames and generate ACKs.
+    ///
+    /// This enables:
+    /// - ACK generation: AP knows we received its frames → better rate adaptation
+    /// - Beamformee: per-peer BF TLVs can be added to this entry
+    /// - Rate feedback: firmware tracks per-peer TX/RX statistics
+    fn mcu_wtbl_update_peer(&mut self, wcid: u16, ap_bssid: &[u8; 6]) -> Result<()> {
+        const WTBL_GENERIC: u16 = 0;
+        const WTBL_RX: u16 = 1;
+        const WTBL_HT: u16 = 2;
+        const WTBL_VHT: u16 = 3;
+        const WTBL_BF: u16 = 12;
+
+        let wtbl_generic_len: u16 = 32;
+        let wtbl_rx_len: u16 = 12;
+        let wtbl_ht_len: u16 = 12;
+        let wtbl_vht_len: u16 = 12;
+        // WTBL_BF TLV (tag 12) — 12 bytes
+        // Layout: tag(2)+len(2)+ibf(1)+ebf(1)+ibf_vht(1)+ebf_vht(1)+gid(1)+pfmu_idx(1)+rsv(2)
+        let wtbl_bf_len: u16 = 12;
+
+        let hdr_len = 16;
+        let n_tlvs: u8 = 5;
+        let total = hdr_len + wtbl_generic_len as usize + wtbl_rx_len as usize
+            + wtbl_ht_len as usize + wtbl_vht_len as usize + wtbl_bf_len as usize;
+        let mut req = vec![0u8; total];
+
+        req[0] = 0; // bss_idx
+        req[1] = 0; // RESET_AND_SET
+        req[2..4].copy_from_slice(&wcid.to_le_bytes());
+        req[4] = n_tlvs;
+
+        // WTBL_GENERIC — peer MAC is the AP, muar_idx=0 (our VIF's OMAC)
+        let t = hdr_len;
+        req[t..t+2].copy_from_slice(&WTBL_GENERIC.to_le_bytes());
+        req[t+2..t+4].copy_from_slice(&wtbl_generic_len.to_le_bytes());
+        req[t+4..t+10].copy_from_slice(ap_bssid);
+        req[t+10] = 0; // muar_idx = 0 (our VIF's omac_idx — NOT 0x0e!)
+        req[t+13] = 1; // qos
+
+        // WTBL_RX — rca1/rca2/rv all enabled for active RX
+        let r = t + wtbl_generic_len as usize;
+        req[r..r+2].copy_from_slice(&WTBL_RX.to_le_bytes());
+        req[r+2..r+4].copy_from_slice(&wtbl_rx_len.to_le_bytes());
+        req[r+5] = 1; // rca1 = MAC address matching
+        req[r+6] = 1; // rca2
+        req[r+7] = 1; // rv = RX valid
+
+        // WTBL_HT
+        let h = r + wtbl_rx_len as usize;
+        req[h..h+2].copy_from_slice(&WTBL_HT.to_le_bytes());
+        req[h+2..h+4].copy_from_slice(&wtbl_ht_len.to_le_bytes());
+        req[h+4] = 1; // ht
+        req[h+5] = 1; // ldpc
+        req[h+6] = 3; // af = 64KB A-MPDU
+        req[h+7] = 0; // mm
+
+        // WTBL_VHT
+        let v = h + wtbl_ht_len as usize;
+        req[v..v+2].copy_from_slice(&WTBL_VHT.to_le_bytes());
+        req[v+2..v+4].copy_from_slice(&wtbl_vht_len.to_le_bytes());
+        req[v+4] = 1; // ldpc
+        req[v+5] = 1; // dyn_bw
+        req[v+6] = 1; // vht
+
+        // WTBL_BF — enable explicit beamforming for this peer.
+        // When the AP supports SU_BEAMFORMER, it will steer its signal toward us
+        // after NDP sounding. The firmware handles NDP feedback autonomously.
+        // Expected gain: 3-6 dB from 2x2 AP, up to 9 dB from 4x4 AP.
+        let b = v + wtbl_vht_len as usize;
+        req[b..b+2].copy_from_slice(&WTBL_BF.to_le_bytes());
+        req[b+2..b+4].copy_from_slice(&wtbl_bf_len.to_le_bytes());
+        req[b+4] = 0; // ibf = false (implicit BF — we don't support)
+        req[b+5] = 1; // ebf = true (explicit BF — AP steers toward us)
+        req[b+6] = 0; // ibf_vht
+        req[b+7] = 1; // ebf_vht = true (VHT explicit beamforming)
+        req[b+8] = 0; // gid = 0 (SU beamforming, not MU)
+        req[b+9] = 0; // pfmu_idx = 0 (first PFMU table entry)
+
+        self.mcu_send_ext_cmd(MCU_EXT_CMD_WTBL_UPDATE, &req, true)?;
+        Ok(())
+    }
+
+    /// Create a per-AP STA_REC for active monitor mode.
+    /// This tells firmware about the specific AP we're monitoring, enabling:
+    /// - Proper frame routing and ACK generation
+    /// - Rate adaptation feedback
+    /// - Beamformee capability advertisement
+    fn mcu_sta_update_peer(&mut self, wcid: u16, ap_bssid: &[u8; 6], enable: bool) -> Result<()> {
+        const STA_REC_BASIC: u16 = 0;
+        const STA_REC_PHY: u16 = 20;
+
+        let hdr_len = 8;
+        let basic_len: usize = 20;
+        let phy_len: usize = 8;
+        let n_tlvs: u16 = 2;
+        let total = hdr_len + basic_len + phy_len;
+        let mut req = vec![0u8; total];
+
+        // Header
+        req[0] = 0; // bss_idx
+        req[1] = (wcid & 0xFF) as u8;
+        req[2..4].copy_from_slice(&n_tlvs.to_le_bytes());
+        req[4] = 1; // is_tlv_append
+        req[5] = 0; // muar_idx = 0 (our VIF)
+        req[6] = ((wcid >> 8) & 0xFF) as u8;
+
+        // STA_REC_BASIC — CONNECTION_INFRA_STA type (we're STA, AP is peer)
+        let t = hdr_len;
+        // conn_type = STA_TYPE_STA(BIT(0)) | NETWORK_INFRA(BIT(16)) = 0x10001
+        let conn_type: u32 = (1u32 << 0) | (1u32 << 16);
+        let conn_state: u8 = if enable { 2 } else { 0 }; // PORT_SECURE / DISCONNECT
+        req[t..t+2].copy_from_slice(&STA_REC_BASIC.to_le_bytes());
+        req[t+2..t+4].copy_from_slice(&(basic_len as u16).to_le_bytes());
+        req[t+4..t+8].copy_from_slice(&conn_type.to_le_bytes());
+        req[t+8] = conn_state;
+        req[t+9] = 1; // qos
+        req[t+10..t+12].copy_from_slice(&0u16.to_le_bytes()); // aid
+        req[t+12..t+18].copy_from_slice(ap_bssid); // peer = AP BSSID
+        let extra = if enable { 0x03u16 } else { 0x01u16 };
+        req[t+18..t+20].copy_from_slice(&extra.to_le_bytes());
+
+        // STA_REC_PHY
+        let p = t + basic_len;
+        req[p..p+2].copy_from_slice(&STA_REC_PHY.to_le_bytes());
+        req[p+2..p+4].copy_from_slice(&(phy_len as u16).to_le_bytes());
+        req[p+4] = 0x3F; // all PHY modes
+
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_STA_REC_UPDATE, &req, true)?;
+        Ok(())
+    }
+
+    /// Set a target AP for active monitor mode — firmware will ACK frames from this AP.
+    /// This creates a per-peer WTBL + STA_REC entry alongside the existing broadcast
+    /// entries. The broadcast entry captures ALL frames; the per-AP entry enables ACK.
+    ///
+    /// Call with None to disable active monitoring (remove per-AP entry).
+    pub fn set_monitor_target(&mut self, target: Option<&[u8; 6]>) -> Result<()> {
+        const PEER_WCID: u16 = 1; // First usable WCID for per-peer entries
+
+        match target {
+            Some(bssid) => {
+                self.mcu_sta_update_peer(PEER_WCID, bssid, true)?;
+                self.mcu_wtbl_update_peer(PEER_WCID, bssid)?;
+            }
+            None => {
+                // Remove per-AP entry by sending with enable=false
+                let zero_mac = [0u8; 6];
+                let _ = self.mcu_sta_update_peer(PEER_WCID, &zero_mac, false);
+            }
+        }
         Ok(())
     }
 
@@ -2847,13 +3042,13 @@ impl Mt7921au {
         req[0] = channel.number; // control_ch
         req[1] = center_ch;     // center_ch
         req[2] = bw;            // bw: 0=20, 1=40, 2=80, 3=160 (CMD_CBW_*)
-        req[3] = 2;             // tx_streams_num = hweight8(antenna_mask 0x3) = 2
-        // rx_streams: Linux sends antenna_mask (0x3) for SET_RX_PATH,
-        // but hweight8(antenna_mask) (2) for CHANNEL_SWITCH.
+        req[3] = hweight8(self.nic_phy_tx_ant); // tx_streams_num = hweight8(antenna_mask)
+        // rx_streams: Linux sends antenna_mask for SET_RX_PATH,
+        // but hweight8(antenna_mask) for CHANNEL_SWITCH.
         req[4] = if ext_cmd == MCU_EXT_CMD_SET_RX_PATH {
-            0x3              // antenna_mask (bitmask: both antennas)
+            self.nic_phy_rx_ant  // antenna_mask (bitmask)
         } else {
-            2                // hweight8(0x3) = 2 (stream count)
+            hweight8(self.nic_phy_rx_ant) // stream count
         };
         req[5] = switch_reason; // CH_SWITCH_NORMAL(0) or CH_SWITCH_SCAN_BYPASS_DPD(9)
         req[6] = 0;            // band_idx = PHY band index (always 0, single-PHY device)
@@ -3199,8 +3394,8 @@ impl Mt7921au {
         req[r+5] = center_ch;
         req[r+6] = 0; // center_chan2 (80+80 only)
         req[r+7] = bw;
-        req[r+8] = 2; // tx_streams
-        req[r+9] = 2; // rx_streams
+        req[r+8] = hweight8(self.nic_phy_tx_ant); // tx_streams
+        req[r+9] = hweight8(self.nic_phy_rx_ant); // rx_streams
         req[r+10] = 1; // short_st
         req[r+11] = 4; // ht_op_info = HT 40M allowed
         // sco: secondary channel offset (1=above, 3=below, 0=none)
@@ -3394,8 +3589,8 @@ impl Mt7921au {
         rlm_req[r+5] = center_ch; // center_chan
         rlm_req[r+6] = 0; // center_chan2 (80+80 only)
         rlm_req[r+7] = bw; // bw: 0=20, 1=40, 2=80, 3=160
-        rlm_req[r+8] = 2; // tx_streams = hweight8(0x3) = 2
-        rlm_req[r+9] = 2; // rx_streams = hweight8(chainmask)
+        rlm_req[r+8] = hweight8(self.nic_phy_tx_ant); // tx_streams
+        rlm_req[r+9] = hweight8(self.nic_phy_rx_ant); // rx_streams
         rlm_req[r+10] = 1; // short_st = true
         rlm_req[r+11] = 4; // ht_op_info = 4 (HT 40M allowed)
         rlm_req[r+12] = 0; // sco (secondary channel offset)
@@ -3640,9 +3835,11 @@ impl Mt7921au {
             req[h+4..h+6].copy_from_slice(&ht_cap.to_le_bytes());
             // ampdu_params at [h+6]: max length exponent=3 (64KB), min spacing=0
             req[h+6] = (3 << 0) | (0 << 2); // MAX_LEN_EXP=3, MIN_MPDU_START=0
-            // mcs_set[16] at [h+8..h+24]: MCS 0-15 supported (2 spatial streams)
-            req[h+8] = 0xFF; // MCS 0-7 for SS1
-            req[h+9] = 0xFF; // MCS 0-7 for SS2
+            // mcs_set[16] at [h+8..h+24]: enable MCS 0-7 per spatial stream
+            let nss = self.nic_phy_nss.max(1).min(4);
+            for ss in 0..nss {
+                req[h + 8 + ss as usize] = 0xFF; // MCS 0-7 for this SS
+            }
 
             // ── STA_REC_VHT TLV (16 bytes) ──
             // Declares VHT (802.11ac) capabilities.
@@ -3662,10 +3859,14 @@ impl Mt7921au {
                 | (3 << 13); // beamformee STS cap = 4
             req[v+4..v+8].copy_from_slice(&vht_cap.to_le_bytes());
             // vht_rx_mcs_map (le16) at [v+8..v+10]:
-            // 2 streams MCS 0-9, rest unsupported (0x3 = not supported)
-            // SS1: MCS 0-9 (0x0), SS2: MCS 0-9 (0x0), SS3-8: not supported (0x3)
-            let rx_mcs: u16 = 0x0000 | (0x3 << 4) | (0x3 << 6) | (0x3 << 8) |
-                (0x3 << 10) | (0x3 << 12) | (0x3 << 14); // 0xFFFC
+            // Each SS takes 2 bits: 0=MCS0-7, 1=MCS0-8, 2=MCS0-9, 3=not supported
+            // Enable MCS 0-9 for supported streams, mark rest as unsupported
+            let vht_nss = self.nic_phy_nss.max(1).min(8);
+            let mut rx_mcs: u16 = 0;
+            for ss in 0..8u16 {
+                let val = if (ss as u8) < vht_nss { 0x2 } else { 0x3 }; // MCS 0-9 or not supported
+                rx_mcs |= val << (ss * 2);
+            }
             req[v+8..v+10].copy_from_slice(&rx_mcs.to_le_bytes());
             // vht_tx_mcs_map (le16) at [v+10..v+12]: same as rx
             req[v+10..v+12].copy_from_slice(&rx_mcs.to_le_bytes());
@@ -3691,10 +3892,14 @@ impl Mt7921au {
             req[e+11] = 0x06; // BW40_2G | BW40_80_5G
             req[e+13] = 0x32; // LDPC | SU_BEAMFORMEE | STS_LE80=3
             req[e+15] = 0x07; // NG16_SU | NG16_MU | CODEBOOK_4_2_SU
-            // he_rx_mcs_bw80 (le16 × 2) at [e+20..e+24]: MCS 0-11 for 2SS
-            // Encoded as: SS1 MCS 0-11(0x2), SS2 MCS 0-11(0x2), rest not supported(0x3)
-            let he_mcs: u16 = 0x02 | (0x02 << 2) | (0x3 << 4) | (0x3 << 6) |
-                (0x3 << 8) | (0x3 << 10) | (0x3 << 12) | (0x3 << 14); // 0xFFFA
+            // he_rx_mcs_bw80 (le16 × 2) at [e+20..e+24]:
+            // Each SS: 0=MCS0-7, 1=MCS0-9, 2=MCS0-11, 3=not supported
+            let he_nss = self.nic_phy_nss.max(1).min(8);
+            let mut he_mcs: u16 = 0;
+            for ss in 0..8u16 {
+                let val = if (ss as u8) < he_nss { 0x2 } else { 0x3 }; // MCS 0-11 or not supported
+                he_mcs |= val << (ss * 2);
+            }
             req[e+20..e+22].copy_from_slice(&he_mcs.to_le_bytes()); // rx mcs bw80
             req[e+22..e+24].copy_from_slice(&he_mcs.to_le_bytes()); // tx mcs bw80
 
