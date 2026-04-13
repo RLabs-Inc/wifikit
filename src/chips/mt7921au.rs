@@ -5282,20 +5282,23 @@ fn mt7921au_parse_rx(buf: &[u8], channel: u8) -> (usize, crate::core::chip::Pars
     match pkt_type {
         2 | 3 => {} // PKT_TYPE_NORMAL + DUP_RFB — parse as 802.11 frame below
         0 => {
-            // MT7921 TXS (connac2) format — DW0 through DW6.
+            // MT7921 TXS (connac2) format — TXS payload after 24-byte RXD base.
             // Matches mt76_connac2_mac_add_txs_skb() from Linux mt76_connac2_mac.c.
             //
-            // DW0: pkt_id[31:25], tx_cnt[19:16], tx_state[14:12], queue_sel[10:8]
-            // DW1: wlan_idx[9:0], final_rate[24:16] (MODE[15:13]|STBC[12]|NSS[10:9]|BW[8:7]|MCS[5:0])
-            // DW2: timestamp[31:0] (microsecond TSF)
-            // DW3: total_airtime[23:0], ampdu_acked[29:24], front_time[31:24] — connac3 layout
-            // DW4: bw[7:6], gi_ltf[5:4], tx_delay[31:16]
-            // DW5: resp_rate[31:24], rx_power[23:16]
-            // DW6: mpdu_tx_cnt[31:24], mpdu_tx_byte_cnt[23:0]
+            // USB RX: [RXD base 24B] [TXS DW0-DW6 28B]
+            // The RXD base has pkt_len + pkt_type. TXS data starts at byte 24.
+            //
+            // TXS DW0: pkt_id[31:25], tx_cnt[19:16], tx_state[14:12], queue_sel[10:8]
+            // TXS DW1: wlan_idx[9:0], final_rate[24:16]
+            // TXS DW2: timestamp[31:0] (microsecond TSF)
+            // TXS DW3: total_airtime[23:0]
+            // TXS DW4: bw[7:6], gi_ltf[5:4], tx_delay[31:16]
             let raw = rxd.to_vec();
+            let txs_base = 24; // TXS payload starts after RXD base header
             let dw = |i: usize| -> u32 {
-                if rxd.len() >= (i + 1) * 4 {
-                    u32::from_le_bytes([rxd[i*4], rxd[i*4+1], rxd[i*4+2], rxd[i*4+3]])
+                let off = txs_base + i * 4;
+                if rxd.len() >= off + 4 {
+                    u32::from_le_bytes([rxd[off], rxd[off+1], rxd[off+2], rxd[off+3]])
                 } else { 0 }
             };
             let txs_dw0 = dw(0);
