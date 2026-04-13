@@ -71,6 +71,8 @@ struct PipelineStats {
     pub eapol_count: AtomicU64,
     /// Beacon/probe response frames.
     pub beacon_count: AtomicU64,
+    /// Frames with FCS errors (received but not parsed/extracted).
+    pub fcs_errors: AtomicU64,
 
     // ── Queue depth counters ──
     /// Frames extracted from USB by adapter threads (submitted count).
@@ -95,6 +97,7 @@ impl PipelineStats {
             control_count: AtomicU64::new(0),
             eapol_count: AtomicU64::new(0),
             beacon_count: AtomicU64::new(0),
+            fcs_errors: AtomicU64::new(0),
             usb_frames: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             peak_pending: AtomicU64::new(0),
@@ -115,6 +118,7 @@ impl PipelineStats {
             control_count: self.control_count.load(Ordering::Relaxed),
             eapol_count: self.eapol_count.load(Ordering::Relaxed),
             beacon_count: self.beacon_count.load(Ordering::Relaxed),
+            fcs_errors: self.fcs_errors.load(Ordering::Relaxed),
             pending: self.pending.load(Ordering::Relaxed),
             peak_pending: self.peak_pending.load(Ordering::Relaxed),
         }
@@ -148,6 +152,8 @@ pub struct PipelineStatsSnapshot {
     pub eapol_count: u64,
     /// Beacon/probe response frames.
     pub beacon_count: u64,
+    /// Frames with FCS errors (counted but not parsed/extracted).
+    pub fcs_errors: u64,
     /// Current queue depth (submit→pipeline).
     pub pending: u64,
     /// Peak queue depth ever observed.
@@ -330,7 +336,29 @@ fn pipeline_thread(
         inner.stats.pending.fetch_sub(1, Ordering::Relaxed);
         inner.stats.frames_received.fetch_add(1, Ordering::Relaxed);
 
-        // ── 0. 802.11 frame control sanity check ──
+        // ── 0. FCS error filter ──
+        // Frames with FCS errors have corrupted bytes — parsing them creates
+        // phantom APs/STAs with garbage MACs and SSIDs. Count them and write
+        // to pcap for offline analysis, but skip parsing and extraction.
+        if rx_frame.is_fcs_error {
+            inner.stats.fcs_errors.fetch_add(1, Ordering::Relaxed);
+
+            // Still write to pcap (errored frames are valuable for RF analysis)
+            if let Some(ref mut cap) = pcap {
+                let elapsed = inner.start_time.elapsed();
+                let ts_us = elapsed.as_micros() as u64;
+                if write_pcap_packet(&mut cap.writer, &rx_frame.data, ts_us).is_ok() {
+                    cap.packets_written += 1;
+                    cap.bytes_written += (16 + rx_frame.data.len()) as u64;
+                    inner.stats.pcap_frames_written.store(cap.packets_written, Ordering::Relaxed);
+                    inner.stats.pcap_bytes_written.store(cap.bytes_written, Ordering::Relaxed);
+                }
+            }
+
+            continue; // Skip parsing, extraction, and broadcasting
+        }
+
+        // ── 1. 802.11 frame control sanity check ──
         // Valid frames: protocol version = 0 (bits 0-1), type = 0-2 (bits 2-3).
         // Type 3 is reserved. Non-zero protocol version is invalid.
         if rx_frame.data.len() >= 2 {
@@ -343,7 +371,7 @@ fn pipeline_thread(
             }
         }
 
-        // ── 1. Parse ──
+        // ── 2. Parse ──
         let parsed = parsed_frame::parse_frame(
             &rx_frame.data,
             rx_frame.rssi,
@@ -352,7 +380,7 @@ fn pipeline_thread(
             rx_frame.timestamp,
         );
 
-        // ── 2. Update per-type counters ──
+        // ── 3. Update per-type counters ──
         match parsed.frame_type {
             0 => {
                 inner.stats.mgmt_count.fetch_add(1, Ordering::Relaxed);
@@ -380,7 +408,7 @@ fn pipeline_thread(
             inner.stats.frames_parsed.fetch_add(1, Ordering::Relaxed);
         }
 
-        // ── 3. Write to pcap ──
+        // ── 4. Write to pcap ──
         if let Some(ref mut cap) = pcap {
             let elapsed = inner.start_time.elapsed();
             let ts_us = elapsed.as_micros() as u64;
@@ -392,7 +420,7 @@ fn pipeline_thread(
             }
         }
 
-        // ── 4. Extract deltas + apply to the FrameStore ──
+        // ── 5. Extract deltas + apply to the FrameStore ──
         //
         // The extractor produces semantic deltas from each frame.
         // The store applies them (single write path for all state).
