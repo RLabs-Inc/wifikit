@@ -16,40 +16,45 @@ use super::{FilterBand, FilterMenuItem, ScanFilter, ScanSnapshot, SortField};
 //  APs View — the main AP table
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Column widths
-const COL_SEL: usize = 2;      // ▶ + space
-const COL_RSSI: usize = 9;     // "-65 ██▌░" = number(4) + space(1) + bar(4)
-const COL_RSSI_BAR: usize = 4; // smooth sub-character bar width
-const COL_CLI: usize = 3;      // client count
-const COL_SSID_MIN: usize = 8; // minimum SSID width
-const COL_SSID_MAX: usize = 32;// WiFi spec max (32 bytes)
-const COL_SEC: usize = 6;      // security (short_name: WPA2-E max)
-const COL_WPS: usize = 3;      // WPS dot (centered)
-const COL_GEN: usize = 5;      // WiFi generation
-const COL_CH: usize = 3;       // channel number
-const COL_VENDOR: usize = 12;  // vendor name (capped, truncated)
-const COL_BSSID: usize = 17;   // XX:XX:XX:XX:XX:XX
-const COL_SEP: usize = 2;      // "  " separator between columns
+// ── Shared column widths ─────────────────────────────────────────────────
+const COL_SEL: usize = 2;       // ▶ + space
+const COL_RSSI: usize = 9;      // "-65 ██▌░" = number(4) + space(1) + bar(4) — default for bar views
+const COL_RSSI_BAR: usize = 4;  // smooth sub-character bar width
+const COL_SEP: usize = 2;       // "  " separator between columns
+
+// ── APs view column widths ──────────────────────────────────────────────
+const AP_COL_RSSI: usize = 13;  // "-65 ▁▃█▅▃▅▇▃" = number(4) + space(1) + sparkline(8)
+const COL_SPARKLINE: usize = 8; // sparkline character width
+const COL_CLI: usize = 3;       // client count
+const COL_CAP: usize = 2;       // capture indicator: PH / P· / ·H
+const COL_SSID_MIN: usize = 8;  // minimum SSID width
+const COL_SSID_MAX: usize = 32; // WiFi spec max (32 bytes)
+const COL_SEC: usize = 6;       // security (short_name: WPA2-E max)
+const COL_WPS: usize = 3;       // WPS dot (centered)
+const COL_GEN: usize = 5;       // WiFi generation
+const COL_CH: usize = 3;        // channel number
+const COL_VENDOR: usize = 12;   // vendor name (capped, truncated)
+const COL_BSSID: usize = 17;    // XX:XX:XX:XX:XX:XX
 
 /// Determine which optional columns are visible based on terminal width.
-/// Returns (show_wps, show_gen, show_ch, show_bssid, show_vendor).
+/// Returns (show_cap, show_wps, show_sec, show_gen, show_ch, show_bssid, show_vendor).
 ///
-/// Column order: SSID RSSI CLI [WPS] [SEC] [GEN] [CH] [BSSID] [VENDOR]
-/// Core (never drop): SSID, RSSI, CLI
-/// Drop order (first to go): VENDOR → BSSID → CH → GEN → SEC → WPS
-fn auto_columns(width: usize) -> (bool, bool, bool, bool, bool, bool) {
-    // ScrollTable: indent(1) + [▶ SSID](sel+ssid)  RSSI  CLI  [optional...]
-    // Cursor is merged into SSID column, so 3 core columns, 2 separators
-    let core = 1 + COL_SEL + COL_SSID_MIN + COL_RSSI + COL_CLI + (2 * COL_SEP);
+/// Column order: SSID RSSI CLI [CAP] [WPS] [SEC] [GEN] [CH] [BSSID] [VENDOR]
+/// Core (never drop): SSID, RSSI (with sparkline), CLI
+/// Drop order (first to go): VENDOR → BSSID → CH → GEN → WPS → SEC → CAP
+fn auto_columns(width: usize) -> (bool, bool, bool, bool, bool, bool, bool) {
+    let core = 1 + COL_SEL + COL_SSID_MIN + AP_COL_RSSI + COL_CLI + (2 * COL_SEP);
     let budget = width.saturating_sub(core);
 
     let mut remaining = budget;
 
     // Add in reverse drop order (most important optional first)
-    let show_wps = remaining >= COL_WPS + COL_SEP;
-    if show_wps { remaining -= COL_WPS + COL_SEP; }
+    let show_cap = remaining >= COL_CAP + COL_SEP;
+    if show_cap { remaining -= COL_CAP + COL_SEP; }
     let show_sec = remaining >= COL_SEC + COL_SEP;
     if show_sec { remaining -= COL_SEC + COL_SEP; }
+    let show_wps = remaining >= COL_WPS + COL_SEP;
+    if show_wps { remaining -= COL_WPS + COL_SEP; }
     let show_gen = remaining >= COL_GEN + COL_SEP;
     if show_gen { remaining -= COL_GEN + COL_SEP; }
     let show_ch = remaining >= COL_CH + COL_SEP;
@@ -58,7 +63,7 @@ fn auto_columns(width: usize) -> (bool, bool, bool, bool, bool, bool) {
     if show_bssid { remaining -= COL_BSSID + COL_SEP; }
     let show_vendor = remaining >= COL_VENDOR + COL_SEP;
 
-    (show_wps, show_sec, show_gen, show_ch, show_bssid, show_vendor)
+    (show_cap, show_wps, show_sec, show_gen, show_ch, show_bssid, show_vendor)
 }
 
 /// Render the APs table view. Returns the data row capacity (for scroll bounds).
@@ -73,12 +78,13 @@ pub fn render_aps(
     lines: &mut Vec<String>,
 ) -> usize {
     let w = width as usize;
-    let (show_wps, show_sec, show_gen, show_ch, show_bssid, show_vendor) = auto_columns(w);
+    let (show_cap, show_wps, show_sec, show_gen, show_ch, show_bssid, show_vendor) = auto_columns(w);
 
     // Calculate SSID width: takes remaining space after fixed columns
     // indent(1) + cursor merged into SSID(COL_SEL) + RSSI + CLI + separators
-    let mut fixed = 1 + COL_SEL + COL_RSSI + COL_CLI;
+    let mut fixed = 1 + COL_SEL + AP_COL_RSSI + COL_CLI;
     let mut sep_count = 2; // ssid|rssi, rssi|cli
+    if show_cap { fixed += COL_CAP; sep_count += 1; }
     if show_wps { fixed += COL_WPS; sep_count += 1; }
     if show_sec { fixed += COL_SEC; sep_count += 1; }
     if show_gen { fixed += COL_GEN; sep_count += 1; }
@@ -94,9 +100,10 @@ pub fn render_aps(
     let ssid_col_w = COL_SEL + ssid_w; // cursor(2) + ssid text
     let mut cols = vec![
         ScrollCol::new("  SSID", ssid_col_w),
-        ScrollCol::new("RSSI", COL_RSSI),
+        ScrollCol::new("RSSI", AP_COL_RSSI),
         ScrollCol::right("CLI", COL_CLI),
     ];
+    if show_cap { cols.push(ScrollCol::center("HS", COL_CAP)); }
     if show_wps { cols.push(ScrollCol::center("WPS", COL_WPS)); }
     if show_sec { cols.push(ScrollCol::new("SEC", COL_SEC)); }
     if show_gen { cols.push(ScrollCol::new("GEN", COL_GEN)); }
@@ -123,9 +130,10 @@ pub fn render_aps(
             format!("  {}", ssid_text)
         };
 
+        // Sparkline + RSSI number (visual pattern first, exact value second)
+        let spark = rssi_sparkline(&ap.rssi_samples, COL_SPARKLINE);
         let num = style_rssi(ap.rssi);
-        let bar = rssi_bar(ap.rssi, COL_RSSI_BAR);
-        let rssi_combined = format!("{} {}", prism::pad(&num, 4, "right"), bar);
+        let rssi_combined = format!("{} {}", spark, prism::pad(&num, 4, "left"));
 
         let cli_str = if ap.client_count > 0 {
             let styled = format!("{:>3}", ap.client_count);
@@ -136,6 +144,7 @@ pub fn render_aps(
 
         let mut row = vec![ssid_cell, rssi_combined, cli_str];
 
+        if show_cap { row.push(style_capture(&ap.handshake_quality, ap.has_pmkid)); }
         if show_wps { row.push(style_wps(&ap.wps_state)); }
         if show_sec { row.push(style_security(&ap.security)); }
         if show_gen { row.push(style_wifi_gen(&ap.wifi_gen)); }
@@ -356,17 +365,18 @@ const CLI_COL_AP_MIN: usize = 8;   // minimum AP name width
 const CLI_COL_AP_MAX: usize = 20;  // maximum AP name width
 const CLI_COL_FRAMES: usize = 7;   // frame count
 const CLI_COL_DATA: usize = 7;     // data bytes (e.g. "14.6 KB")
+const CLI_COL_GEN: usize = 5;      // WiFi generation
 const CLI_COL_PS: usize = 2;       // power save flag
 const CLI_COL_PROBES: usize = 6;   // probe count
 const CLI_COL_VENDOR: usize = 12;  // vendor name
+const CLI_COL_AGE: usize = 4;      // last-seen age ("3s", "1m", "5m")
 
 /// Adaptive columns for Clients table.
-/// Returns (show_data, show_ps, show_probes, show_vendor).
+/// Returns (show_data, show_gen, show_ps, show_probes, show_age, show_vendor).
 ///
 /// Core (never drop): MAC, AP, RSSI, FRAMES
-/// Drop order (first to go): VENDOR → PS → DATA → PROBES
-fn auto_columns_clients(width: usize) -> (bool, bool, bool, bool) {
-    // indent(1) + MAC(sel+17) + AP(min) + RSSI(9) + FRAMES(7) + 3 seps
+/// Drop order (first to go): VENDOR → AGE → PS → GEN → DATA → PROBES
+fn auto_columns_clients(width: usize) -> (bool, bool, bool, bool, bool, bool) {
     let core = 1 + COL_SEL + CLI_COL_MAC + CLI_COL_AP_MIN + COL_RSSI + CLI_COL_FRAMES + (3 * COL_SEP);
     let budget = width.saturating_sub(core);
     let mut remaining = budget;
@@ -376,11 +386,15 @@ fn auto_columns_clients(width: usize) -> (bool, bool, bool, bool) {
     if show_probes { remaining -= CLI_COL_PROBES + COL_SEP; }
     let show_data = remaining >= CLI_COL_DATA + COL_SEP;
     if show_data { remaining -= CLI_COL_DATA + COL_SEP; }
+    let show_gen = remaining >= CLI_COL_GEN + COL_SEP;
+    if show_gen { remaining -= CLI_COL_GEN + COL_SEP; }
     let show_ps = remaining >= CLI_COL_PS + COL_SEP;
     if show_ps { remaining -= CLI_COL_PS + COL_SEP; }
+    let show_age = remaining >= CLI_COL_AGE + COL_SEP;
+    if show_age { remaining -= CLI_COL_AGE + COL_SEP; }
     let show_vendor = remaining >= CLI_COL_VENDOR + COL_SEP;
 
-    (show_data, show_ps, show_probes, show_vendor)
+    (show_data, show_gen, show_ps, show_probes, show_age, show_vendor)
 }
 
 pub fn render_clients(
@@ -392,21 +406,24 @@ pub fn render_clients(
     lines: &mut Vec<String>,
 ) -> usize {
     let w = width as usize;
-    let (show_data, show_ps, show_probes, show_vendor) = auto_columns_clients(w);
+    let (show_data, show_gen, show_ps, show_probes, show_age, show_vendor) = auto_columns_clients(w);
 
-    // Sort: associated first, then most active (frame count descending)
+    // Sort: associated first, then strongest signal (RSSI descending)
+    // Closest client = best target for deauth/capture
     let mut stations = snap.stations.clone();
     stations.sort_by(|a, b| {
         b.is_associated.cmp(&a.is_associated)
-            .then(b.frame_count.cmp(&a.frame_count))
+            .then(b.rssi.cmp(&a.rssi))
     });
 
     // AP column absorbs remaining width (like SSID in APs table)
     let mut fixed = 1 + COL_SEL + CLI_COL_MAC + COL_RSSI + CLI_COL_FRAMES;
     let mut sep_count = 3; // mac|ap, ap|rssi, rssi|frames
     if show_data { fixed += CLI_COL_DATA; sep_count += 1; }
+    if show_gen { fixed += CLI_COL_GEN; sep_count += 1; }
     if show_ps { fixed += CLI_COL_PS; sep_count += 1; }
     if show_probes { fixed += CLI_COL_PROBES; sep_count += 1; }
+    if show_age { fixed += CLI_COL_AGE; sep_count += 1; }
     if show_vendor { fixed += CLI_COL_VENDOR; sep_count += 1; }
     fixed += sep_count * COL_SEP;
 
@@ -420,8 +437,10 @@ pub fn render_clients(
         ScrollCol::right("FRAMES", CLI_COL_FRAMES),
     ];
     if show_data { cols.push(ScrollCol::right("DATA", CLI_COL_DATA)); }
+    if show_gen { cols.push(ScrollCol::new("GEN", CLI_COL_GEN)); }
     if show_ps { cols.push(ScrollCol::center("PS", CLI_COL_PS)); }
     if show_probes { cols.push(ScrollCol::right("PROBES", CLI_COL_PROBES)); }
+    if show_age { cols.push(ScrollCol::right("AGE", CLI_COL_AGE)); }
     if show_vendor { cols.push(ScrollCol::new("VENDOR", CLI_COL_VENDOR)); }
 
     // Build data rows
@@ -480,9 +499,18 @@ pub fn render_clients(
             row.push(if is_sel { s().cyan().bold().paint(&d) } else { d });
         }
 
+        // GEN — WiFi generation from fingerprinting
+        if show_gen {
+            row.push(if sta.wifi_gen != crate::protocol::ieee80211::WifiGeneration::Legacy {
+                style_wifi_gen(&sta.wifi_gen)
+            } else {
+                String::new()
+            });
+        }
+
         // PS — power save flag
         if show_ps {
-            row.push(if sta.power_save { s().yellow().paint("Z") } else { s().dim().paint("-") });
+            row.push(if sta.power_save { s().yellow().paint("Z") } else { String::new() });
         }
 
         // Probes — only show when > 0, bold to catch attention
@@ -495,28 +523,31 @@ pub fn render_clients(
             });
         }
 
+        // AGE — time since last seen, green when fresh, dim when stale
+        if show_age {
+            row.push(format_age(sta.last_seen));
+        }
+
         // Vendor — dimmed, truncated
         if show_vendor {
-            let vendor_plain = if sta.vendor.is_empty() { "" } else { &sta.vendor };
-            row.push(if vendor_plain.is_empty() {
+            row.push(if sta.vendor.is_empty() {
                 String::new()
             } else {
-                s().dim().paint(&truncate(vendor_plain, CLI_COL_VENDOR, "…"))
+                s().dim().paint(&truncate(&sta.vendor, CLI_COL_VENDOR, "…"))
             });
         }
 
         data_rows.push(row);
     }
 
-    // Footer hints — mention legend for visible indicator columns
+    // Footer hints
     let mut hint_parts = vec![
         format!("{} scroll", s().dim().paint("j/k")),
-        format!("{} top/bottom", s().dim().paint("g/G")),
         format!("{} detail", s().dim().paint("Enter")),
         format!("{} = randomized", s().yellow().paint("MAC")),
     ];
     if show_ps {
-        hint_parts.push(format!("{} = power save", s().yellow().paint("Z")));
+        hint_parts.push(format!("{} = sleep", s().yellow().paint("Z")));
     }
 
     let footer = vec![
@@ -612,9 +643,10 @@ pub fn render_probes(
     for (i, probe) in probes.iter().enumerate() {
         let is_sel = i == selected;
 
-        // STATION — yellow for randomized, cyan for selected
+        // STATION — yellow for randomized MAC, cyan for selected
         let mac_str = format!("{}", probe.sta_mac);
-        let mac_styled = if probe.sta_mac.is_locally_administered() {
+        let is_rand = probe.sta_mac.is_locally_administered();
+        let mac_styled = if is_rand {
             s().yellow().paint(&mac_str)
         } else if is_sel {
             s().cyan().bold().paint(&mac_str)
@@ -623,6 +655,8 @@ pub fn render_probes(
         };
         let mac_cell = if is_sel {
             format!("{} {}", s().cyan().bold().paint("▶"), mac_styled)
+        } else if is_rand {
+            format!("{} {}", s().yellow().dim().paint("R"), mac_styled)
         } else {
             format!("  {}", mac_styled)
         };
@@ -696,23 +730,28 @@ pub fn render_probes(
 const CHN_COL_DENSITY: usize = 12;  // density bar width
 const CHN_COL_FRAMES: usize = 8;    // frame count
 const CHN_COL_FPS: usize = 6;       // frames per second
+const CHN_COL_UTIL: usize = 5;      // utilization % ("99.9")
+const CHN_COL_NOISE: usize = 4;     // noise floor ("-95")
 
 /// Adaptive columns for Channels table.
-/// Returns (show_frames, show_fps).
+/// Returns (show_frames, show_fps, show_util, show_noise).
 ///
 /// Core (never drop): CH, BAND, APs, STAs, RETRY%, DENSITY
-/// Drop order (first to go): FRAMES → FPS
-fn auto_columns_channels(width: usize) -> (bool, bool) {
-    // indent(1) + CH(sel+3) + BAND(4) + APs(4) + STAs(4) + RETRY%(6) + DENSITY(12) + 5 seps
+/// Drop order (first to go): NOISE → FRAMES → FPS → UTIL
+fn auto_columns_channels(width: usize) -> (bool, bool, bool, bool) {
     let core = 1 + COL_SEL + 3 + 4 + 4 + 4 + 6 + CHN_COL_DENSITY + (5 * COL_SEP);
     let budget = width.saturating_sub(core);
     let mut remaining = budget;
 
+    let show_util = remaining >= CHN_COL_UTIL + COL_SEP;
+    if show_util { remaining -= CHN_COL_UTIL + COL_SEP; }
     let show_fps = remaining >= CHN_COL_FPS + COL_SEP;
     if show_fps { remaining -= CHN_COL_FPS + COL_SEP; }
     let show_frames = remaining >= CHN_COL_FRAMES + COL_SEP;
+    if show_frames { remaining -= CHN_COL_FRAMES + COL_SEP; }
+    let show_noise = remaining >= CHN_COL_NOISE + COL_SEP;
 
-    (show_frames, show_fps)
+    (show_frames, show_fps, show_util, show_noise)
 }
 
 pub fn render_channels(
@@ -724,7 +763,7 @@ pub fn render_channels(
     lines: &mut Vec<String>,
 ) -> usize {
     let w = width as usize;
-    let (show_frames, show_fps) = auto_columns_channels(w);
+    let (show_frames, show_fps, show_util, show_noise) = auto_columns_channels(w);
 
     // Merge AP-derived data with real ChannelStats
     // Key is (band<<8 | channel) to separate 6GHz channels from 2.4GHz.
@@ -758,6 +797,8 @@ pub fn render_channels(
         entry.fps = cs.fps;
         entry.retries = cs.retry_count;
         entry.retry_rate = cs.retry_rate;
+        entry.noise_floor = cs.noise_floor;
+        entry.utilization_pct = cs.utilization_pct;
         if cs.ap_count > 0 { entry.ap_count = cs.ap_count as u32; }
         if cs.sta_count > 0 { entry.sta_count = cs.sta_count as u32; }
     }
@@ -771,6 +812,8 @@ pub fn render_channels(
     if show_frames { cols.push(ScrollCol::right("FRAMES", CHN_COL_FRAMES)); }
     if show_fps { cols.push(ScrollCol::right("FPS", CHN_COL_FPS)); }
     cols.push(ScrollCol::right("RETRY%", 6));
+    if show_util { cols.push(ScrollCol::right("UTIL%", CHN_COL_UTIL)); }
+    if show_noise { cols.push(ScrollCol::right("NF", CHN_COL_NOISE)); }
     cols.push(ScrollCol::new("DENSITY", CHN_COL_DENSITY));
 
     let max_frames = channel_map.values().map(|e| e.frames.max(e.beacon_total as u64)).max().unwrap_or(1);
@@ -811,6 +854,28 @@ pub fn render_channels(
             s().dim().paint(&format!("{:.1}", entry.retry_rate))
         };
         row.push(retry_styled);
+
+        // UTIL% — channel utilization (from MIB survey), color-coded
+        if show_util {
+            let util = entry.utilization_pct;
+            row.push(if util > 0.0 {
+                let text = format!("{:.1}", util);
+                if util > 70.0 { s().red().bold().paint(&text) }
+                else if util > 40.0 { s().yellow().paint(&text) }
+                else { s().green().paint(&text) }
+            } else {
+                String::new()
+            });
+        }
+
+        // NF — noise floor in dBm
+        if show_noise {
+            row.push(if entry.noise_floor > -100 && entry.noise_floor < 0 {
+                s().dim().paint(&format!("{}", entry.noise_floor))
+            } else {
+                String::new()
+            });
+        }
 
         let density_val = entry.frames.max(entry.beacon_total as u64);
         row.push(density_bar(density_val as u32, max_frames as u32, CHN_COL_DENSITY));
@@ -856,6 +921,8 @@ struct ChannelEntry {
     fps: f32,
     retries: u64,
     retry_rate: f32,
+    noise_floor: i8,
+    utilization_pct: f32,
 }
 
 impl ChannelEntry {
@@ -879,6 +946,8 @@ impl ChannelEntry {
             fps: 0.0,
             retries: 0,
             retry_rate: 0.0,
+            noise_floor: -95,
+            utilization_pct: 0.0,
         }
     }
 }

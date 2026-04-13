@@ -603,6 +603,13 @@ impl SharedAdapter {
 /// The thread reads bulk IN continuously, calls the chip-specific parse_fn
 /// to extract RxFrames, and submits them to the FrameGate. The gate handles
 /// all downstream processing (parsing, pcap, distribution).
+///
+/// NOTE: Multi-URB approaches (rusb-async TransferPool, multi-thread read_bulk)
+/// were tested and showed NO improvement over single-thread sync reads. All
+/// approaches hit the same ~850 reads/sec ceiling — the bottleneck is in
+/// libusb/IOKit event processing, not in our read pattern. See bench_radio_vs_usb
+/// A/B/C test results for evidence. The only path to more frames/sec is
+/// aggregation (multiple frames per USB transfer).
 fn start_rx_thread(
     rx_handle: RxHandle,
     gate: FrameGate,
@@ -614,20 +621,6 @@ fn start_rx_thread(
         .name("rx-usb".into())
         .spawn(move || {
             let mut buf = vec![0u8; rx_handle.rx_buf_size];
-            let mut read_num = 0u64;
-            const READS_PER_CHANNEL: u64 = 5; // log 5 reads per channel change
-            let mut reads_this_channel = 0u64;
-            let mut last_log_channel = 0u8;
-            let mut log = {
-                use std::io::Write;
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true).write(true).truncate(true)
-                    .open("/tmp/wifikit_shared_usb_reads.log").ok();
-                if let Some(ref mut f) = f {
-                    let _ = writeln!(f, "=== Shared RX Thread USB Reads ({} per channel) ===\n", READS_PER_CHANNEL);
-                }
-                f
-            };
 
             loop {
                 if !inner.alive.load(Ordering::SeqCst) {
@@ -651,48 +644,14 @@ fn start_rx_thread(
                     continue;
                 }
 
-                read_num += 1;
                 stats.usb_reads.fetch_add(1, Ordering::Relaxed);
                 stats.usb_bytes.fetch_add(actual as u64, Ordering::Relaxed);
-                // Track max read size
                 let prev_max = stats.max_read_size.load(Ordering::Relaxed);
                 if actual as u32 > prev_max {
                     stats.max_read_size.store(actual as u32, Ordering::Relaxed);
                 }
 
                 let channel = inner.current_channel.load(Ordering::Relaxed);
-
-                // Dump a few USB reads per channel for diagnostics
-                if channel != last_log_channel {
-                    last_log_channel = channel;
-                    reads_this_channel = 0;
-                    if let Some(ref mut f) = log {
-                        use std::io::Write;
-                        let _ = writeln!(f, "\n{}", "=".repeat(60));
-                        let _ = writeln!(f, "  CHANNEL {} (band={})", channel,
-                            if channel <= 14 { "2.4GHz" } else { "5GHz" });
-                        let _ = writeln!(f, "{}", "=".repeat(60));
-                    }
-                }
-                reads_this_channel += 1;
-                if reads_this_channel <= READS_PER_CHANNEL {
-                    if let Some(ref mut f) = log {
-                        use std::io::Write;
-                        let _ = writeln!(f, "\n══ USB READ #{} (ch{} read #{}) — {} bytes ══",
-                            read_num, channel, reads_this_channel, actual);
-                        let mut p = 0;
-                        while p < actual {
-                            let end = (p + 16).min(actual);
-                            let hex: String = buf[p..end].iter()
-                                .map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-                            let ascii: String = buf[p..end].iter()
-                                .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '.' })
-                                .collect();
-                            let _ = writeln!(f, "  {:04X}: {:<48} |{}|", p, hex, ascii);
-                            p += 16;
-                        }
-                    }
-                }
 
                 // Parse all frames from the USB bulk transfer
                 // (USB aggregation means one transfer can contain multiple frames)
@@ -704,7 +663,7 @@ fn start_rx_thread(
 
                     if consumed == 0 {
                         stats.consumed_zero.fetch_add(1, Ordering::Relaxed);
-                        break; // Don't skip — leftover bytes are partial packet
+                        break;
                     }
 
                     pos += consumed;
@@ -735,9 +694,6 @@ fn start_rx_thread(
                                 let _ = tx.send(evt.raw);
                             }
                         }
-                        // TODO: Route CSI, DFS, BB scope, spatial sounding to
-                        // FrameStore/subscribers once consumers exist (spectrum
-                        // analyzer, positioning, radar detection views).
                         crate::core::chip::ParsedPacket::ChannelInfo(_) => {
                             stats.channel_info.fetch_add(1, Ordering::Relaxed);
                         }

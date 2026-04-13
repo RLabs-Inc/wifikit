@@ -555,10 +555,18 @@ pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset:
     lines.push(empty_line());
 
     // ═══ 3. Target info: SSID + BSSID + ch + RSSI bars + dBm ═══
-    if !info.ssid.is_empty() {
+    // Always show target info when we have a BSSID — use "(hidden)" for empty SSIDs.
+    // Previously gated on !info.ssid.is_empty() which hid the entire section for
+    // hidden networks or when SSID wasn't yet revealed by a probe response.
+    let has_target = info.bssid != crate::core::MacAddress::ZERO;
+    if has_target {
         lines.push(empty_line());
         let ssid_max = if compact { 20 } else { 28 };
-        let ssid_display = s().white().bold().paint(&truncate(&info.ssid, ssid_max, "\u{2026}"));
+        let ssid_display = if info.ssid.is_empty() {
+            s().dim().italic().paint("(hidden)")
+        } else {
+            s().white().bold().paint(&truncate(&info.ssid, ssid_max, "\u{2026}"))
+        };
         let bssid_str = info.bssid.to_string();
         let ch_str = s().cyan().paint(&format!("ch{}", info.channel));
 
@@ -612,8 +620,10 @@ pub fn render_wps_view(info: &WpsInfo, width: u16, _height: u16, _scroll_offset:
     } else if !info.running && info.phase == WpsPhase::Done {
         lines.push(empty_line());
         lines.push(vline(&s().dim().paint("  Attack complete"), inner_w));
-    } else if info.running && info.phase == WpsPhase::KeyGeneration {
-        // DH key generation spinner (before target is set)
+    }
+
+    // DH keygen spinner — shown during key generation phase regardless of target
+    if info.running && info.phase == WpsPhase::KeyGeneration {
         lines.push(empty_line());
         let keygen_spinner = prism::get_spinner("arc");
         let keygen_frame = keygen_spinner.as_ref().map(|sp| {

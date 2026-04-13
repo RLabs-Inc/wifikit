@@ -8,7 +8,11 @@
 //! All formatting delegates to prism-rs primitives. Domain-specific styling
 //! (RSSI thresholds, security colors, etc.) lives here as thin wrappers.
 
+use std::collections::VecDeque;
+use std::time::Duration;
+
 use crate::core::Bandwidth;
+use crate::protocol::eapol::HandshakeQuality;
 use crate::store::WpsState;
 use crate::protocol::ieee80211::{Security, WifiGeneration};
 
@@ -58,6 +62,79 @@ pub fn rssi_bar(rssi: i8, bar_width: usize) -> String {
 /// Combined RSSI number + bar for detail views: `-65 dBm ██████░░░░`
 pub fn rssi_compact(rssi: i8) -> String {
     format!("{} {}", style_rssi_dbm(rssi), rssi_bar(rssi, 10))
+}
+
+/// RSSI sparkline — temporal signal history using Unicode block characters.
+/// Each character represents one RSSI sample at one of 8 heights (▁▂▃▄▅▆▇█),
+/// individually colored by signal quality (green/yellow/red).
+/// Missing samples are shown as dim dots for visual rhythm.
+///
+/// `width` is the number of characters in the sparkline (= samples shown).
+pub fn rssi_sparkline(samples: &VecDeque<(Duration, i8)>, width: usize) -> String {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    if samples.is_empty() {
+        return prism::s().dim().paint(&"·".repeat(width));
+    }
+
+    let mut out = String::new();
+    let n = samples.len();
+    let start = if n > width { n - width } else { 0 };
+    let visible = n - start;
+
+    // Render samples oldest→newest (left→right)
+    for &(_ts, rssi) in samples.iter().skip(start) {
+        let level = ((rssi as i16 + 100) * 7 / 70).clamp(0, 7) as usize;
+        let ch = BLOCKS[level];
+        let color = rssi_color(rssi);
+        out.push_str(&color(&ch.to_string()));
+    }
+
+    // Pad RIGHT with dim dots for unfilled future slots —
+    // sparkline grows left→right as samples arrive
+    let pad = width.saturating_sub(visible);
+    if pad > 0 {
+        out.push_str(&prism::s().dim().paint(&"·".repeat(pad)));
+    }
+
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Capture indicator — PMKID / Handshake badges for AP table
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compact capture indicator for the AP table (2 chars max).
+/// Shows what crackable material has been captured:
+///   `PH` = PMKID + handshake (bright green)
+///   `P·` = PMKID only (green)
+///   `·H` = handshake only (green/yellow by quality)
+///   empty = nothing captured
+pub fn style_capture(quality: &HandshakeQuality, has_pmkid: bool) -> String {
+    let nothing = *quality == HandshakeQuality::None
+        && *quality != HandshakeQuality::Pmkid
+        && !has_pmkid;
+    if nothing { return String::new(); }
+
+    let pmkid_ch = if has_pmkid {
+        prism::s().green().bold().paint("P")
+    } else if *quality != HandshakeQuality::None {
+        prism::s().dim().paint("·")
+    } else {
+        return String::new();
+    };
+
+    let hs_ch = match quality {
+        HandshakeQuality::None | HandshakeQuality::Pmkid => {
+            if has_pmkid { prism::s().dim().paint("·") } else { return String::new(); }
+        }
+        HandshakeQuality::M1M2 => prism::s().yellow().bold().paint("H"),
+        HandshakeQuality::M1M2M3 | HandshakeQuality::Full => {
+            prism::s().green().bold().paint("H")
+        }
+    };
+
+    format!("{}{}", pmkid_ch, hs_ch)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -323,6 +400,26 @@ pub fn section_header_heavy(title: &str, indent: usize) -> String {
         title_styled,
         prism::s().dim().paint(&prism::divider("═", right)),
     )
+}
+
+/// Format age since last seen — compact, dimmed for stale.
+/// Fresh (< 5s): bright, medium (< 30s): normal, stale (> 30s): dim.
+pub fn format_age(last_seen: std::time::Instant) -> String {
+    let secs = last_seen.elapsed().as_secs();
+    let text = if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    };
+    if secs <= 5 {
+        prism::s().green().paint(&text)
+    } else if secs <= 30 {
+        text
+    } else {
+        prism::s().dim().paint(&text)
+    }
 }
 
 /// Horizontal rule via prism::divider.

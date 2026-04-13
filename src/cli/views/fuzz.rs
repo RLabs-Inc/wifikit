@@ -439,9 +439,14 @@ pub fn render_fuzz_view(info: &FuzzInfo, crashes: &[FuzzCrash], width: u16) -> V
         bc(&"\u{2500}".repeat(remaining)), bc("\u{256e}")));
 
     // ═══ Target ═══
-    if !info.target_ssid.is_empty() {
+    if !info.target_ssid.is_empty() || info.target_bssid != crate::core::MacAddress::ZERO {
+        let ssid_display = if info.target_ssid.is_empty() {
+            s().dim().italic().paint("(hidden)")
+        } else {
+            s().bold().paint(&prism::truncate(&info.target_ssid, 24, "\u{2026}"))
+        };
         lines.push(vline(&format!("{}  {}  ch{}",
-            s().bold().paint(&prism::truncate(&info.target_ssid, 24, "\u{2026}")),
+            ssid_display,
             s().dim().paint(&info.target_bssid.to_string()),
             info.target_channel), inner_w));
     }

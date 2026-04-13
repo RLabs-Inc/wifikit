@@ -2116,6 +2116,13 @@ impl Mt7921au {
         Ok(())
     }
 
+    /// Read a hardware register by absolute address.
+    /// Exposed for diagnostic binaries that need direct register access
+    /// (e.g., MIB counter scanning, hardware debugging).
+    pub fn read_register(&self, addr: u32) -> Result<u32> {
+        self.reg_read(addr)
+    }
+
     /// Set per-rate TX power limits for all channels in a band.
     /// Matches mt76_connac_mcu_rate_txpower_band() from mt76_connac_mcu.c:2121.
     ///
@@ -3675,7 +3682,16 @@ impl ChipDriver for Mt7921au {
         }
         pkt[off+12..off+16].copy_from_slice(&dw3.to_le_bytes());
 
-        // DW4-DW5: zero (no PN, no PID)
+        // DW4: zero (no PN — encryption handled externally)
+
+        // DW5: PID + TX_STATUS_HOST — enables firmware TX status reports.
+        // Without PID, firmware never generates TxStatus packets on the RX path.
+        // PID[7:0] = 1 (any non-zero value enables per-packet tracking)
+        // TX_STATUS_HOST[8] = 1 (route TX status reports to host via USB RX)
+        // Linux: MT_TXD5_TX_STATUS_HOST | FIELD_PREP(MT_TXD5_PID, pid)
+        let dw5: u32 = 1       // PID = 1
+            | (1u32 << 8);     // TX_STATUS_HOST
+        pkt[off+20..off+24].copy_from_slice(&dw5.to_le_bytes());
 
         // DW6: TX_RATE[29:16] | SGI[15:14] | LDPC[11] | BW[4:3] | DYN_BW[5] | FIXED_BW[2]
         // Rate encoding via TxRate::mt76_rate(): MODE[9:6] | NSS[12:10] | IDX[5:0]

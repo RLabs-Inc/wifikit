@@ -17,10 +17,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::core::MacAddress;
+use crate::pipeline::subscriber::UpdateSubscriber;
 use crate::scanner::Scanner;
 use crate::store::{
     Ap, ChannelStats, FrameStore, ProbeReq, ScanEvent, ScanStats, Station, WpsState,
 };
+use crate::store::update::StoreUpdate;
 use crate::protocol::ieee80211::{Security, WifiGeneration};
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -246,6 +248,7 @@ pub fn sort_aps(aps: &mut [Ap], field: SortField, ascending: bool) {
 //  ScanSnapshot — lock once, clone what we need, render from snapshot
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
 pub struct ScanSnapshot {
     pub aps: Vec<Ap>,
     pub stations: Vec<Station>,
@@ -273,6 +276,21 @@ impl Default for ScanSnapshot {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  DirtyFlags — what categories of data changed since last render
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Default)]
+struct DirtyFlags {
+    any: bool,
+    aps: bool,
+    stations: bool,
+    probes: bool,
+    channels: bool,
+    events: bool,
+    handshakes: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  ScannerModule — the interactive scanner state
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -282,6 +300,9 @@ pub struct ScannerModule {
     pub store: FrameStore,
     /// SharedAdapter reference — used to read pipeline stats for status bar.
     pub shared: Option<crate::adapter::SharedAdapter>,
+    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
+    /// Wired in start() when SharedAdapter becomes available.
+    update_sub: Option<UpdateSubscriber>,
     pub view: ScanView,
     pub detail: DetailState,
     pub selected: usize,
@@ -290,8 +311,8 @@ pub struct ScannerModule {
     pub scan_start: Instant,
     accumulated_events: VecDeque<ScanEvent>,
 
-    /// Cached snapshot — refreshed once per render cycle via `refresh_snapshot()`.
-    /// Avoids 2-3 full AP vector clones per 50ms frame.
+    /// Cached snapshot — refreshed when deltas arrive, reused when nothing changed.
+    /// Clone-based semantics: cache survives across calls, zero store reads on quiet frames.
     cached_snapshot: Option<ScanSnapshot>,
 
     // Sort state
@@ -321,6 +342,7 @@ impl ScannerModule {
             scanner,
             store,
             shared: None,
+            update_sub: None,
             view: ScanView::Aps,
             detail: DetailState::None,
             selected: 0,
@@ -341,27 +363,149 @@ impl ScannerModule {
         }
     }
 
-    /// Refresh the cached snapshot from the scanner.
-    /// Call once per render cycle, before render() and status_segments().
-    pub fn refresh_snapshot(&mut self) {
-        // Drain new scan events and accumulate (VecDeque for O(1) front removal)
-        let new_events = self.store.drain_events();
-        self.accumulated_events.extend(new_events);
-        // Cap at 10,000 most recent — drop oldest from front
-        const MAX_ACCUMULATED_EVENTS: usize = 10_000;
-        while self.accumulated_events.len() > MAX_ACCUMULATED_EVENTS {
-            self.accumulated_events.pop_front();
+    /// Drain pending deltas from the subscriber and categorize what changed.
+    /// Returns DirtyFlags indicating which data categories have new updates.
+    /// When no subscriber is wired (pre-start), returns all-dirty to force full reads.
+    fn process_deltas(&mut self) -> DirtyFlags {
+        let sub = match &self.update_sub {
+            Some(s) => s,
+            None => {
+                // No subscriber yet — treat everything as dirty (legacy behavior)
+                return DirtyFlags {
+                    any: true, aps: true, stations: true, probes: true,
+                    channels: true, events: true, handshakes: true,
+                };
+            }
+        };
+
+        let batches = sub.drain();
+        if batches.is_empty() {
+            return DirtyFlags::default();
         }
 
-        let handshakes = self.store.with_capture_db_read(|db| db.handshakes().to_vec());
+        let mut flags = DirtyFlags { any: true, ..Default::default() };
 
-        let channel_stats_map = self.store.get_channel_stats();
-        let channel_stats: Vec<ChannelStats> = channel_stats_map.into_values().collect();
+        for batch in &batches {
+            for delta in batch.iter() {
+                match delta {
+                    StoreUpdate::ApDiscovered { .. }
+                    | StoreUpdate::ApBeaconUpdate { .. }
+                    | StoreUpdate::ApSsidRevealed { .. }
+                    | StoreUpdate::ApClientCountChanged { .. }
+                    | StoreUpdate::ApCaptureStateChanged { .. } => flags.aps = true,
 
+                    StoreUpdate::StationDiscovered { .. }
+                    | StoreUpdate::StationAssociated { .. }
+                    | StoreUpdate::StationDataUpdate { .. }
+                    | StoreUpdate::StationProbeUpdate { .. }
+                    | StoreUpdate::StationFingerprinted { .. }
+                    | StoreUpdate::StationPowerSaveChanged { .. }
+                    | StoreUpdate::StationHandshakeProgress { .. } => flags.stations = true,
+
+                    StoreUpdate::ProbeDiscovered { .. }
+                    | StoreUpdate::ProbeUpdated { .. } => flags.probes = true,
+
+                    StoreUpdate::ScanEvent { .. } => flags.events = true,
+
+                    StoreUpdate::ChannelFrameCounted { .. }
+                    | StoreUpdate::ChannelDwellComplete { .. }
+                    | StoreUpdate::ChannelStatsCleared
+                    | StoreUpdate::ChannelDwellStarted { .. }
+                    | StoreUpdate::ChannelDwellEnded { .. }
+                    | StoreUpdate::ScannerChannelChanged { .. }
+                    | StoreUpdate::ScannerRoundComplete { .. } => flags.channels = true,
+
+                    StoreUpdate::HandshakeComplete { .. }
+                    | StoreUpdate::HandshakeQualityImproved { .. }
+                    | StoreUpdate::PmkidCaptured { .. }
+                    | StoreUpdate::EapolMessage { .. }
+                    | StoreUpdate::HandshakeExportReady { .. }
+                    | StoreUpdate::EapIdentityCaptured { .. }
+                    | StoreUpdate::EapMethodNegotiated { .. } => flags.handshakes = true,
+
+                    StoreUpdate::FrameCounted { .. }
+                    | StoreUpdate::BeaconTimingUpdate { .. } => {
+                        // Frame counting updates stats (FPS, frame counts).
+                        // Beacon timing is used in AP detail views.
+                        // Mark aps dirty so stats refresh.
+                        flags.aps = true;
+                    }
+
+                    // Adapter lifecycle, TX feedback, diagnostics, sensor data,
+                    // attack lifecycle — not relevant for scanner views
+                    _ => {}
+                }
+            }
+        }
+
+        flags
+    }
+
+    /// Refresh the cached snapshot from the store.
+    /// Per-category lazy refresh: only re-reads dirty categories from the store,
+    /// reusing cached data for clean categories. During active scanning with 30+
+    /// APs and hundreds of stations, this avoids cloning the entire AP HashMap
+    /// when only a station's RSSI changed.
+    ///
+    /// Events still drain from the store's EventRing (Phase 0 — will move to
+    /// delta-based events when we rewrite the Events view).
+    pub fn refresh_snapshot(&mut self) {
+        let dirty = self.process_deltas();
+
+        // Fast path: subscriber active, nothing changed, cache intact → skip
+        if self.update_sub.is_some() && !dirty.any && self.cached_snapshot.is_some() {
+            return;
+        }
+
+        // Drain scan events from store (still EventRing-based for Phase 0)
+        if dirty.events || self.update_sub.is_none() {
+            let new_events = self.store.drain_events();
+            self.accumulated_events.extend(new_events);
+            const MAX_ACCUMULATED_EVENTS: usize = 10_000;
+            while self.accumulated_events.len() > MAX_ACCUMULATED_EVENTS {
+                self.accumulated_events.pop_front();
+            }
+        }
+
+        // Per-category lazy refresh: only re-read what actually changed.
+        // Reuse cached data for clean categories to avoid unnecessary clones.
+        let prev = self.cached_snapshot.take();
+
+        let aps = if dirty.aps || prev.is_none() {
+            self.store.get_aps().into_values().collect()
+        } else {
+            prev.as_ref().unwrap().aps.clone()
+        };
+
+        let stations = if dirty.stations || prev.is_none() {
+            self.store.get_stations().into_values().collect()
+        } else {
+            prev.as_ref().unwrap().stations.clone()
+        };
+
+        let probes = if dirty.probes || prev.is_none() {
+            self.store.get_probes()
+        } else {
+            prev.as_ref().unwrap().probes.clone()
+        };
+
+        let handshakes = if dirty.handshakes || prev.is_none() {
+            self.store.with_capture_db_read(|db| db.handshakes().to_vec())
+        } else {
+            prev.as_ref().unwrap().handshakes.clone()
+        };
+
+        let channel_stats = if dirty.channels || prev.is_none() {
+            self.store.get_channel_stats().into_values().collect()
+        } else {
+            prev.as_ref().unwrap().channel_stats.clone()
+        };
+
+        // Stats and channel are always cheap to read (atomics, no locks)
         self.cached_snapshot = Some(ScanSnapshot {
-            aps: self.store.get_aps().into_values().collect(),
-            stations: self.store.get_stations().into_values().collect(),
-            probes: self.store.get_probes(),
+            aps,
+            stations,
+            probes,
             handshakes,
             scan_events: self.accumulated_events.iter().cloned().collect(),
             channel_stats,
@@ -370,23 +514,12 @@ impl ScannerModule {
         });
     }
 
-    /// Get the cached snapshot, refreshing if not yet cached this cycle.
+    /// Get a clone of the cached snapshot, refreshing if needed.
+    /// Clone instead of take — the cache survives across calls within a frame
+    /// and across frames when no deltas arrive (zero store reads on quiet periods).
     fn snapshot(&mut self) -> ScanSnapshot {
-        if self.cached_snapshot.is_none() {
-            self.refresh_snapshot();
-        }
-        // Take the snapshot out — callers may mutate it (sort/filter).
-        // It will be re-created on next refresh_snapshot() call.
-        self.cached_snapshot.take().unwrap_or_else(|| ScanSnapshot {
-            aps: Vec::new(),
-            stations: Vec::new(),
-            probes: Vec::new(),
-            handshakes: Vec::new(),
-            scan_events: Vec::new(),
-            channel_stats: Vec::new(),
-            stats: ScanStats::default(),
-            channel: 0,
-        })
+        self.refresh_snapshot();
+        self.cached_snapshot.clone().unwrap_or_default()
     }
 
     /// Total row count for current view (for scroll bounds).
@@ -1102,6 +1235,10 @@ impl Module for ScannerModule {
     fn module_type(&self) -> ModuleType { ModuleType::Scanner }
 
     fn start(&mut self, shared: crate::adapter::SharedAdapter) {
+        // Subscribe to delta stream BEFORE starting scanner thread
+        // so we don't miss any early deltas
+        self.update_sub = Some(shared.gate().subscribe_updates("scanner-ui"));
+
         // Keep a clone for pipeline stats access from status bar
         self.shared = Some(shared.clone());
 

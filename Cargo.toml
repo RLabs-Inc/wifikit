@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 rusb = "0.9"
+rusb-async = "0.0.1-alpha"
 thiserror = "2"
 crossterm = "0.28"
 unicode-width = "0.2"

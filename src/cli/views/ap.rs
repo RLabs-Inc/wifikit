@@ -165,8 +165,12 @@ pub fn render_ap_view(info: &ApInfo, width: u16) -> Vec<String> {
         bc(&"\u{2500}".repeat(remaining)), bc("\u{256e}")));
 
     // ═══ Target + BSSID ═══
-    if !info.ssid.is_empty() {
-        let ssid_display = s().bold().paint(&truncate(&info.ssid, 24, "\u{2026}"));
+    if !info.ssid.is_empty() || info.channel > 0 {
+        let ssid_display = if info.ssid.is_empty() {
+            s().dim().italic().paint("(hidden)")
+        } else {
+            s().bold().paint(&truncate(&info.ssid, 24, "\u{2026}"))
+        };
         let mut target_line = format!("{}  ch{}", ssid_display, info.channel);
         if info.our_bssid != crate::core::MacAddress::ZERO {
             target_line.push_str(&format!("  rogue: {}", s().dim().paint(&info.our_bssid.to_string())));
