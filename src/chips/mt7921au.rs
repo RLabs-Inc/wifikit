@@ -4104,8 +4104,12 @@ impl Mt7921au {
         payload[14] = center_ch;
         // tlv.center_ch2 = 0 (byte 15)
         payload[15] = 0;
-        // tlv.drop_err = 1 (byte 16)
-        payload[16] = 1;
+        // tlv.drop_err = 0 (byte 16)
+        // MUST be 0 for monitor mode — drop_err=1 tells firmware to discard frames
+        // with errors, which on 2.4GHz (high interference: BT, microwave, overlapping
+        // channels) silently eats a large percentage of frames. We handle FCS errors
+        // ourselves via is_fcs_error in the RxFrame.
+        payload[16] = 0;
 
         self.mcu_send_uni_cmd(MCU_UNI_CMD_SNIFFER, &payload, true)?;
         Ok(())
