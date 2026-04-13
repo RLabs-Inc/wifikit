@@ -640,10 +640,46 @@ fn process_eapol_key(
         return process_m1(db, ap_mac, sta_mac, ssid, eapol_version, key, raw_eapol, timestamp);
     }
 
-    // ── M2/M3/M4/Group: find the latest entry for this pair ──
-    let hs = match db.find_or_create(ap_mac, sta_mac, ssid) {
-        Some(hs) => hs,
-        None => return events, // database full
+    // ── M2/M3/M4/Group: find the right entry for this pair ──
+    //
+    // During deauth, overlapping handshake attempts are common: a new M1 arrives
+    // between M2 and M3 of the previous attempt. If we always use the latest entry,
+    // M3 for the previous attempt gets silently dropped because the ANonce check
+    // (line ~706) fails against the new entry's nonce.
+    //
+    // Fix: for M3, find the entry whose ANonce matches this frame's nonce.
+    // For M4, find the most recent entry that already has M3 (M4 carries zero/SNonce,
+    // not the ANonce, so we can't match by nonce — but the M3-bearing entry is the
+    // one this M4 belongs to).
+    // For M2/Group, use the latest entry (standard behavior).
+    let hs = match message {
+        HandshakeMessage::M3 => {
+            // Find entry whose ANonce matches this M3's nonce
+            let idx = db.handshakes.iter().rposition(|hs|
+                hs.ap_mac == ap_mac && hs.sta_mac == sta_mac
+                && hs.anonce.as_ref().is_some_and(|a| *a == key.nonce)
+            );
+            match idx {
+                Some(i) => &mut db.handshakes[i],
+                None => return events, // no matching handshake attempt
+            }
+        }
+        HandshakeMessage::M4 => {
+            // Find the most recent entry that has M3 — that's the one this M4 completes
+            let idx = db.handshakes.iter().rposition(|hs|
+                hs.ap_mac == ap_mac && hs.sta_mac == sta_mac && hs.has_m3
+            );
+            match idx {
+                Some(i) => &mut db.handshakes[i],
+                None => return events, // no M3 to complete
+            }
+        }
+        _ => {
+            match db.find_or_create(ap_mac, sta_mac, ssid) {
+                Some(hs) => hs,
+                None => return events, // database full
+            }
+        }
     };
 
     // Store EAPOL version and key descriptor info

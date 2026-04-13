@@ -289,17 +289,19 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, f
 
     // ═══ Client table — attack-semantic status ═══
     //
-    // Status colors are INVERTED from scanner context:
-    //   ⟳ yellow  = reconnect cycle — deauth landing but client keeps coming back (EAPOL window!)
-    //   ✗ red     = still active (<5s) — deauth NOT working on this client
-    //   ○ dim     = going quiet (5-15s) — might be dropping, watch sparkline
-    //   ✓ green   = dropped (>15s silence) — deauth SUCCESS
+    // During deauth, clients disconnect and reconnect within 1-3 seconds.
+    // Thresholds tuned for attack tempo, not passive scanning:
+    //   ⟳ yellow  = reconnect cycle — deauth landing, client coming back (EAPOL window!)
+    //   ● red     = still active (<2s) — deauth not working on this client
+    //   ○ dim     = going quiet (2-8s) — might be dropping
+    //   ✓ green   = dropped (>8s silence) — deauth SUCCESS
     if !clients.is_empty() {
         lines.push(vline(
-            &format!("{}  {}  {}  {}  {}",
+            &format!("{}  {}  {}  {}  {}  {}",
                 s().bold().dim().paint(&prism::pad("CLIENT", 17, "left")),
                 s().bold().dim().paint(&prism::pad("SIGNAL", 13, "left")),
                 s().bold().dim().paint(&prism::pad("FRAMES", 8, "left")),
+                s().bold().dim().paint(&prism::pad("LAST SEEN", 8, "left")),
                 s().bold().dim().paint(&prism::pad("STATUS", 10, "left")),
                 s().bold().dim().paint(&prism::pad("VENDOR", 15, "left"))),
             inner_w));
@@ -307,23 +309,24 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, f
         let now = Instant::now();
         for client in clients {
             let age = now.duration_since(client.last_seen);
+            let age_str = format_age(age);
 
             let is_reconnecting = client.reconnect_at
                 .map(|t| now.duration_since(t) < Duration::from_secs(4))
                 .unwrap_or(false);
 
-            // Attack-semantic status: inverted from scanner
+            // Attack-semantic status — thresholds tuned for deauth tempo (1-3s cycles)
             let (status_icon, status_label, mac_styled) = if is_reconnecting {
                 // Reconnect cycle — deauth lands, client comes back. EAPOL capture window!
                 (s().yellow().bold().paint("\u{27f3}"),
                  s().yellow().bold().paint("reconnect"),
                  s().yellow().bold().paint(&client.mac.to_string()))
-            } else if age < Duration::from_secs(5) {
-                // Still active — deauth not working
+            } else if age < Duration::from_secs(2) {
+                // Still active — deauth not working on this one
                 (s().red().paint("\u{25cf}"),
                  s().red().paint("active"),
                  s().red().paint(&client.mac.to_string()))
-            } else if age < Duration::from_secs(15) {
+            } else if age < Duration::from_secs(8) {
                 // Going quiet — might be dropping
                 (s().dim().paint("\u{25cb}"),
                  s().dim().paint("quiet"),
@@ -344,11 +347,12 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, f
             let frames_str = prism::format_number(client.frame_count as u64);
 
             lines.push(vline(
-                &format!("{} {}  {}  {}  {}  {}",
+                &format!("{} {}  {}  {}  {}  {}  {}",
                     status_icon,
                     prism::pad(&mac_styled, 17, "left"),
                     prism::pad(&signal_col, 13, "left"),
                     prism::pad(&frames_str, 8, "right"),
+                    prism::pad(&s().dim().paint(&age_str), 8, "left"),
                     prism::pad(&status_label, 10, "left"),
                     s().dim().paint(&vendor_display)),
                 inner_w));
@@ -616,8 +620,11 @@ impl DosModule {
 
     /// Update connected clients of the target AP (called by shell from scanner data).
     /// This enables the client monitoring UX: showing who drops off during the attack.
-    /// Detects reconnections: if a client was quiet (>5s) and comes back, marks it
+    /// Detects reconnections: if a client was quiet then active again, marks it
     /// with `reconnect_at` for a visual flash effect.
+    ///
+    /// Thresholds tuned for deauth tempo: clients disconnect/reconnect in 1-3s,
+    /// so we detect reconnection at 2s quiet (not 5s which misses every cycle).
     pub fn update_target_clients(&mut self, mut clients: Vec<ClientSnapshot>) {
         let now = Instant::now();
 
@@ -627,8 +634,9 @@ impl DosModule {
                 let prev_age = now.duration_since(prev.last_seen);
                 let cur_age = now.duration_since(client.last_seen);
 
-                // Client was quiet (>5s) but is now active again (<3s) → reconnection!
-                if prev_age > Duration::from_secs(5) && cur_age < Duration::from_secs(3) {
+                // Client was quiet (>2s) but is now active again (<2s) → reconnection!
+                // Tuned for deauth: clients typically reconnect within 1-3 seconds.
+                if prev_age > Duration::from_secs(2) && cur_age < Duration::from_secs(2) {
                     client.reconnect_at = Some(now);
                 } else if let Some(prev_reconnect) = prev.reconnect_at {
                     // Carry forward reconnect_at if still within flash window (4s)
