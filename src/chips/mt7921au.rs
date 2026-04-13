@@ -4058,6 +4058,48 @@ impl Mt7921au {
         Arc::clone(&self.handle)
     }
 
+    /// Check firmware health — returns true if firmware is responsive.
+    /// Matches Linux mt792x_mac_work() watchdog check.
+    ///
+    /// Should be called periodically (~1s) during long-running operations.
+    /// If this returns false, call recover_firmware() to attempt recovery.
+    pub fn check_firmware_health(&self) -> bool {
+        if !self.mcu_running {
+            return false;
+        }
+
+        // Check N9 MCU ready bit — if firmware crashes this goes low
+        match self.reg_read(MT_CONN_ON_MISC) {
+            Ok(val) => (val & MT_TOP_MISC2_FW_N9_RDY) == MT_TOP_MISC2_FW_N9_RDY,
+            Err(_) => false, // USB read failed — device may be disconnected
+        }
+    }
+
+    /// Attempt firmware crash recovery via WFSYS reset + re-init.
+    /// Matches Linux mt7921_reset() → mt792x_wfsys_reset() → mt7921_run_firmware().
+    ///
+    /// Returns Ok(()) if recovery succeeded, Err if device is unrecoverable.
+    pub fn recover_firmware(&mut self) -> Result<()> {
+        self.mcu_running = false;
+        self.sniffer_enabled = false;
+        self.radio_initialized = false;
+
+        // WFSYS reset clears all firmware state
+        self.wfsys_reset()?;
+
+        // Re-run the init sequence from step 4 onward
+        self.mcu_power_on()?;
+        self.dma_init(false)?;
+        self.reg_write(MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE)?;
+        self.run_firmware()?;
+
+        // Re-query capabilities
+        let _ = self.mcu_get_nic_capability();
+        let _ = self.mcu_send_ce_cmd(0xC5, &[1, 0, 0, 0], false);
+
+        Ok(())
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     //  AP Mode — Rogue AP / Evil Twin
     // ══════════════════════════════════════════════════════════════════════════
@@ -4281,12 +4323,49 @@ impl ChipDriver for Mt7921au {
     }
 
     fn shutdown(&mut self) -> Result<()> {
-        // Disable sniffer if active
-        if self.sniffer_enabled {
-            let _ = self.mcu_set_sniffer(false);
+        // Proper teardown sequence matching Linux mt7921_stop() + mt792x_mcu_drv_pmctrl().
+        // Without this, re-init often needs a full WFSYS reset.
+
+        if self.mcu_running {
+            // 1. Disable sniffer if active
+            if self.sniffer_enabled {
+                let _ = self.mcu_set_sniffer(false);
+                self.sniffer_enabled = false;
+            }
+
+            // 2. Remove broadcast STA record
+            let _ = self.mcu_sta_update(false); // conn_state=DISCONNECT
+
+            // 3. Deactivate BSS — send BSS_INFO_UPDATE with active=0
+            let mut bss_deact = vec![0u8; 36]; // hdr(4) + BASIC TLV(32)
+            bss_deact[0] = 0; // bss_idx
+            bss_deact[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag=BASIC
+            bss_deact[6..8].copy_from_slice(&32u16.to_le_bytes()); // len
+            bss_deact[8] = 0; // active = false
+            let _ = self.mcu_send_uni_cmd(0x02, &bss_deact, true);
+
+            // 4. Deactivate device — DEV_INFO_UPDATE with active=0
+            let mut dev_deact = [0u8; 16];
+            dev_deact[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag=DEV_INFO_ACTIVE
+            dev_deact[6..8].copy_from_slice(&12u16.to_le_bytes()); // len
+            dev_deact[8] = 0; // active = false
+            let _ = self.mcu_send_uni_cmd(0x01, &dev_deact, true);
+
+            // 5. Enter deep sleep — reduces power and prepares for clean re-init
+            let _ = self.mcu_set_deep_sleep(true);
+
+            // 6. Enter power management
+            let _ = self.mcu_set_pm(0, true); // band=0, enter=true
+
+            // 7. Power off MCU — NIC_POWER_CTRL with power_mode=1
+            let poweroff = [1u8, 0, 0, 0];
+            let _ = self.mcu_send_msg(MCU_CMD_NIC_POWER_CTRL, &poweroff, false);
+
+            self.mcu_running = false;
+            self.radio_initialized = false;
         }
 
-        // Release the interface
+        // Release the USB interface
         let _ = self.handle.release_interface(self.iface_num);
 
         Ok(())
@@ -4416,13 +4495,23 @@ impl ChipDriver for Mt7921au {
 
         self.mcu_set_rxfilter(0, MT7921_FIF_BIT_CLR, drop_bits_to_clear)?;
 
-        // STEP 6: Disable beacon filter
-        // Matches mt7921_mcu_set_beacon_filter(dev, vif, false)
-        // This uses BSS_INFO_UPDATE with BSS_INFO_BCNFT TLV + SET_BSS_ABORT CE cmd
-        // For monitor mode, the rxfilter clearing above should be sufficient,
-        // but we send SET_BSS_ABORT to be thorough
+        // STEP 6: Disable beacon filter — both BSS_INFO TLV and CE cmd.
+        // Matches mt7921_mcu_set_beacon_filter(dev, vif, false) from Linux.
+        //
+        // 6a. BSS_INFO_BCNFT TLV (tag 6) — tells firmware to not filter beacons
+        // struct { tag(2), len(2), len_adjust(1), pad(3) } = 8 bytes
+        let hdr_len = 4;
+        let bcnft_len: u16 = 8;
+        let mut bcnft_req = vec![0u8; hdr_len + bcnft_len as usize];
+        bcnft_req[0] = 0; // bss_idx
+        bcnft_req[hdr_len..hdr_len+2].copy_from_slice(&6u16.to_le_bytes()); // tag=BCNFT
+        bcnft_req[hdr_len+2..hdr_len+4].copy_from_slice(&bcnft_len.to_le_bytes());
+        // len_adjust=0, all zeros = disable beacon filter
+        let _ = self.mcu_send_uni_cmd(0x02, &bcnft_req, true);
+
+        // 6b. SET_BSS_ABORT CE cmd — hard disable of BSS-level filtering
         let abort_data = [0u8; 4]; // bss_idx=0, pad[3]
-        let _ = self.mcu_send_ce_cmd(0x17, &abort_data, false); // CE_CMD_SET_BSS_ABORT
+        let _ = self.mcu_send_ce_cmd(0x17, &abort_data, false);
 
         // STEP 7: Re-enable UDMA RX — match Linux mt792xu_dma_init() exactly.
         // Linux: clear RX_FLUSH, enable RX/TX, clear aggregation params.
