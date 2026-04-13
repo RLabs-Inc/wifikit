@@ -292,19 +292,27 @@ const MCU_CMD_EXT_CID: u8           = 0xED;
 const MCU_CMD_FW_SCATTER: u8        = 0xEE;
 const MCU_CMD_RESTART_DL_REQ: u8    = 0xEF;
 
-// MCU EXT command IDs (ext_cid field when cid=0xED)
-const MCU_EXT_CMD_CHANNEL_SWITCH: u8 = 0x08;
-const MCU_EXT_CMD_PM_STATE_CTRL: u8  = 0x07;
+// MCU EXT command IDs (ext_cid field when cid=0xED — from mt76_connac_mcu.h)
+const MCU_EXT_CMD_PM_STATE_CTRL: u8    = 0x07;
+const MCU_EXT_CMD_CHANNEL_SWITCH: u8   = 0x08;
 const MCU_EXT_CMD_EFUSE_BUFFER_MODE: u8 = 0x21;
-const MCU_EXT_CMD_WTBL_UPDATE: u8    = 0x32;
-const MCU_EXT_CMD_PROTECT_CTRL: u8   = 0x3E;
-const MCU_EXT_CMD_MAC_INIT_CTRL: u8  = 0x46;
-const MCU_EXT_CMD_SET_RX_PATH: u8    = 0x4E;
+const MCU_EXT_CMD_THERMAL_CTRL: u8     = 0x2C;
+const MCU_EXT_CMD_WTBL_UPDATE: u8      = 0x32;
+const MCU_EXT_CMD_SET_SER_TRIGGER: u8  = 0x3C;
+const MCU_EXT_CMD_PROTECT_CTRL: u8     = 0x3E;
+const MCU_EXT_CMD_MAC_INIT_CTRL: u8    = 0x46;
+const MCU_EXT_CMD_SET_RX_PATH: u8      = 0x4E;
 
 // MCU CE command IDs (community engine — set_query=MCU_Q_SET)
 const MCU_CE_CMD_TEST_CTRL: u8       = 0x01;  // RF test mode control
 const MCU_CE_CMD_SET_PS_PROFILE: u8  = 0x05;
 const MCU_CE_CMD_SET_RX_FILTER: u8   = 0x0A;
+const MCU_CE_CMD_SET_CHAN_DOMAIN: u8  = 0x0F;
+const MCU_CE_CMD_SET_BSS_ABORT: u8   = 0x17;
+const MCU_CE_CMD_SET_EDCA_PARMS: u8  = 0x1D;
+const MCU_CE_CMD_SET_RATE_TX_POWER: u8 = 0x5D;
+const MCU_CE_CMD_GET_NIC_CAPAB: u8   = 0x8A;
+const MCU_CE_CMD_FW_LOG_2_HOST: u8   = 0xC5;
 const MCU_CE_CMD_CHIP_CONFIG: u8     = 0xCA;
 
 // ── RF Test Mode (testmode.h) ───────────────────────────────────────────
@@ -350,10 +358,15 @@ const MCU_ATE_GET_TX_INFO: u32          = 0x81;  // Query TX info (pending, done
 const MCU_ATE_GET_TEMPERATURE: u32      = 0x82;  // Query chip temperature
 const MCU_ATE_GET_TSSI: u32             = 0x83;  // Query TSSI (TX signal strength indicator)
 
-// MCU UNI command IDs
+// MCU UNI command IDs (from mt76_connac_mcu.h — MCU_UNI_CMD_*)
 const MCU_UNI_CMD_DEV_INFO_UPDATE: u16 = 0x01;
 const MCU_UNI_CMD_BSS_INFO_UPDATE: u16 = 0x02;
+const MCU_UNI_CMD_STA_REC_UPDATE: u16  = 0x03;
+const MCU_UNI_CMD_SUSPEND: u16        = 0x05;
+const MCU_UNI_CMD_OFFLOAD: u16        = 0x06;
+const MCU_UNI_CMD_HIF_CTRL: u16       = 0x07;
 const MCU_UNI_CMD_SNIFFER: u16        = 0x24;
+const MCU_UNI_CMD_SER: u16            = 0x25;
 
 // RX filter bit operations (mt7921_mcu_set_rxfilter)
 const MT7921_FIF_BIT_SET: u8 = 0x01;  // BIT(0) — set bits in bitmap
@@ -2218,9 +2231,7 @@ impl Mt7921au {
     }
 
     fn mcu_set_rate_txpower_inner(&mut self, band: Band, max_half_dbm: u8, is_last_band: bool) -> Result<()> {
-        /// CE cmd 0x5d — matches MCU_CE_CMD_SET_RATE_TX_POWER from mt76_connac_mcu.h
-        const MCU_CE_CMD_SET_RATE_TX_POWER: u8 = 0x5d;
-
+        // CE cmd 0x5D — matches MCU_CE_CMD_SET_RATE_TX_POWER from mt76_connac_mcu.h
         // Channel lists from Linux mt76_connac_mcu.c:2126-2156.
         // These include ALL channels (primary + center frequencies for 40/80/160)
         // because firmware needs power limits for every possible operating frequency.
@@ -3011,7 +3022,6 @@ impl Mt7921au {
         //   [1]   band_idx = 0
         //   [2-3] pad
         // }
-        const MCU_EXT_CMD_THERMAL_CTRL: u8 = 0x2C;
         let req = [0u8, 0, 0, 0]; // ctrl_id=0 (read), band=0
         let temp = self.mcu_send_ext_cmd(MCU_EXT_CMD_THERMAL_CTRL, &req, true)?;
         Ok(temp)
@@ -3199,7 +3209,7 @@ impl Mt7921au {
                      else { 0 };
         req[r+13] = band_to_idx(channel.band);
 
-        self.mcu_send_uni_cmd(0x02, &req, true)?;
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &req, true)?;
         Ok(())
     }
 
@@ -3256,7 +3266,7 @@ impl Mt7921au {
             off += chan_entry_size;
         }
 
-        self.mcu_send_ce_cmd(0x0F, &data, false)?; // CE_CMD_SET_CHAN_DOMAIN = 0x0F
+        self.mcu_send_ce_cmd(MCU_CE_CMD_SET_CHAN_DOMAIN, &data, false)?;
         Ok(())
     }
 
@@ -3294,7 +3304,7 @@ impl Mt7921au {
         dev_req[9] = 0; // link_idx = 0
         dev_req[10..16].copy_from_slice(&self.mac_addr.0); // omac_addr = our MAC
 
-        self.mcu_send_uni_cmd(0x01, &dev_req, true)?;
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_DEV_INFO_UPDATE, &dev_req, true)?;
 
         // 2. BSS_INFO_UPDATE (UNI cmd 0x02) — BASIC + QOS TLVs
         // Matches mt76_connac_mcu_uni_add_bss() from Linux mt76_connac_mcu.c:1546.
@@ -3367,7 +3377,7 @@ impl Mt7921au {
         bss_req[q+2..q+4].copy_from_slice(&qos_len.to_le_bytes()); // len
         bss_req[q+4] = 1; // qos = true (enable WMM)
 
-        self.mcu_send_uni_cmd(0x02, &bss_req, true)?;
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &bss_req, true)?;
 
         // 3. BSS_INFO_UPDATE — RLM TLV (Radio Link Management / channel context)
         // Matches mt76_connac_mcu_uni_set_chctx() from Linux mt76_connac_mcu.c:1464.
@@ -3391,7 +3401,7 @@ impl Mt7921au {
         rlm_req[r+12] = 0; // sco (secondary channel offset)
         rlm_req[r+13] = band_to_idx(self.current_channel.band); // band: 0=2.4G, 1=5G, 2=6G
 
-        self.mcu_send_uni_cmd(0x02, &rlm_req, true)?;
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &rlm_req, true)?;
 
         // 4. BSS_INFO_UPDATE — HE TLV (802.11ax capabilities for this BSS)
         // Matches mt76_connac_mcu_bss_he_tlv() from Linux mt76_connac_mcu.c.
@@ -3410,7 +3420,7 @@ impl Mt7921au {
         he_req[h..h+2].copy_from_slice(&20u16.to_le_bytes()); // tag = UNI_BSS_INFO_HE_BASIC
         he_req[h+2..h+4].copy_from_slice(&he_tlv_len.to_le_bytes());
         he_req[h+4..h+6].copy_from_slice(&4u16.to_le_bytes()); // default_pe_duration = 4
-        self.mcu_send_uni_cmd(0x02, &he_req, true)?;
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &he_req, true)?;
 
         // 5. BSS_INFO_UPDATE — RATE TLV (supported rate set for this BSS)
         // Matches mt76_connac_mcu_bss_basic_rates_tlv() from Linux.
@@ -3433,7 +3443,7 @@ impl Mt7921au {
         // Use 0x15F = all OFDM mandatory + CCK rates (universal acceptance)
         let basic_rate: u16 = 0x015F;
         rate_req[rt+4..rt+6].copy_from_slice(&basic_rate.to_le_bytes());
-        self.mcu_send_uni_cmd(0x02, &rate_req, true)?;
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &rate_req, true)?;
 
         Ok(())
     }
@@ -3448,8 +3458,6 @@ impl Mt7921au {
     ///
     /// Without these, firmware uses conservative defaults that affect frame delivery.
     fn mcu_set_edca(&mut self) -> Result<()> {
-        const MCU_CE_CMD_SET_EDCA_PARMS: u8 = 0x1D;
-
         // EDCA struct per AC: cw_min(le16), cw_max(le16), txop(le16), aifs(le16),
         //                     guardtime(u8), acm(u8) = 10 bytes per AC
         // Total: 4 ACs × 10 + bss_idx(1) + qos(1) + wmm_idx(1) + pad(1) = 44 bytes
@@ -3557,8 +3565,6 @@ impl Mt7921au {
     ///   sta_req_hdr (8 bytes) + sta_rec_basic TLV (20 bytes)
     /// Sent via MCU_UNI_CMD(STA_REC_UPDATE) = 0x03
     fn mcu_sta_update(&mut self, enable: bool) -> Result<()> {
-        const MCU_UNI_CMD_STA_REC_UPDATE: u16 = 0x03;
-
         // TLV tags from mt76_connac_mcu.h
         const STA_REC_BASIC: u16 = 0;
         const STA_REC_HT: u16 = 7;
@@ -4043,7 +4049,7 @@ impl Mt7921au {
 
         // Enable firmware logging to host (CE cmd 0xC5, data=1)
         // Matches mt7921_mcu_fw_log_2_host(dev, 1)
-        let _ = self.mcu_send_ce_cmd(0xC5, &[1, 0, 0, 0], false);
+        let _ = self.mcu_send_ce_cmd(MCU_CE_CMD_FW_LOG_2_HOST, &[1, 0, 0, 0], false);
 
         // 9. If NIC_CAPS didn't provide MAC, try EEPROM fallback
         if self.mac_addr.0 == [0, 0, 0, 0, 0, 0] {
@@ -4095,7 +4101,7 @@ impl Mt7921au {
 
         // Re-query capabilities
         let _ = self.mcu_get_nic_capability();
-        let _ = self.mcu_send_ce_cmd(0xC5, &[1, 0, 0, 0], false);
+        let _ = self.mcu_send_ce_cmd(MCU_CE_CMD_FW_LOG_2_HOST, &[1, 0, 0, 0], false);
 
         Ok(())
     }
@@ -4196,7 +4202,7 @@ impl Mt7921au {
             payload[pkt_off+32..pkt_off+32+beacon_frame.len()].copy_from_slice(beacon_frame);
         }
 
-        self.mcu_send_uni_cmd(0x02, &payload, true)?; // BSS_INFO_UPDATE with BCN_CONTENT tag
+        self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &payload, true)?; // BSS_INFO_UPDATE with BCN_CONTENT tag
         Ok(())
     }
 
@@ -4342,14 +4348,14 @@ impl ChipDriver for Mt7921au {
             bss_deact[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag=BASIC
             bss_deact[6..8].copy_from_slice(&32u16.to_le_bytes()); // len
             bss_deact[8] = 0; // active = false
-            let _ = self.mcu_send_uni_cmd(0x02, &bss_deact, true);
+            let _ = self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &bss_deact, true);
 
             // 4. Deactivate device — DEV_INFO_UPDATE with active=0
             let mut dev_deact = [0u8; 16];
             dev_deact[4..6].copy_from_slice(&0u16.to_le_bytes()); // tag=DEV_INFO_ACTIVE
             dev_deact[6..8].copy_from_slice(&12u16.to_le_bytes()); // len
             dev_deact[8] = 0; // active = false
-            let _ = self.mcu_send_uni_cmd(0x01, &dev_deact, true);
+            let _ = self.mcu_send_uni_cmd(MCU_UNI_CMD_DEV_INFO_UPDATE, &dev_deact, true);
 
             // 5. Enter deep sleep — reduces power and prepares for clean re-init
             let _ = self.mcu_set_deep_sleep(true);
@@ -4507,11 +4513,11 @@ impl ChipDriver for Mt7921au {
         bcnft_req[hdr_len..hdr_len+2].copy_from_slice(&6u16.to_le_bytes()); // tag=BCNFT
         bcnft_req[hdr_len+2..hdr_len+4].copy_from_slice(&bcnft_len.to_le_bytes());
         // len_adjust=0, all zeros = disable beacon filter
-        let _ = self.mcu_send_uni_cmd(0x02, &bcnft_req, true);
+        let _ = self.mcu_send_uni_cmd(MCU_UNI_CMD_BSS_INFO_UPDATE, &bcnft_req, true);
 
         // 6b. SET_BSS_ABORT CE cmd — hard disable of BSS-level filtering
         let abort_data = [0u8; 4]; // bss_idx=0, pad[3]
-        let _ = self.mcu_send_ce_cmd(0x17, &abort_data, false);
+        let _ = self.mcu_send_ce_cmd(MCU_CE_CMD_SET_BSS_ABORT, &abort_data, false);
 
         // STEP 7: Re-enable UDMA RX — match Linux mt792xu_dma_init() exactly.
         // Linux: clear RX_FLUSH, enable RX/TX, clear aggregation params.
@@ -4758,7 +4764,7 @@ impl ChipDriver for Mt7921au {
             dev_req[9] = 0; // link_idx
             dev_req[10..16].copy_from_slice(&self.mac_addr.0); // new MAC
 
-            if let Err(e) = self.mcu_send_uni_cmd(0x01, &dev_req, true) {
+            if let Err(e) = self.mcu_send_uni_cmd(MCU_UNI_CMD_DEV_INFO_UPDATE, &dev_req, true) {
                 self.mac_addr = old_mac; // rollback
                 return Err(e);
             }
