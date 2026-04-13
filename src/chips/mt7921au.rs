@@ -1241,32 +1241,23 @@ impl Mt7921au {
         // Clear RX flush
         self.reg_clear(MT_UDMA_WLCFG_0, MT_WL_RX_FLUSH)?;
 
-        // Enable TX/RX with USB RX aggregation.
-        // Linux disables AGG because it uses 128 async URBs (no benefit).
-        // We use synchronous bulk reads where aggregation reduces USB round-trips.
-        // On USB3 SuperSpeed (5Gbps) this batches multiple frames per read.
+        // Enable TX/RX — match Linux mt792xu_dma_init() EXACTLY.
         //
-        // AGG_TO  = aggregation timeout (GENMASK(7,0) in WLCFG_0) in 33ns units
-        // AGG_LMT = max frames per aggregate (GENMASK(15,8) in WLCFG_0)
-        // PKT_LMT = packet count limit (GENMASK(7,0) in WLCFG_1)
+        // Linux: mt76_set(RX_EN | TX_EN | RX_MPSZ_PAD0 | TICK_1US_EN)
+        //        mt76_clear(RX_AGG_TO | RX_AGG_LMT)
+        //        mt76_clear(WLCFG_1, RX_AGG_PKT_LMT)
         //
-        // Tuning rationale (from PHY capabilities):
-        //   Max AMPDU = 65535 bytes, Max AMSDU = 7935 bytes
-        //   With avg beacon ~200 bytes, 64 frames × 200 = 12.8KB = fits in 65KB buffer
-        //   Timeout: 0xFF ≈ 8.4µs — aggressive enough for real-time scanning
-        //   but long enough to batch multiple back-to-back frames.
+        // Linux does NOT set RX_AGG_EN and CLEARS the aggregation parameters.
+        // The firmware delivers frames immediately without batching.
+        // Linux compensates with 128 async URBs for throughput.
+        // We must match this exactly — firmware behavior depends on these values.
         self.reg_set(MT_UDMA_WLCFG_0,
                      MT_WL_RX_EN | MT_WL_TX_EN |
-                     MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN |
-                     MT_WL_RX_AGG_EN)?;
-        // AGG_TO=0x80 (~4µs), AGG_LMT=16 frames per aggregate
-        // Conservative values that work reliably during init and monitor setup.
-        // Monitor mode set_monitor_mode() can tune these up for RX throughput.
-        self.reg_rmw(MT_UDMA_WLCFG_0,
-                     MT_WL_RX_AGG_TO | MT_WL_RX_AGG_LMT,
-                     0x80 | (0x10 << 8))?;
-        // PKT_LMT=16 in WLCFG_1
-        self.reg_rmw(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT, 0x10)?;
+                     MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN)?;
+        // Clear aggregation parameters — firmware delivers frames immediately
+        self.reg_clear(MT_UDMA_WLCFG_0,
+                       MT_WL_RX_AGG_TO | MT_WL_RX_AGG_LMT)?;
+        self.reg_clear(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT)?;
 
         if resume {
             return Ok(());
@@ -1596,6 +1587,37 @@ impl Mt7921au {
             }
         }
         None
+    }
+
+    /// Receive MCU response and return the FULL raw buffer.
+    /// Used for commands that return data (NIC_CAPS, EEPROM read, etc).
+    fn mcu_recv_response_raw(&self, expected_seq: u8) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 2048];
+
+        while Instant::now() < deadline {
+            match self.handle.read_bulk(self.ep_data_in, &mut buf, Duration::from_millis(10)) {
+                Ok(n) if n > 0 => {
+                    if n >= 4 {
+                        let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        let pkt_type = (dw0 >> 27) & 0xF;
+                        if pkt_type != 7 { continue; }
+                    }
+                    if n >= 30 && buf[29] == expected_seq {
+                        return Ok(buf[..n].to_vec());
+                    }
+                    continue;
+                }
+                Ok(_) | Err(rusb::Error::Timeout) => continue,
+                Err(e) => return Err(Error::Usb(e)),
+            }
+        }
+
+        Err(Error::ChipInitFailed {
+            chip: "MT7921AU".into(),
+            stage: crate::core::error::InitStage::FirmwareDownload,
+            reason: format!("MCU response (raw) timeout for seq {}", expected_seq),
+        })
     }
 
     /// Send an EXT MCU command.
@@ -2709,7 +2731,12 @@ impl Mt7921au {
     /// Set RX path / channel info via MCU command.
     /// Matches mt7921_mcu_set_chan_info() from Linux mt7921/mcu.c:863.
     /// Accepts a full Channel struct to support bandwidth (20/40/80/160 MHz).
-    fn mcu_set_chan_info(&mut self, ext_cmd: u8, channel: Channel) -> Result<()> {
+    ///
+    /// switch_reason values (from mt76_connac_mcu.h):
+    ///   0 = CH_SWITCH_NORMAL — full calibration including DPD
+    ///   3 = CH_SWITCH_SCAN — scan mode
+    ///   9 = CH_SWITCH_SCAN_BYPASS_DPD — skip DPD calibration for faster switch
+    fn mcu_set_chan_info(&mut self, ext_cmd: u8, channel: Channel, switch_reason: u8) -> Result<()> {
         let channel_band = band_to_idx(channel.band);
         let (center_ch, bw) = channel_center_and_bw(channel);
 
@@ -2727,7 +2754,7 @@ impl Mt7921au {
         } else {
             2                // hweight8(0x3) = 2 (stream count)
         };
-        req[5] = 0;            // switch_reason = CH_SWITCH_NORMAL (monitor mode)
+        req[5] = switch_reason; // CH_SWITCH_NORMAL(0) or CH_SWITCH_SCAN_BYPASS_DPD(9)
         req[6] = 0;            // band_idx = PHY band index (always 0, single-PHY device)
         req[7] = 0;            // center_ch2 (only for 80+80)
         // cac_case: le16 at [8-9] = 0
@@ -2861,14 +2888,90 @@ impl Mt7921au {
         // Initial channel uses SET_RX_PATH (0x4E) — matches Linux __mt7921_start().
         // SET_RX_PATH configures antenna paths + initial channel. rx_streams = antenna bitmask.
         // Sniffer is not active yet, so no sniffer config needed here.
-        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, channel)?;
+        self.mcu_set_chan_info(MCU_EXT_CMD_SET_RX_PATH, channel, 0)?; // CH_SWITCH_NORMAL for init
         self.current_channel = channel;
+
+        // Set band-specific MAC timing IMMEDIATELY after initial channel.
+        // Linux: __mt7921_start() → set_rx_path() followed by mac_set_timeing().
+        // Without this, CCA/PLCP/SIFS registers have stale firmware defaults.
+        self.mac_set_timing(channel)?;
 
         // Send TX power limits for ALL bands via CE 0x5d (SET_RATE_TX_POWER).
         // This is REQUIRED for 6GHz — firmware won't enable the 6GHz RF path
         // without receiving country-coded per-channel power limits.
         // Matches Linux __mt7921_start() → mt76_connac_mcu_set_rate_txpower().
         self.mcu_set_rate_txpower_all()?;
+        Ok(())
+    }
+
+    /// Set band-specific MAC timing registers — CRITICAL for correct frame detection.
+    ///
+    /// Matches mt792x_mac_set_timeing() from Linux mt792x_mac.c:35.
+    /// MUST be called on every channel switch. Sets:
+    ///   - CCK detect timeout (PLCP preamble + CCA energy detect)
+    ///   - OFDM detect timeout (PLCP + CCA)
+    ///   - Inter-frame spacing (SIFS differs: 10μs on 2.4GHz, 16μs on 5/6GHz)
+    ///   - CF-END rate (11B for 2.4GHz, OFDM 24M for 5/6GHz)
+    ///
+    /// Without this, the chip uses stale timing from a previous band — CCA sensitivity
+    /// and PLCP detection will be wrong, causing massive frame loss on the wrong band.
+    fn mac_set_timing(&self, channel: Channel) -> Result<()> {
+        // Register bases — band 0 (all our monitor ops use band 0)
+        const TMAC_BASE: u32  = 0x820e4000;
+        const AGG_BASE: u32   = 0x820e2000;
+        const ARB_BASE: u32   = 0x820e3000;
+
+        const TMAC_CDTR: u32  = TMAC_BASE + 0x090; // CCK detect timeout
+        const TMAC_ODTR: u32  = TMAC_BASE + 0x094; // OFDM detect timeout
+        const TMAC_ICR0: u32  = TMAC_BASE + 0x0a4; // IFS timing
+        const AGG_ACR0: u32   = AGG_BASE + 0x084;  // CF-END rate
+        const ARB_SCR: u32    = ARB_BASE + 0x080;   // TX/RX arbitration control
+
+        const ARB_SCR_TX_DISABLE: u32 = 1 << 8;
+        const ARB_SCR_RX_DISABLE: u32 = 1 << 9;
+
+        // CFEND rate constants (from mt792x.h)
+        const CFEND_RATE_OFDM_24M: u32 = 0x49;  // 5GHz/6GHz default
+        const CFEND_RATE_11B: u32 = 0x03;        // 2.4GHz 11B LP, 11M
+
+        let is_2ghz = channel.band == Band::Band2g;
+
+        // SIFS: 10μs for 2.4GHz (802.11b/g/n), 16μs for 5GHz/6GHz (802.11a/ac/ax)
+        let sifs: u32 = if is_2ghz { 10 } else { 16 };
+        // Slot time: 9μs for short slot (non-legacy), 20μs for long slot (2.4GHz legacy)
+        // Monitor mode always uses short slot (9μs) — we don't negotiate with APs
+        let slottime: u32 = 9;
+
+        // CCK timeout: PLCP=231 ticks, CCA=48 ticks (from Linux)
+        let cck: u32 = 231 | (48 << 16);
+        // OFDM timeout: PLCP=60 ticks, CCA=28 ticks
+        let ofdm: u32 = 60 | (28 << 16);
+
+        // coverage_class=0 for monitor mode (no range extension), so reg_offset=0
+
+        // Step 1: Atomically disable TX+RX during timing update
+        self.reg_set(ARB_SCR, ARB_SCR_TX_DISABLE | ARB_SCR_RX_DISABLE)?;
+        thread::sleep(Duration::from_micros(1));
+
+        // Step 2: Write band-specific timing registers
+        self.reg_write(TMAC_CDTR, cck)?;
+        self.reg_write(TMAC_ODTR, ofdm)?;
+
+        // IFS: EIFS[8:0]=360, RIFS[14:10]=2, SIFS[22:16], SLOT[30:24]
+        let icr0 = (360 & 0x1FF)
+            | ((2 & 0x1F) << 10)
+            | ((sifs & 0x7F) << 16)
+            | ((slottime & 0x7F) << 24);
+        self.reg_write(TMAC_ICR0, icr0)?;
+
+        // CF-END rate: 11B for 2.4GHz (when slottime >= 20 or is_2ghz), OFDM 24M otherwise
+        // For monitor mode with short slottime: use OFDM unless 2.4GHz
+        let cfend_rate = if is_2ghz { CFEND_RATE_11B } else { CFEND_RATE_OFDM_24M };
+        self.reg_rmw(AGG_ACR0, 0x3FFF, cfend_rate)?; // CFEND_RATE is GENMASK(13,0)
+
+        // Step 3: Re-enable TX+RX
+        self.reg_clear(ARB_SCR, ARB_SCR_TX_DISABLE | ARB_SCR_RX_DISABLE)?;
+
         Ok(())
     }
 
@@ -2896,7 +2999,26 @@ impl Mt7921au {
         } else {
             MCU_EXT_CMD_CHANNEL_SWITCH
         };
-        self.mcu_set_chan_info(cmd, channel)?;
+        // Use SCAN_BYPASS_DPD (9) during scanning to skip DPD calibration = faster switch.
+        // DPD (Digital Pre-Distortion) adds ~100-300ms per switch but is only needed for
+        // accurate TX power. In passive monitor mode we mostly care about RX.
+        // Linux uses CH_SWITCH_NORMAL (0) but supports SCAN_BYPASS_DPD for scan ops.
+        const CH_SWITCH_SCAN_BYPASS_DPD: u8 = 9;
+        let switch_reason = if cmd == MCU_EXT_CMD_CHANNEL_SWITCH {
+            CH_SWITCH_SCAN_BYPASS_DPD // Faster for scanning
+        } else {
+            0 // CH_SWITCH_NORMAL for SET_RX_PATH (6GHz band transitions)
+        };
+        self.mcu_set_chan_info(cmd, channel, switch_reason)?;
+
+        // Set band-specific MAC timing — CCA, PLCP, SIFS, slot time.
+        // Linux calls this on EVERY channel switch (mt7921_set_channel → mac_set_timeing).
+        // Without this, frame detection uses stale timing from the previous band.
+        self.mac_set_timing(channel)?;
+
+        // Reset MIB/airtime counters — reading clears them.
+        // Matches Linux mt7921_set_channel() → mac_reset_counters().
+        self.mac_reset_counters()?;
 
         // Re-send TX power limits when switching TO 6GHz band.
         // The pcap shows Linux sends all-band TX power after every SET_RX_PATH
@@ -3006,30 +3128,189 @@ impl Mt7921au {
 
         self.mcu_send_uni_cmd(0x01, &dev_req, true)?;
 
-        // 2. BSS_INFO_UPDATE (UNI cmd 0x02)
-        // struct { bss_idx, pad[3] } hdr (4 bytes)
-        // struct mt76_connac_bss_basic_tlv (variable, ~32+ bytes)
-        let mut bss_req = [0u8; 36]; // hdr(4) + bss_basic_tlv(32)
+        // 2. BSS_INFO_UPDATE (UNI cmd 0x02) — BASIC + QOS TLVs
+        // Matches mt76_connac_mcu_uni_add_bss() from Linux mt76_connac_mcu.c:1546.
+        //
+        // mt76_connac_bss_basic_tlv layout (32 bytes):
+        //   [0-1]  tag = UNI_BSS_INFO_BASIC (0)
+        //   [2-3]  len = 32
+        //   [4]    active
+        //   [5]    omac_idx
+        //   [6]    hw_bss_idx
+        //   [7]    band_idx
+        //   [8-11] conn_type (le32)
+        //   [12]   conn_state
+        //   [13]   wmm_idx
+        //   [14-19] bssid[6]
+        //   [20-21] bmc_tx_wlan_idx (le16)
+        //   [22-23] bcn_interval (le16)
+        //   [24]   dtim_period
+        //   [25]   phymode (bit flags: A|B|G|GN|AN|AC|AX2|AX5|AX6)
+        //   [26-27] sta_idx (le16)
+        //   [28-29] nonht_basic_phy (le16)
+        //   [30]   phymode_ext (bit 0 = AX_6G)
+        //   [31]   link_idx
+        //
+        // mt76_connac_bss_qos_tlv layout (8 bytes):
+        //   [0-1]  tag = UNI_BSS_INFO_QBSS (15)
+        //   [2-3]  len = 8
+        //   [4]    qos = 1 (enable WMM QoS)
+        //   [5-7]  pad
+
+        // phymode: bit flags for supported PHY modes
+        // For monitor mode we declare all modes so firmware accepts all frame types
+        // B(1) | G(2) | GN(3) | AN(4) | AC(5) | AX2(6) | AX5(7) = 0xFE
+        let phymode: u8 = 0xFE; // All modes enabled for monitor
+        let phymode_ext: u8 = 1; // AX_6G = bit 0
+
+        let basic_len: u16 = 32;
+        let qos_len: u16 = 8;
+        let hdr_len = 4;
+        let total = hdr_len + basic_len as usize + qos_len as usize;
+        let mut bss_req = vec![0u8; total];
+
+        // Header
         bss_req[0] = bss_idx;
-        // bss_basic_tlv starts at offset 4
-        let t = 4;
-        bss_req[t..t+2].copy_from_slice(&0u16.to_le_bytes()); // tag = UNI_BSS_INFO_BASIC = 0
-        bss_req[t+2..t+4].copy_from_slice(&32u16.to_le_bytes()); // len = 32 (matches Linux struct size)
+
+        // BASIC TLV
+        let t = hdr_len;
+        bss_req[t..t+2].copy_from_slice(&0u16.to_le_bytes()); // tag = UNI_BSS_INFO_BASIC
+        bss_req[t+2..t+4].copy_from_slice(&basic_len.to_le_bytes()); // len
         bss_req[t+4] = 1; // active = true
-        bss_req[t+5] = omac_idx; // omac_idx
-        bss_req[t+6] = omac_idx; // hw_bss_idx (same as omac_idx when < EXT_BSSID_START)
-        bss_req[t+7] = band_idx; // band_idx
-        bss_req[t+8..t+12].copy_from_slice(&conn_type.to_le_bytes()); // conn_type = CONNECTION_INFRA_AP
-        bss_req[t+12] = 1; // conn_state = CONNECT
-        bss_req[t+13] = wmm_idx; // wmm_idx
-        // bssid[6] at t+14..t+20 — zeros for monitor mode
+        bss_req[t+5] = omac_idx;
+        bss_req[t+6] = omac_idx; // hw_bss_idx (same when < EXT_BSSID_START)
+        bss_req[t+7] = band_idx;
+        bss_req[t+8..t+12].copy_from_slice(&conn_type.to_le_bytes()); // CONNECTION_INFRA_AP
+        bss_req[t+12] = 0; // conn_state = DISCONNECT (Linux: !enable for AP mode activate)
+        bss_req[t+13] = wmm_idx;
+        // bssid[6] at t+14..t+20: zeros for monitor (no specific BSS)
         bss_req[t+20..t+22].copy_from_slice(&wcid_idx.to_le_bytes()); // bmc_tx_wlan_idx
-        // bcn_interval at t+22..t+24 — 0
-        // dtim_period at t+24 — 0
-        // phymode at t+25 — 0
+        bss_req[t+22..t+24].copy_from_slice(&100u16.to_le_bytes()); // bcn_interval = 100 TU
+        bss_req[t+24] = 1; // dtim_period = 1
+        bss_req[t+25] = phymode;
         bss_req[t+26..t+28].copy_from_slice(&wcid_idx.to_le_bytes()); // sta_idx
+        // nonht_basic_phy: OFDM(bit 2) = 4 for 5GHz default
+        bss_req[t+28..t+30].copy_from_slice(&4u16.to_le_bytes());
+        bss_req[t+30] = phymode_ext; // AX_6G
+
+        // QOS TLV — enables WMM QoS handling in firmware
+        let q = t + basic_len as usize;
+        bss_req[q..q+2].copy_from_slice(&15u16.to_le_bytes()); // tag = UNI_BSS_INFO_QBSS
+        bss_req[q+2..q+4].copy_from_slice(&qos_len.to_le_bytes()); // len
+        bss_req[q+4] = 1; // qos = true (enable WMM)
 
         self.mcu_send_uni_cmd(0x02, &bss_req, true)?;
+
+        // 3. BSS_INFO_UPDATE — RLM TLV (Radio Link Management / channel context)
+        // Matches mt76_connac_mcu_uni_set_chctx() from Linux mt76_connac_mcu.c:1464.
+        // Tells firmware the channel parameters for this BSS.
+        let (center_ch, bw) = channel_center_and_bw(self.current_channel);
+        let rlm_len: u16 = 16; // sizeof(rlm_tlv)
+        let mut rlm_req = vec![0u8; hdr_len + rlm_len as usize];
+        rlm_req[0] = bss_idx;
+
+        let r = hdr_len;
+        rlm_req[r..r+2].copy_from_slice(&2u16.to_le_bytes()); // tag = UNI_BSS_INFO_RLM
+        rlm_req[r+2..r+4].copy_from_slice(&rlm_len.to_le_bytes()); // len
+        rlm_req[r+4] = self.current_channel.number; // control_channel
+        rlm_req[r+5] = center_ch; // center_chan
+        rlm_req[r+6] = 0; // center_chan2 (80+80 only)
+        rlm_req[r+7] = bw; // bw: 0=20, 1=40, 2=80, 3=160
+        rlm_req[r+8] = 2; // tx_streams = hweight8(0x3) = 2
+        rlm_req[r+9] = 2; // rx_streams = hweight8(chainmask)
+        rlm_req[r+10] = 1; // short_st = true
+        rlm_req[r+11] = 4; // ht_op_info = 4 (HT 40M allowed)
+        rlm_req[r+12] = 0; // sco (secondary channel offset)
+        rlm_req[r+13] = band_to_idx(self.current_channel.band); // band: 0=2.4G, 1=5G, 2=6G
+
+        self.mcu_send_uni_cmd(0x02, &rlm_req, true)?;
+
+        Ok(())
+    }
+
+    /// Set EDCA (Enhanced Distributed Channel Access) QoS parameters.
+    /// Matches mt7921_mcu_set_tx() from Linux mt7921/mcu.c:672.
+    ///
+    /// Configures per-AC (Access Category) channel access timing:
+    ///   - CW_MIN/CW_MAX: contention window bounds
+    ///   - AIFS: arbitration inter-frame spacing
+    ///   - TXOP: transmit opportunity limit
+    ///
+    /// Without these, firmware uses conservative defaults that affect frame delivery.
+    fn mcu_set_edca(&mut self) -> Result<()> {
+        const MCU_CE_CMD_SET_EDCA_PARMS: u8 = 0x1D;
+
+        // EDCA struct per AC: cw_min(le16), cw_max(le16), txop(le16), aifs(le16),
+        //                     guardtime(u8), acm(u8) = 10 bytes per AC
+        // Total: 4 ACs × 10 + bss_idx(1) + qos(1) + wmm_idx(1) + pad(1) = 44 bytes
+        //
+        // AC order in struct: BK(1), BE(0), VI(2), VO(3) — mapped by to_aci[]
+
+        let mut req = [0u8; 44];
+
+        // Default 802.11 EDCA parameters (from IEEE 802.11-2020 Table 9-155)
+        // Format: [cw_min, cw_max, aifs, txop]
+        let edca_defaults: [(u16, u16, u16, u16); 4] = [
+            // to_aci[0] = AC_BK (index 1): CWmin=15, CWmax=1023, AIFS=7, TXOP=0
+            (15, 1023, 7, 0),
+            // to_aci[1] = AC_BE (index 0): CWmin=15, CWmax=1023, AIFS=3, TXOP=0
+            (15, 1023, 3, 0),
+            // to_aci[2] = AC_VI (index 2): CWmin=7, CWmax=15, AIFS=2, TXOP=94
+            (7, 15, 2, 94),
+            // to_aci[3] = AC_VO (index 3): CWmin=3, CWmax=7, AIFS=2, TXOP=47
+            (3, 7, 2, 47),
+        ];
+
+        // Map to Linux order: to_aci[] = { 1, 0, 2, 3 }
+        // Struct order: [AC_BE(0), AC_BK(1), AC_VI(2), AC_VO(3)]
+        // Linux: for ac in 0..4 { req.edca[to_aci[ac]] = queue_params[ac] }
+        // ac=0(BK) → to_aci[0]=1, ac=1(BE) → to_aci[1]=0,
+        // ac=2(VI) → to_aci[2]=2, ac=3(VO) → to_aci[3]=3
+        let ordered: [(u16, u16, u16, u16); 4] = [
+            edca_defaults[1], // slot 0 = BE
+            edca_defaults[0], // slot 1 = BK
+            edca_defaults[2], // slot 2 = VI
+            edca_defaults[3], // slot 3 = VO
+        ];
+
+        for (i, &(cw_min, cw_max, aifs, txop)) in ordered.iter().enumerate() {
+            let off = i * 10;
+            req[off..off+2].copy_from_slice(&cw_min.to_le_bytes());
+            req[off+2..off+4].copy_from_slice(&cw_max.to_le_bytes());
+            req[off+4..off+6].copy_from_slice(&txop.to_le_bytes());
+            req[off+6..off+8].copy_from_slice(&aifs.to_le_bytes());
+            // guardtime[8]=0, acm[9]=0
+        }
+        // bss_idx, qos, wmm_idx, pad at offset 40
+        req[40] = 0; // bss_idx
+        req[41] = 1; // qos = true
+        req[42] = 0; // wmm_idx
+        // req[43] = pad
+
+        self.mcu_send_ce_cmd(MCU_CE_CMD_SET_EDCA_PARMS, &req, false)?;
+        Ok(())
+    }
+
+    /// Reset MAC counters — clear MIB, TX aggregation, and airtime statistics.
+    /// Matches mt792x_mac_reset_counters() from Linux mt792x_mac.c:192.
+    /// Called on every channel switch and during monitor mode init.
+    fn mac_reset_counters(&self) -> Result<()> {
+        // Read and discard TX aggregation counters (reading clears them)
+        for i in 0..4u32 {
+            let _ = self.reg_read(0x820e2000 + 0x0a8 + i * 4); // MT_TX_AGG_CNT(0, i)
+            let _ = self.reg_read(0x820e2000 + 0x164 + i * 4); // MT_TX_AGG_CNT2(0, i)
+        }
+
+        // Read and discard airtime counters (reading clears them)
+        let _ = self.reg_read(MT_WF_MIB_BASE0 + MT_MIB_SDR9_OFF);  // busy time
+        let _ = self.reg_read(MT_WF_MIB_BASE0 + MT_MIB_SDR36_OFF); // TX time
+        let _ = self.reg_read(MT_WF_MIB_BASE0 + MT_MIB_SDR37_OFF); // RX time
+
+        // Clear and re-enable RX time measurement
+        self.reg_set(MT_WF_RMAC_BASE0 + MT_WF_RMAC_MIB_TIME0_OFF,
+                     MT_WF_RMAC_MIB_RXTIME_CLR)?;
+        let rmac_airtime0 = MT_WF_RMAC_BASE0 + 0x0380;
+        self.reg_set(rmac_airtime0, 1 << 31)?; // RXTIME_CLR in AIRTIME0
 
         Ok(())
     }
@@ -3124,15 +3405,111 @@ impl Mt7921au {
     ///
     /// The RXD (receive descriptor) is a connac2 format with:
     /// Read MAC address from EEPROM via MCU.
-    fn read_mac_from_eeprom(&mut self) -> Result<MacAddress> {
-        // MAC is at EEPROM offset 0x004
-        // For now, try reading it directly from registers
-        // The MAC might be available at a well-known register after firmware boots
-        // We'll read it from the EEPROM MCU query later when we have the full MCU
-        // command set working. For now, generate a local MAC or read from USB descriptor.
+    /// Query NIC capabilities and parse TLV response — reads MAC address, PHY caps, etc.
+    /// Matches mt7921_mcu_get_nic_capability() from Linux mt7921/mcu.c:556.
+    ///
+    /// The firmware responds with a TLV chain:
+    ///   Header: n_element(le16), rsv[2]
+    ///   TLVs:   type(le32), len(le32), data[len]
+    ///
+    /// TLV types (from mt76_connac_mcu.h):
+    ///   0  = TX_RESOURCE
+    ///   6  = SW_VER
+    ///   7  = MAC_ADDR ← we need this
+    ///   8  = PHY
+    ///   0x14 = HW_ADIE_VERSION
+    ///   0x18 = 6G ← has_6ghz flag
+    ///   0x20 = CHIP_CAP
+    fn mcu_get_nic_capability(&mut self) -> Result<()> {
+        let seq = self.next_mcu_seq();
 
-        // Try to read from EEPROM offset 0x04 via register (some chips expose this)
-        // Fall back to a locally-administered MAC based on device serial
+        // Build CE cmd GET_NIC_CAPAB (0x8A) — same as before but capture response
+        let mut txd = [0u8; MT_SDIO_TXD_SIZE];
+        let msg_len = MT_SDIO_TXD_SIZE;
+        let txd_dw0: u32 = (msg_len as u32 & 0xFFFF)
+            | (1u32 << 23) | (0x20u32 << 25);
+        txd[0..4].copy_from_slice(&txd_dw0.to_le_bytes());
+        let txd_dw1: u32 = (1u32 << 16) | (1u32 << 31);
+        txd[4..8].copy_from_slice(&txd_dw1.to_le_bytes());
+        let m = 32;
+        let mcu_len = (msg_len - 32) as u16;
+        txd[m..m+2].copy_from_slice(&mcu_len.to_le_bytes());
+        let pq_id: u16 = (1 << 15) | (0x20 << 10);
+        txd[m+2..m+4].copy_from_slice(&pq_id.to_le_bytes());
+        txd[m+4] = 0x8A; // GET_NIC_CAPAB
+        txd[m+5] = MCU_PKT_ID;
+        txd[m+6] = 1; // set_query = MCU_Q_SET
+        txd[m+7] = seq;
+        txd[m+10] = MCU_S2D_H2N;
+
+        let total_len = MT_SDIO_HDR_SIZE + msg_len;
+        let padded_len = (total_len + 3) & !3;
+        let final_len = padded_len + MT_USB_TAIL_SIZE;
+        let mut pkt = vec![0u8; final_len];
+        let sdio_hdr: u32 = (msg_len as u32) & 0xFFFF;
+        pkt[0..4].copy_from_slice(&sdio_hdr.to_le_bytes());
+        pkt[MT_SDIO_HDR_SIZE..MT_SDIO_HDR_SIZE + MT_SDIO_TXD_SIZE].copy_from_slice(&txd);
+
+        self.handle.write_bulk(self.ep_mcu_out, &pkt, USB_BULK_TIMEOUT)?;
+
+        // Get raw response
+        let resp = self.mcu_recv_response_raw(seq)?;
+
+        // Parse TLV chain from response
+        // Response layout: RXD(24) + MCU_RXD(8) + payload
+        // Payload starts at byte 32: cap_hdr(4) + TLVs
+        if resp.len() < 36 {
+            return Ok(()); // Short response, no TLVs
+        }
+
+        let payload = &resp[32..];
+        if payload.len() < 4 {
+            return Ok(());
+        }
+
+        let n_element = u16::from_le_bytes([payload[0], payload[1]]);
+        let mut off = 4; // skip cap_hdr (n_element + rsv[2])
+
+        for _ in 0..n_element {
+            if off + 8 > payload.len() { break; }
+            let tlv_type = u32::from_le_bytes([
+                payload[off], payload[off+1], payload[off+2], payload[off+3]]);
+            let tlv_len = u32::from_le_bytes([
+                payload[off+4], payload[off+5], payload[off+6], payload[off+7]]) as usize;
+            off += 8;
+
+            if off + tlv_len > payload.len() { break; }
+            let tlv_data = &payload[off..off + tlv_len];
+
+            match tlv_type {
+                7 => { // MT_NIC_CAP_MAC_ADDR
+                    if tlv_data.len() >= 6 {
+                        self.mac_addr = MacAddress([
+                            tlv_data[0], tlv_data[1], tlv_data[2],
+                            tlv_data[3], tlv_data[4], tlv_data[5],
+                        ]);
+                    }
+                }
+                0x18 => { // MT_NIC_CAP_6G
+                    if !tlv_data.is_empty() {
+                        let _has_6ghz = tlv_data[0] != 0;
+                    }
+                }
+                6 => { // MT_NIC_CAP_SW_VER
+                    // Could extract firmware version string here
+                }
+                _ => {} // Other TLVs — parsed but not yet used
+            }
+
+            off += tlv_len;
+        }
+
+        Ok(())
+    }
+
+    fn read_mac_from_eeprom(&mut self) -> Result<MacAddress> {
+        // Fallback: generate a locally-administered MAC based on device IDs.
+        // This is only used if mcu_get_nic_capability() fails to provide one.
         let mac_bytes = [0x02, 0x7E, 0xCA, 0xFE, (self.vid & 0xFF) as u8, (self.pid & 0xFF) as u8];
         Ok(MacAddress(mac_bytes))
     }
@@ -3198,18 +3575,24 @@ impl Mt7921au {
         self.run_firmware()?;
 
         // 8. Post-firmware MCU init — matches mt7921_run_firmware()
-        // Query NIC capabilities (CE cmd 0x8A) — this initializes firmware internal state
-        match self.mcu_send_ce_cmd(0x8A, &[], true) {
+        // Query NIC capabilities — parses TLV response for MAC address, PHY caps, etc.
+        // Linux: mt7921_mcu_get_nic_capability() — this is the proper way to get the MAC.
+        match self.mcu_get_nic_capability() {
             Ok(_) => {},
-            Err(_) => {},
+            Err(_) => {
+                // Fallback to generated MAC if NIC_CAPS fails
+                self.mac_addr = self.read_mac_from_eeprom()?;
+            }
         }
 
         // Enable firmware logging to host (CE cmd 0xC5, data=1)
         // Matches mt7921_mcu_fw_log_2_host(dev, 1)
         let _ = self.mcu_send_ce_cmd(0xC5, &[1, 0, 0, 0], false);
 
-        // 9. Read MAC address
-        self.mac_addr = self.read_mac_from_eeprom()?;
+        // 9. If NIC_CAPS didn't provide MAC, try EEPROM fallback
+        if self.mac_addr.0 == [0, 0, 0, 0, 0, 0] {
+            self.mac_addr = self.read_mac_from_eeprom()?;
+        }
 
         Ok(())
     }
@@ -3496,6 +3879,9 @@ impl ChipDriver for Mt7921au {
         if !self.radio_initialized {
             self.radio_init(Channel::new(6))?;
             self.radio_initialized = true;
+            // Reset all MIB/airtime counters after radio init
+            // Matches Linux __mt7921_start() → mac_reset_counters()
+            self.mac_reset_counters()?;
         }
 
         // Exit power management state — radio must be fully awake for monitor mode
@@ -3507,7 +3893,13 @@ impl ChipDriver for Mt7921au {
         self.drain_rx();
 
         // STEP 1: Create a virtual interface (VIF) in the firmware.
+        // This sends DEV_INFO_UPDATE + BSS_INFO_UPDATE (BASIC + QOS + RLM TLVs).
         self.mcu_add_dev()?;
+
+        // STEP 1b: Set EDCA QoS parameters — channel access timing per AC.
+        // Matches Linux mt7921_mcu_set_tx() called during BSS_CHANGED_QOS.
+        // Without this, firmware uses conservative defaults that affect frame delivery.
+        self.mcu_set_edca()?;
 
         // STEP 2: Disable deep sleep — CRITICAL for monitor mode.
         self.mcu_set_deep_sleep(false)?;
@@ -3565,15 +3957,15 @@ impl ChipDriver for Mt7921au {
         let abort_data = [0u8; 4]; // bss_idx=0, pad[3]
         let _ = self.mcu_send_ce_cmd(0x17, &abort_data, false); // CE_CMD_SET_BSS_ABORT
 
-        // STEP 7: Re-enable UDMA RX with tuned aggregation for monitor mode.
-        // Match the dma_init() values: AGG_TO=0xFF, AGG_LMT=64, PKT_LMT=64
+        // STEP 7: Re-enable UDMA RX — match Linux mt792xu_dma_init() exactly.
+        // Linux: clear RX_FLUSH, enable RX/TX, clear aggregation params.
+        // Do NOT set RX_AGG_EN — firmware delivers frames immediately.
         self.reg_clear(MT_UDMA_WLCFG_0, MT_WL_RX_FLUSH)?;
         self.reg_set(MT_UDMA_WLCFG_0, MT_WL_RX_EN | MT_WL_TX_EN |
-                     MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN | MT_WL_RX_AGG_EN)?;
-        self.reg_rmw(MT_UDMA_WLCFG_0,
-                     MT_WL_RX_AGG_LMT | MT_WL_RX_AGG_TO,
-                     0xFF | (0x40 << 8))?;
-        self.reg_rmw(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT, 0x40)?;
+                     MT_WL_RX_MPSZ_PAD0 | MT_TICK_1US_EN)?;
+        self.reg_clear(MT_UDMA_WLCFG_0,
+                       MT_WL_RX_AGG_TO | MT_WL_RX_AGG_LMT)?;
+        self.reg_clear(MT_UDMA_WLCFG_1, MT_WL_RX_AGG_PKT_LMT)?;
         self.reg_set(MT_UWFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_RX_DMA_EN)?;
 
         // Drain again after config — catch any responses from commands above
