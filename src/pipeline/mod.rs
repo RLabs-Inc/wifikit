@@ -337,9 +337,14 @@ fn pipeline_thread(
         inner.stats.frames_received.fetch_add(1, Ordering::Relaxed);
 
         // ── 0. FCS error filter ──
-        // Frames with FCS errors have corrupted bytes — parsing them creates
-        // phantom APs/STAs with garbage MACs and SSIDs. Count them and write
-        // to pcap for offline analysis, but skip parsing and extraction.
+        // Frames with FCS errors have corrupted bytes — parsing them as beacons
+        // creates phantom APs/STAs with garbage MACs. However, EAPOL frames
+        // (M2/M4 from clients at marginal signal) often arrive with FCS errors
+        // but intact EAPOL payloads. We MUST let those through for capture.
+        //
+        // Strategy: check raw bytes for LLC/SNAP + EAPOL signature (0x888E).
+        // If found → parse and extract normally (EAPOL data survives bit flips).
+        // If not → count and skip (prevents phantom APs from corrupted beacons).
         if rx_frame.is_fcs_error {
             inner.stats.fcs_errors.fetch_add(1, Ordering::Relaxed);
 
@@ -355,7 +360,19 @@ fn pipeline_thread(
                 }
             }
 
-            continue; // Skip parsing, extraction, and broadcasting
+            // Quick EAPOL check on raw bytes: LLC/SNAP + EtherType 0x888E
+            // at offset 24 (non-QoS data) or 26 (QoS data).
+            // If this looks like EAPOL, let it through — the SNonce/MIC inside
+            // is likely intact even if the FCS failed on a header bit flip.
+            const EAPOL_SIG: [u8; 8] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E];
+            let d = &rx_frame.data;
+            let is_eapol = (d.len() > 34 && d[24..32] == EAPOL_SIG)
+                        || (d.len() > 36 && d[26..34] == EAPOL_SIG);
+
+            if !is_eapol {
+                continue; // Not EAPOL — skip to prevent phantom APs
+            }
+            // Fall through to normal parse + extract for EAPOL frames
         }
 
         // ── 1. 802.11 frame control sanity check ──
