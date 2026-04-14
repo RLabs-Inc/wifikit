@@ -101,6 +101,88 @@ pub fn rssi_sparkline(samples: &VecDeque<(Duration, i8)>, width: usize) -> Strin
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  SNR — color-coded signal-to-noise ratio (4-tier capture quality)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Color helper for dim red (poor SNR, not hopeless)
+fn dim_red_color(t: &str) -> String { prism::s().red().dim().paint(t) }
+
+/// Pick a color function based on SNR capture quality thresholds.
+/// 4 tiers tuned for EAPOL M2 capture reliability:
+///   >= 25 dB  green  — M2 arrives clean every time
+///   15-24 dB  yellow — usually arrives, occasional FCS error
+///   8-14 dB   dim red — coin flip, depends on multipath/collision timing
+///   < 8 dB    red    — basic rate struggles, M2 drowns in noise
+fn snr_color(snr: u8) -> fn(&str) -> String {
+    if snr >= 25 { green_color }
+    else if snr >= 15 { yellow_color }
+    else if snr >= 8 { dim_red_color }
+    else { red_color }
+}
+
+/// Compact SNR number for table columns: `28` in green/yellow/red.
+pub fn style_snr(snr: u8) -> String {
+    if snr == 0 { return prism::s().dim().paint("·"); }
+    snr_color(snr)(&format!("{snr}"))
+}
+
+/// SNR sparkline — temporal signal quality history using Unicode block characters.
+/// Same pattern as rssi_sparkline but with SNR-specific color thresholds.
+/// Each character represents one SNR sample at one of 8 heights,
+/// individually colored by capture quality (green/yellow/dim-red/red).
+///
+/// `width` is the number of characters in the sparkline (= samples shown).
+pub fn snr_sparkline(samples: &VecDeque<(Duration, u8)>, width: usize) -> String {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    if samples.is_empty() {
+        return prism::s().dim().paint(&"·".repeat(width));
+    }
+
+    let mut out = String::new();
+    let n = samples.len();
+    let start = if n > width { n - width } else { 0 };
+    let visible = n - start;
+
+    // Render samples oldest→newest (left→right)
+    // SNR range: 0-40 dB mapped to 8 block heights
+    for &(_ts, snr) in samples.iter().skip(start) {
+        let level = ((snr as u16) * 7 / 40).min(7) as usize;
+        let ch = BLOCKS[level];
+        let color = snr_color(snr);
+        out.push_str(&color(&ch.to_string()));
+    }
+
+    // Pad RIGHT with dim dots for unfilled future slots
+    let pad = width.saturating_sub(visible);
+    if pad > 0 {
+        out.push_str(&prism::s().dim().paint(&"·".repeat(pad)));
+    }
+
+    out
+}
+
+/// Capture quality badge for the deauth client table.
+/// 4-tier assessment based on SNR:
+///   CLEAN  (green bold) — confident capture
+///   FAIR   (yellow)     — likely, try multiple cycles
+///   WEAK   (dim red)    — coin flip, don't count on it
+///   LOST   (red bold)   — skip this client
+pub fn snr_badge(snr: u8) -> String {
+    if snr == 0 {
+        prism::s().dim().paint("·····")
+    } else if snr >= 25 {
+        prism::s().green().bold().paint("CLEAN")
+    } else if snr >= 15 {
+        prism::s().yellow().paint(" FAIR")
+    } else if snr >= 8 {
+        prism::s().red().dim().paint(" WEAK")
+    } else {
+        prism::s().red().bold().paint(" LOST")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Capture indicator — PMKID / Handshake badges for AP table
 // ═══════════════════════════════════════════════════════════════════════════════
 

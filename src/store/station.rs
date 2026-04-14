@@ -19,6 +19,8 @@ pub struct Station {
     pub is_associated: bool,
     pub rssi: i8,
     pub rssi_best: i8,
+    pub snr: u8,
+    pub snr_best: u8,
     pub last_channel: u8,
     pub frame_count: u32,
     pub data_bytes: u64,
@@ -72,6 +74,9 @@ pub struct Station {
 
     // RSSI history for sparkline rendering (elapsed since scan start, rssi)
     pub rssi_samples: VecDeque<(Duration, i8)>,
+
+    // SNR history for sparkline rendering (elapsed since scan start, snr dB)
+    pub snr_samples: VecDeque<(Duration, u8)>,
 }
 
 impl Station {
@@ -84,6 +89,8 @@ impl Station {
             is_associated: false,
             rssi: -100,
             rssi_best: -100,
+            snr: 0,
+            snr_best: 0,
             last_channel: 0,
             frame_count: 0,
             data_bytes: 0,
@@ -119,6 +126,7 @@ impl Station {
             handshake_state: 0,
             tid_counts: [0; 8],
             rssi_samples: VecDeque::with_capacity(super::MAX_RSSI_SAMPLES),
+            snr_samples: VecDeque::with_capacity(super::MAX_RSSI_SAMPLES),
         }
     }
 }

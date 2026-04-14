@@ -73,6 +73,8 @@ pub struct Ap {
     pub rssi_best: i8,
     pub rssi_worst: i8,
     pub noise: i8,
+    pub snr: u8,
+    pub snr_best: u8,
     pub channel: u8,
     pub channel_center: u16,
     pub bandwidth: Bandwidth,
@@ -225,6 +227,9 @@ pub struct Ap {
 
     // RSSI history for sparkline rendering (timestamp since scan start, rssi)
     pub rssi_samples: VecDeque<(Duration, i8)>,
+
+    // SNR history for sparkline rendering (timestamp since scan start, snr dB)
+    pub snr_samples: VecDeque<(Duration, u8)>,
 }
 
 impl Ap {
@@ -238,6 +243,8 @@ impl Ap {
             rssi_best: -100,
             rssi_worst: 0,
             noise: -95,
+            snr: 0,
+            snr_best: 0,
             channel: 0,
             channel_center: 0,
             bandwidth: Bandwidth::Bw20,
@@ -334,6 +341,7 @@ impl Ap {
             raw_ies: Vec::new(),
             client_count: 0,
             rssi_samples: VecDeque::with_capacity(MAX_RSSI_SAMPLES),
+            snr_samples: VecDeque::with_capacity(MAX_RSSI_SAMPLES),
         }
     }
 

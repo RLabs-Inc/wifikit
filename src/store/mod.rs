@@ -350,7 +350,7 @@ impl FrameStore {
             match delta {
                 // ── AP lifecycle ──────────────────────────────────────────
                 StoreUpdate::ApDiscovered {
-                    bssid, ssid, ssid_raw, is_hidden, rssi, channel,
+                    bssid, ssid, ssid_raw, is_hidden, rssi, snr, noise_floor, channel,
                     channel_center, bandwidth, wifi_gen, freq_mhz, max_nss,
                     max_rate_mbps, security, rsn, beacon_interval, capability,
                     tsf, country, vendor, qbss, tim, supported_rates, ft,
@@ -369,6 +369,12 @@ impl FrameStore {
                     ap.rssi_best = *rssi;
                     ap.rssi_worst = *rssi;
                     ap.rssi_samples.push_back((elapsed, *rssi));
+                    if *snr > 0 {
+                        ap.snr = *snr;
+                        ap.snr_best = *snr;
+                        ap.snr_samples.push_back((elapsed, *snr));
+                    }
+                    if *noise_floor != 0 { ap.noise = *noise_floor; }
                     ap.channel = *channel;
                     ap.channel_center = *channel_center;
                     ap.bandwidth = *bandwidth;
@@ -506,7 +512,8 @@ impl FrameStore {
                 }
 
                 StoreUpdate::ApBeaconUpdate {
-                    bssid, rssi, rssi_sample, channel, freq_mhz, tsf,
+                    bssid, rssi, rssi_sample, snr, snr_sample,
+                    channel, freq_mhz, tsf,
                     beacon_count, security, rsn, bandwidth, wifi_gen,
                     channel_center, max_nss, max_rate_mbps, qbss,
                     dtim_count, csa, ies_changed, wps,
@@ -522,6 +529,16 @@ impl FrameStore {
                                 ap.rssi_samples.pop_front();
                             }
                             ap.rssi_samples.push_back((*ts, *r));
+                        }
+                        if let Some(s) = snr {
+                            ap.snr = *s;
+                            if *s > ap.snr_best { ap.snr_best = *s; }
+                        }
+                        if let Some((ts, s)) = snr_sample {
+                            if ap.snr_samples.len() >= crate::store::MAX_RSSI_SAMPLES {
+                                ap.snr_samples.pop_front();
+                            }
+                            ap.snr_samples.push_back((*ts, *s));
                         }
                         ap.beacon_count = *beacon_count;
                         ap.last_seen = now;
@@ -593,7 +610,7 @@ impl FrameStore {
                 }
 
                 // ── Station lifecycle ─────────────────────────────────────
-                StoreUpdate::StationDiscovered { mac, vendor, is_randomized, channel, rssi } => {
+                StoreUpdate::StationDiscovered { mac, vendor, is_randomized, channel, rssi, snr } => {
                     self.with_stations_mut(|stations| {
                         stations.entry(*mac).or_insert_with(|| {
                             let mut sta = Station::new(*mac, now);
@@ -602,6 +619,11 @@ impl FrameStore {
                             sta.last_channel = *channel;
                             sta.rssi = *rssi;
                             sta.rssi_samples.push_back((elapsed, *rssi));
+                            if *snr > 0 {
+                                sta.snr = *snr;
+                                sta.snr_best = *snr;
+                                sta.snr_samples.push_back((elapsed, *snr));
+                            }
                             sta
                         });
                     });
@@ -617,7 +639,7 @@ impl FrameStore {
                 }
 
                 StoreUpdate::StationDataUpdate {
-                    mac, bssid, rssi, channel, frame_count, data_bytes,
+                    mac, bssid, rssi, snr, channel, frame_count, data_bytes,
                     seq_num, seq_gap, power_save, power_save_changed, qos_tid,
                 } => {
                     self.update_station(*mac, |sta| {
@@ -632,6 +654,14 @@ impl FrameStore {
                                 sta.rssi_samples.pop_front();
                             }
                             sta.rssi_samples.push_back((elapsed, *r));
+                        }
+                        if let Some(s) = snr {
+                            sta.snr = *s;
+                            if *s > sta.snr_best { sta.snr_best = *s; }
+                            if sta.snr_samples.len() >= MAX_RSSI_SAMPLES {
+                                sta.snr_samples.pop_front();
+                            }
+                            sta.snr_samples.push_back((elapsed, *s));
                         }
                         sta.last_channel = *channel;
                         sta.last_seen = now;
@@ -659,11 +689,15 @@ impl FrameStore {
                 }
 
                 StoreUpdate::StationProbeUpdate {
-                    mac, rssi, channel, probe_ssid, probe_ssid_count, avg_probe_interval_ms,
+                    mac, rssi, snr, channel, probe_ssid, probe_ssid_count, avg_probe_interval_ms,
                 } => {
                     self.update_station(*mac, |sta| {
                         sta.frame_count += 1;
                         if let Some(r) = rssi { sta.rssi = *r; }
+                        if let Some(s) = snr {
+                            sta.snr = *s;
+                            if *s > sta.snr_best { sta.snr_best = *s; }
+                        }
                         sta.last_channel = *channel;
                         sta.last_seen = now;
                         sta.probe_ssid_count = *probe_ssid_count;

@@ -1407,7 +1407,7 @@ mod tests {
 
     // Helper: create a ParsedFrame from raw bytes for testing
     fn pf(data: &[u8]) -> crate::core::ParsedFrame {
-        crate::core::parsed_frame::parse_frame(data, -40, 6, 0, Duration::from_millis(100))
+        crate::core::parsed_frame::parse_frame(data, -40, 0, 0, 6, 0, Duration::from_millis(100))
     }
 
     #[test]

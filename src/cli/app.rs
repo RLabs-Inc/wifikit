@@ -307,11 +307,13 @@ impl Shell {
                             .map(|sta| dos_cli::ClientSnapshot {
                                 mac: sta.mac,
                                 rssi: sta.rssi,
+                                snr: sta.snr,
                                 last_seen: sta.last_seen,
                                 frame_count: sta.frame_count,
                                 vendor: sta.vendor.clone(),
                                 reconnect_at: None,
                                 rssi_samples: sta.rssi_samples.clone(),
+                                snr_samples: sta.snr_samples.clone(),
                             })
                             .collect()
                     } else {

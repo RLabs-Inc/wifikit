@@ -362,6 +362,8 @@ fn pipeline_thread(
         let parsed = parsed_frame::parse_frame(
             &rx_frame.data,
             rx_frame.rssi,
+            rx_frame.snr,
+            rx_frame.noise_floor,
             rx_frame.channel,
             rx_frame.band,
             rx_frame.timestamp,

@@ -22,7 +22,7 @@ use crate::pipeline::UpdateSubscriber;
 use crate::store::update::{AttackEventKind, AttackId, AttackType, StoreUpdate};
 
 use prism::{s, truncate, FrameOptions, BorderStyle};
-use crate::cli::scanner::style::rssi_sparkline;
+use crate::cli::scanner::style::{rssi_sparkline, snr_sparkline, style_snr, snr_badge};
 use super::{signal_bar, fps_sparkline, tx_stats_line};
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -131,6 +131,7 @@ pub fn format_event(event: &DosEvent) -> String {
 pub struct ClientSnapshot {
     pub mac: MacAddress,
     pub rssi: i8,
+    pub snr: u8,
     pub last_seen: Instant,
     pub frame_count: u32,
     pub vendor: String,
@@ -139,6 +140,8 @@ pub struct ClientSnapshot {
     pub reconnect_at: Option<Instant>,
     /// RSSI history for sparkline rendering — pulled from Station.rssi_samples.
     pub rssi_samples: VecDeque<(Duration, i8)>,
+    /// SNR history for sparkline rendering — pulled from Station.snr_samples.
+    pub snr_samples: VecDeque<(Duration, u8)>,
 }
 
 /// Render the DoS attack progress view for the Layout active zone.
@@ -297,9 +300,11 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, f
     //   ✓ green   = dropped (>8s silence) — deauth SUCCESS
     if !clients.is_empty() {
         lines.push(vline(
-            &format!("{}  {}  {}  {}  {}  {}",
+            &format!("{}  {}  {}  {}  {}  {}  {}  {}",
                 s().bold().dim().paint(&prism::pad("CLIENT", 17, "left")),
                 s().bold().dim().paint(&prism::pad("SIGNAL", 13, "left")),
+                s().bold().dim().paint(&prism::pad("SNR", 13, "left")),
+                s().bold().dim().paint(&prism::pad("CAPT", 5, "left")),
                 s().bold().dim().paint(&prism::pad("FRAMES", 8, "left")),
                 s().bold().dim().paint(&prism::pad("LAST SEEN", 8, "left")),
                 s().bold().dim().paint(&prism::pad("STATUS", 10, "left")),
@@ -343,14 +348,22 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, f
             let rssi_num = format!("{}", client.rssi);
             let signal_col = format!("{} {}", spark, prism::pad(&rssi_num, 4, "left"));
 
+            // SNR sparkline + current value + capture quality badge
+            let snr_spark = snr_sparkline(&client.snr_samples, 8);
+            let snr_num = style_snr(client.snr);
+            let snr_col = format!("{} {}", snr_spark, prism::pad(&snr_num, 4, "left"));
+            let capt_badge = snr_badge(client.snr);
+
             let vendor_display = truncate(&client.vendor, 15, "\u{2026}");
             let frames_str = prism::format_number(client.frame_count as u64);
 
             lines.push(vline(
-                &format!("{} {}  {}  {}  {}  {}  {}",
+                &format!("{} {}  {}  {}  {}  {}  {}  {}  {}",
                     status_icon,
                     prism::pad(&mac_styled, 17, "left"),
                     prism::pad(&signal_col, 13, "left"),
+                    prism::pad(&snr_col, 13, "left"),
+                    prism::pad(&capt_badge, 5, "left"),
                     prism::pad(&frames_str, 8, "right"),
                     prism::pad(&s().dim().paint(&age_str), 8, "left"),
                     prism::pad(&status_label, 10, "left"),
@@ -819,20 +832,24 @@ mod tests {
             ClientSnapshot {
                 mac: MacAddress::new([0xA4, 0x83, 0xE7, 0x12, 0x34, 0x56]),
                 rssi: -38,
+                snr: 28,
                 last_seen: Instant::now(),
                 frame_count: 247,
                 vendor: "Apple".to_string(),
                 reconnect_at: None,
                 rssi_samples: VecDeque::new(),
+                snr_samples: VecDeque::new(),
             },
             ClientSnapshot {
                 mac: MacAddress::new([0x8C, 0x85, 0x90, 0xAB, 0xCD, 0xEF]),
                 rssi: -52,
+                snr: 9,
                 last_seen: Instant::now() - Duration::from_secs(20),
                 frame_count: 12,
                 vendor: "Samsung".to_string(),
                 reconnect_at: None,
                 rssi_samples: VecDeque::new(),
+                snr_samples: VecDeque::new(),
             },
         ];
 

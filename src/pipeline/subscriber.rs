@@ -194,7 +194,7 @@ mod tests {
         data[1] = 0x00;
         // addr1, addr2, addr3 = zeros (fine for test)
 
-        Arc::new(parse_frame(&data, -50, 6, 0, Duration::from_millis(100)))
+        Arc::new(parse_frame(&data, -50, 0, 0, 6, 0, Duration::from_millis(100)))
     }
 
     #[test]

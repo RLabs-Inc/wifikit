@@ -47,6 +47,8 @@ pub enum StoreUpdate {
         ssid_raw: Vec<u8>,
         is_hidden: bool,
         rssi: i8,
+        snr: u8,
+        noise_floor: i8,
         channel: u8,
         channel_center: u16,
         bandwidth: Bandwidth,
@@ -104,6 +106,8 @@ pub enum StoreUpdate {
         bssid: MacAddress,
         rssi: Option<i8>,
         rssi_sample: Option<(Duration, i8)>,
+        snr: Option<u8>,
+        snr_sample: Option<(Duration, u8)>,
         channel: u8,
         freq_mhz: u16,
         tsf: u64,
@@ -153,6 +157,7 @@ pub enum StoreUpdate {
         is_randomized: bool,
         channel: u8,
         rssi: i8,
+        snr: u8,
     },
 
     /// Station associated with an AP (from data frame or assoc response).
@@ -167,6 +172,7 @@ pub enum StoreUpdate {
         mac: MacAddress,
         bssid: MacAddress,
         rssi: Option<i8>,
+        snr: Option<u8>,
         channel: u8,
         frame_count: u32,
         data_bytes: u64,
@@ -181,6 +187,7 @@ pub enum StoreUpdate {
     StationProbeUpdate {
         mac: MacAddress,
         rssi: Option<i8>,
+        snr: Option<u8>,
         channel: u8,
         probe_ssid: String,
         probe_ssid_count: u16,

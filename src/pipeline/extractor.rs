@@ -334,6 +334,7 @@ fn extract_beacon(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: &mu
     if ap_exists {
         // ── ApBeaconUpdate ──
         let rssi_valid = pf.rssi != 0;
+        let snr_valid = pf.snr > 0;
 
         // Check if raw IEs changed
         let ies_changed = store.get_ap(&bssid).and_then(|ap| {
@@ -363,6 +364,8 @@ fn extract_beacon(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: &mu
             bssid,
             rssi: if rssi_valid { Some(pf.rssi) } else { None },
             rssi_sample: if rssi_valid { Some((start_time_elapsed, pf.rssi)) } else { None },
+            snr: if snr_valid { Some(pf.snr) } else { None },
+            snr_sample: if snr_valid { Some((start_time_elapsed, pf.snr)) } else { None },
             channel: ap_channel,
             freq_mhz,
             tsf,
@@ -394,6 +397,8 @@ fn extract_beacon(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: &mu
             ssid_raw: ssid_raw.clone(),
             is_hidden: hidden,
             rssi: pf.rssi,
+            snr: pf.snr,
+            noise_floor: pf.noise_floor,
             channel: ap_channel,
             channel_center,
             bandwidth,
@@ -543,6 +548,7 @@ fn extract_probe_req(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: 
                 is_randomized: sta_mac.as_bytes()[0] & 0x02 != 0,
                 channel,
                 rssi: pf.rssi,
+                snr: pf.snr,
             });
         }
 
@@ -553,6 +559,7 @@ fn extract_probe_req(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: 
         deltas.push(StoreUpdate::StationProbeUpdate {
             mac: sta_mac,
             rssi: if pf.rssi != 0 { Some(pf.rssi) } else { None },
+            snr: if pf.snr > 0 { Some(pf.snr) } else { None },
             channel,
             probe_ssid: ssid,
             probe_ssid_count,
@@ -589,6 +596,7 @@ fn extract_data(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: &mut 
             is_randomized: sta_mac.as_bytes()[0] & 0x02 != 0,
             channel,
             rssi: pf.rssi,
+            snr: pf.snr,
         });
     }
 
@@ -620,6 +628,7 @@ fn extract_data(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: &mut 
         mac: sta_mac,
         bssid: bssid_mac,
         rssi: if pf.rssi != 0 { Some(pf.rssi) } else { None },
+        snr: if pf.snr > 0 { Some(pf.snr) } else { None },
         channel,
         frame_count,
         data_bytes,
