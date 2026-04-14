@@ -126,6 +126,15 @@ pub fn format_event(event: &DosEvent) -> String {
 //  Active zone view — rendered in the Layout active zone during attack
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Per-client EAPOL state tracked during the attack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientEapolState {
+    None,
+    M1,
+    M2,
+    Captured,
+}
+
 /// Client snapshot for the DoS view — pulled from the scanner each render cycle.
 #[derive(Debug, Clone)]
 pub struct ClientSnapshot {
@@ -142,6 +151,8 @@ pub struct ClientSnapshot {
     pub rssi_samples: VecDeque<(Duration, i8)>,
     /// SNR history for sparkline rendering — pulled from Station.snr_samples.
     pub snr_samples: VecDeque<(Duration, u8)>,
+    /// Per-client EAPOL state — set by the module from delta stream.
+    pub eapol_state: ClientEapolState,
 }
 
 /// Render the DoS attack progress view for the Layout active zone.
@@ -320,27 +331,41 @@ pub fn render_dos_view(info: &DosInfo, clients: &[ClientSnapshot], width: u16, f
                 .map(|t| now.duration_since(t) < Duration::from_secs(4))
                 .unwrap_or(false);
 
-            // Attack-semantic status — thresholds tuned for deauth tempo (1-3s cycles)
-            let (status_icon, status_label, mac_styled) = if is_reconnecting {
-                // Reconnect cycle — deauth lands, client comes back. EAPOL capture window!
+            // Attack-semantic status — priority order:
+            //   1. captured  — M1+M2 from this client (goal achieved)
+            //   2. capturing — EAPOL M1 or M2 in progress (handshake happening)
+            //   3. reconnect — was quiet, now active again (disconnect confirmed)
+            //   4. active    — sending frames right now (deauth not working yet)
+            //   5. quiet     — was active, now silent (might be dropping)
+            //   6. dropped   — silent >8s (deauth success)
+            let (status_icon, status_label, mac_styled) = if client.eapol_state == ClientEapolState::Captured {
+                (s().green().bold().paint("\u{2605}"),
+                 s().green().bold().paint("captured"),
+                 s().green().bold().paint(&client.mac.to_string()))
+            } else if client.eapol_state == ClientEapolState::M2 {
+                (s().cyan().bold().paint("\u{25b6}"),
+                 s().cyan().bold().paint("capturing"),
+                 s().cyan().bold().paint(&client.mac.to_string()))
+            } else if client.eapol_state == ClientEapolState::M1 {
+                (s().cyan().paint("\u{25b7}"),
+                 s().cyan().paint("M1 seen"),
+                 s().cyan().paint(&client.mac.to_string()))
+            } else if is_reconnecting {
                 (s().yellow().bold().paint("\u{27f3}"),
                  s().yellow().bold().paint("reconnect"),
                  s().yellow().bold().paint(&client.mac.to_string()))
             } else if age < Duration::from_secs(2) {
-                // Still active — deauth not working on this one
                 (s().red().paint("\u{25cf}"),
                  s().red().paint("active"),
                  s().red().paint(&client.mac.to_string()))
             } else if age < Duration::from_secs(8) {
-                // Going quiet — might be dropping
                 (s().dim().paint("\u{25cb}"),
                  s().dim().paint("quiet"),
                  s().dim().paint(&client.mac.to_string()))
             } else {
-                // Dropped — deauth success!
-                (s().green().bold().paint("\u{2713}"),
-                 s().green().bold().paint("dropped"),
-                 s().green().bold().paint(&client.mac.to_string()))
+                (s().green().paint("\u{2713}"),
+                 s().green().paint("dropped"),
+                 s().green().paint(&client.mac.to_string()))
             };
 
             // RSSI sparkline + current value
@@ -494,37 +519,27 @@ fn format_age(age: Duration) -> String {
 //  DosModule — Module trait implementation for DoS attack
 // ═══════════════════════════════════════════════════════════════════════════════
 
+use std::collections::HashMap;
 use crate::cli::module::{Module, ModuleType, ViewDef, StatusSegment, SegmentStyle};
+use crate::protocol::eapol::HandshakeMessage;
 use crate::store::Station;
 
 /// DosModule wraps DosAttack with the Module trait for the shell's focus stack.
-///
-/// Uses SharedAdapter architecture: the attack spawns its own thread via start(),
-/// locks the channel, and shares the adapter with the scanner.
-///
-/// The `target_clients` field is updated each render cycle by the shell
-/// with client data from the scanner — showing which clients drop off
-/// during the attack.
 pub struct DosModule {
     attack: DosAttack,
-    /// Target AP for starting the attack.
     target: Option<Ap>,
-    /// Target station for targeted attacks.
     target_station: Option<Station>,
-    /// Cached info for rendering — refreshed when deltas arrive.
     cached_info: Option<DosInfo>,
-    /// Connected clients of the target AP (updated by shell from scanner).
     target_clients: Vec<ClientSnapshot>,
-    /// Delta subscriber — receives StoreUpdate batches from the pipeline.
     update_sub: Option<UpdateSubscriber>,
-    /// Attack ID learned from the first AttackStarted delta.
     attack_id: Option<AttackId>,
-    /// Dirty flag — set when deltas arrive, cleared after info refresh.
     dirty: bool,
-    /// Formatted scrollback lines accumulated from AttackEvent deltas.
     scrollback_lines: Vec<String>,
-    /// FPS history for sparkline — accumulated from AttackCountersUpdate deltas.
     fps_history: VecDeque<f64>,
+    /// Per-client EAPOL state — populated from EapolMessage deltas.
+    client_eapol: HashMap<MacAddress, ClientEapolState>,
+    /// Target BSSID — for filtering EAPOL deltas.
+    target_bssid: Option<MacAddress>,
 }
 
 use crate::store::Ap;
@@ -543,6 +558,8 @@ impl DosModule {
             dirty: false,
             scrollback_lines: Vec::new(),
             fps_history: VecDeque::new(),
+            client_eapol: HashMap::new(),
+            target_bssid: None,
         }
     }
 
@@ -553,6 +570,7 @@ impl DosModule {
 
     /// Set target AP and optional station before starting.
     pub fn set_targets(&mut self, target: Ap, station: Option<Station>) {
+        self.target_bssid = Some(target.bssid);
         self.target = Some(target);
         self.target_station = station;
     }
@@ -578,6 +596,35 @@ impl DosModule {
 
         for update in sub.drain_flat() {
             match &update {
+                // ── Per-client EAPOL tracking ──
+                StoreUpdate::EapolMessage { ap_mac, sta_mac, message, quality, .. }
+                    if self.target_bssid.is_some_and(|b| b == *ap_mac) =>
+                {
+                    let entry = self.client_eapol.entry(*sta_mac).or_insert(ClientEapolState::None);
+                    match message {
+                        HandshakeMessage::M1 => {
+                            if *entry == ClientEapolState::None {
+                                *entry = ClientEapolState::M1;
+                            }
+                        }
+                        HandshakeMessage::M2 => {
+                            *entry = ClientEapolState::M2;
+                        }
+                        _ => {}
+                    }
+                    if *quality >= crate::protocol::eapol::HandshakeQuality::M1M2 {
+                        *entry = ClientEapolState::Captured;
+                    }
+                    self.dirty = true;
+                }
+                StoreUpdate::HandshakeComplete { ap_mac, sta_mac, .. }
+                    if self.target_bssid.is_some_and(|b| b == *ap_mac) =>
+                {
+                    self.client_eapol.insert(*sta_mac, ClientEapolState::Captured);
+                    self.dirty = true;
+                }
+
+                // ── Attack lifecycle deltas ──
                 StoreUpdate::AttackStarted { id, attack_type: AttackType::Dos, .. } => {
                     self.attack_id = Some(*id);
                     self.dirty = true;
@@ -642,6 +689,11 @@ impl DosModule {
         let now = Instant::now();
 
         for client in &mut clients {
+            // Apply per-client EAPOL state from our tracking
+            if let Some(&state) = self.client_eapol.get(&client.mac) {
+                client.eapol_state = state;
+            }
+
             // Check if this client existed in previous snapshot
             if let Some(prev) = self.target_clients.iter().find(|c| c.mac == client.mac) {
                 let prev_age = now.duration_since(prev.last_seen);
@@ -839,6 +891,7 @@ mod tests {
                 reconnect_at: None,
                 rssi_samples: VecDeque::new(),
                 snr_samples: VecDeque::new(),
+                eapol_state: ClientEapolState::None,
             },
             ClientSnapshot {
                 mac: MacAddress::new([0x8C, 0x85, 0x90, 0xAB, 0xCD, 0xEF]),
@@ -850,6 +903,7 @@ mod tests {
                 reconnect_at: None,
                 rssi_samples: VecDeque::new(),
                 snr_samples: VecDeque::new(),
+                eapol_state: ClientEapolState::None,
             },
         ];
 

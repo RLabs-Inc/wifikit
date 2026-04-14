@@ -750,6 +750,7 @@ pub struct AttackId(pub u64);
 pub enum AttackType {
     Pmkid,
     Dos,
+    Csa,
     Wps,
     Eap,
     Krack,
@@ -776,6 +777,7 @@ pub struct AttackPhase {
 pub enum AttackEventKind {
     Pmkid(crate::attacks::pmkid::PmkidEventKind),
     Dos(crate::attacks::dos::DosEventKind),
+    Csa(crate::attacks::csa::CsaEventKind),
     Wps(crate::attacks::wps::WpsEventKind),
     Eap(crate::attacks::eap::EapEventKind),
     Krack(crate::attacks::krack::KrackEventKind),
@@ -797,6 +799,11 @@ pub enum AttackResult {
     Dos {
         frames_sent: u64,
         stop_reason: crate::attacks::dos::StopReason,
+    },
+    Csa {
+        frames_sent: u64,
+        handshake_quality: crate::protocol::eapol::HandshakeQuality,
+        stop_reason: crate::attacks::csa::CsaStopReason,
     },
     Wps {
         pin_found: Option<String>,

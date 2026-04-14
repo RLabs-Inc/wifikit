@@ -9,6 +9,7 @@ pub mod view;
 pub mod attack;
 pub mod pmkid;
 pub mod dos;
+pub mod csa;
 pub mod wps;
 pub mod eap;
 pub mod fuzz;

@@ -2,6 +2,7 @@ pub mod info;
 pub mod pmkid;
 pub mod wps;
 pub mod dos;
+pub mod csa;
 pub mod ap;
 pub mod eap;
 pub mod krack;

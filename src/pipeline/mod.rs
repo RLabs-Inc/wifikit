@@ -345,6 +345,15 @@ fn pipeline_thread(
             }
         }
 
+        // ── 0.5. Skip FCS-errored frames ──
+        // With drop_err=0 (MT7921AU), firmware passes frames with bad FCS to host.
+        // These are already written to pcap (step 0) for forensic analysis.
+        // But parsing them creates phantom APs from corrupted bytes — skip.
+        if rx_frame.is_fcs_error {
+            inner.stats.frames_unparseable.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
         // ── 1. 802.11 frame control sanity check ──
         // Valid frames: protocol version = 0 (bits 0-1), type = 0-2 (bits 2-3).
         // Type 3 is reserved. Non-zero protocol version is invalid.

@@ -24,6 +24,7 @@ use crate::cli::banner;
 use crate::cli::commands::{self, Ctx, ShellState, Mode, AdapterStatus};
 use crate::cli::views::pmkid as pmkid_cli;
 use crate::cli::views::dos as dos_cli;
+use crate::cli::views::csa as csa_cli;
 use crate::cli::views::wps as wps_cli;
 use crate::cli::views::eap as eap_cli;
 use crate::cli::views::fuzz as fuzz_cli;
@@ -314,6 +315,7 @@ impl Shell {
                                 reconnect_at: None,
                                 rssi_samples: sta.rssi_samples.clone(),
                                 snr_samples: sta.snr_samples.clone(),
+                                eapol_state: dos_cli::ClientEapolState::None,
                             })
                             .collect()
                     } else {
@@ -331,6 +333,77 @@ impl Shell {
 
                 // Also drain EAPOL/handshake events from the scanner
                 let attack_start = dos_info.start_time;
+                let eapol_lines: Vec<String> =
+                    if let Some(scanner_mod) = state.focus_stack.find_as::<ScannerModule>("scanner") {
+                        let scan_events = scanner_mod.store.drain_events();
+                        scan_events.iter()
+                            .filter(|e| matches!(e.event_type,
+                                crate::store::ScanEventType::EapolM1
+                                | crate::store::ScanEventType::EapolM2
+                                | crate::store::ScanEventType::EapolM3
+                                | crate::store::ScanEventType::EapolM4
+                                | crate::store::ScanEventType::PmkidCaptured
+                                | crate::store::ScanEventType::HandshakeComplete
+                            ))
+                            .map(|e| format_eapol_event_relative(e, attack_start))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                drop(state);
+                for line in &lines {
+                    self.layout.print(line);
+                }
+                for line in &eapol_lines {
+                    self.layout.print(line);
+                }
+            }
+        }
+
+        // CSA: delta-driven — tick() processes deltas, returns formatted scrollback lines
+        // Also update target clients from scanner for the client monitoring view
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(csa_mod) = state.focus_stack.find_as_mut::<csa_cli::CsaModule>("csa") {
+                let lines = csa_mod.tick();
+                let csa_info = csa_mod.info();
+                let target_bssid = csa_info.target_bssid;
+
+                // Get scanner clients associated with target AP for client monitoring
+                let clients: Vec<csa_cli::ClientSnapshot> =
+                    if let Some(scanner_mod) = state.focus_stack.find_as::<ScannerModule>("scanner") {
+                        let stations = scanner_mod.store.get_stations().into_values().collect::<Vec<_>>();
+                        stations.iter()
+                            .filter(|sta| sta.bssid == Some(target_bssid) && sta.is_associated)
+                            .map(|sta| csa_cli::ClientSnapshot {
+                                mac: sta.mac,
+                                rssi: sta.rssi,
+                                snr: sta.snr,
+                                last_seen: sta.last_seen,
+                                frame_count: sta.frame_count,
+                                vendor: sta.vendor.clone(),
+                                reconnect_at: None,
+                                rssi_samples: sta.rssi_samples.clone(),
+                                snr_samples: sta.snr_samples.clone(),
+                                eapol_state: csa_cli::ClientEapolState::None,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                // Update CSA module with client data
+                if let Some(csa_mod) = state.focus_stack.find_as_mut::<csa_cli::CsaModule>("csa") {
+                    csa_mod.update_target_clients(clients.clone());
+                    let client_macs: Vec<crate::core::mac::MacAddress> = clients.iter()
+                        .map(|c| c.mac)
+                        .collect();
+                    csa_mod.attack().update_clients(client_macs);
+                }
+
+                // Drain EAPOL events from scanner
+                let attack_start = csa_info.start_time;
                 let eapol_lines: Vec<String> =
                     if let Some(scanner_mod) = state.focus_stack.find_as::<ScannerModule>("scanner") {
                         let scan_events = scanner_mod.store.drain_events();
@@ -514,6 +587,7 @@ impl Shell {
                 "pmkid"              => commands::pmkid::run(&mut ctx, &matched.args),
                 "dos"                => commands::dos::run(&mut ctx, &matched.args),
                 "deauth"             => commands::dos::deauth(&mut ctx, &matched.args),
+                "csa"                => commands::csa::run(&mut ctx, &matched.args),
                 "wps"                => commands::wps::run(&mut ctx, &matched.args),
                 "eap"                => commands::eap::run(&mut ctx, &matched.args),
                 "fuzz"               => commands::fuzz::run(&mut ctx, &matched.args),
@@ -792,6 +866,7 @@ fn build_commands() -> Vec<(String, prism::Command)> {
         c("pmkid", "PMKID extraction attack", &[]),
         c("wps", "WPS Pixie Dust + brute force", &[]),
         c("deauth", "Deauthentication attack", &[]),
+        c("csa", "CSA injection (PMF bypass handshake capture)", &[]),
         c("dos", "Denial of service (14 types)", &[]),
         c("ap", "Rogue AP / Evil Twin / KARMA", &[]),
         c("eap", "Enterprise credential capture", &[]),
