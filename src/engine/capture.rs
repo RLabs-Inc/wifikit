@@ -344,24 +344,6 @@ pub struct CaptureStats {
 //  Capture Database
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Bit-level hamming distance between two MAC addresses.
-/// Returns the number of differing bits across all 6 bytes.
-fn mac_hamming_distance(a: &MacAddress, b: &MacAddress) -> u32 {
-    let ab = a.as_bytes();
-    let bb = b.as_bytes();
-    (0..6).map(|i| (ab[i] ^ bb[i]).count_ones()).sum()
-}
-
-/// Maximum hamming distance for fuzzy MAC matching.
-/// 2 bits allows single-byte bit flips (common in FCS-errored frames
-/// from clients at marginal signal). Higher values risk false matches.
-const FUZZY_MAC_MAX_DISTANCE: u32 = 2;
-
-/// Check if two MACs match exactly or within fuzzy hamming distance.
-fn macs_match(a: &MacAddress, b: &MacAddress) -> bool {
-    a == b || mac_hamming_distance(a, b) <= FUZZY_MAC_MAX_DISTANCE
-}
-
 /// Stateful database tracking all captured handshakes and EAP identities.
 ///
 /// Called by the scanner engine each time an EAPOL frame is received.
@@ -406,30 +388,26 @@ impl CaptureDatabase {
         }
     }
 
+    /// Find an existing handshake entry for the given AP+STA pair.
     /// Find the most recent handshake entry for the given AP+STA pair.
-    /// Uses fuzzy AP MAC matching (within 2 bits hamming distance).
     pub fn find(&self, ap_mac: &MacAddress, sta_mac: &MacAddress) -> Option<&Handshake> {
-        let idx = self.handshakes.iter().rposition(|hs| macs_match(&hs.ap_mac, ap_mac) && hs.sta_mac == *sta_mac)?;
+        let idx = self.handshakes.iter().rposition(|hs| hs.ap_mac == *ap_mac && hs.sta_mac == *sta_mac)?;
         Some(&self.handshakes[idx])
     }
 
     /// Find an existing handshake entry for the given AP+STA pair (mutable, last/latest).
     fn find_mut(&mut self, ap_mac: &MacAddress, sta_mac: &MacAddress) -> Option<&mut Handshake> {
-        let idx = self.handshakes.iter().rposition(|hs| macs_match(&hs.ap_mac, ap_mac) && hs.sta_mac == *sta_mac)?;
+        let idx = self.handshakes.iter().rposition(|hs| hs.ap_mac == *ap_mac && hs.sta_mac == *sta_mac)?;
         Some(&mut self.handshakes[idx])
     }
 
     /// Find the LAST (most recent) entry for this pair — used by process_m1 after pushing.
     fn find_last_mut(&mut self, ap_mac: &MacAddress, sta_mac: &MacAddress) -> Option<&mut Handshake> {
-        let idx = self.handshakes.iter().rposition(|hs| macs_match(&hs.ap_mac, ap_mac) && hs.sta_mac == *sta_mac)?;
+        let idx = self.handshakes.iter().rposition(|hs| hs.ap_mac == *ap_mac && hs.sta_mac == *sta_mac)?;
         Some(&mut self.handshakes[idx])
     }
 
     /// Find or create a handshake entry for the given AP+STA pair.
-    ///
-    /// Uses fuzzy MAC matching: if the AP MAC is within 2 bits of a known entry,
-    /// it's treated as the same AP (handles FCS bit-flip errors from clients at
-    /// marginal signal). STA MAC must match exactly.
     ///
     /// If the database is full, returns `None` (matches C behavior).
     fn find_or_create(
@@ -438,11 +416,11 @@ impl CaptureDatabase {
         sta_mac: MacAddress,
         ssid: &str,
     ) -> Option<&mut Handshake> {
-        // Find the LAST (most recent) entry — exact match first, then fuzzy
+        // Find the LAST (most recent) entry — M2/M3/M4 go to the latest attempt
         if let Some(idx) = self
             .handshakes
             .iter()
-            .rposition(|hs| macs_match(&hs.ap_mac, &ap_mac) && hs.sta_mac == sta_mac)
+            .rposition(|hs| hs.ap_mac == ap_mac && hs.sta_mac == sta_mac)
         {
             // Update SSID if we now have one and didn't before
             if !ssid.is_empty() && self.handshakes[idx].ssid.is_empty() {
@@ -681,9 +659,9 @@ fn process_eapol_key(
     //   Group: latest entry (standard)
     let hs = match message {
         HandshakeMessage::M3 => {
-            // Find entry whose ANonce matches this M3's nonce (fuzzy AP MAC)
+            // Find entry whose ANonce matches this M3's nonce
             let idx = db.handshakes.iter().rposition(|hs|
-                macs_match(&hs.ap_mac, &ap_mac) && hs.sta_mac == sta_mac
+                hs.ap_mac == ap_mac && hs.sta_mac == sta_mac
                 && hs.anonce.as_ref().is_some_and(|a| *a == key.nonce)
             );
             match idx {
@@ -706,9 +684,9 @@ fn process_eapol_key(
             }
         }
         HandshakeMessage::M4 => {
-            // Find the most recent entry that has M3 (fuzzy AP MAC)
+            // Find the most recent entry that has M3 — that's the one this M4 completes
             let idx = db.handshakes.iter().rposition(|hs|
-                macs_match(&hs.ap_mac, &ap_mac) && hs.sta_mac == sta_mac && hs.has_m3
+                hs.ap_mac == ap_mac && hs.sta_mac == sta_mac && hs.has_m3
             );
             match idx {
                 Some(i) => &mut db.handshakes[i],
@@ -955,7 +933,7 @@ fn process_m1(
         } else {
             // Database full — find the worst quality entry for this pair and reuse it
             if let Some(idx) = db.handshakes.iter().position(|hs|
-                macs_match(&hs.ap_mac, &ap_mac) && hs.sta_mac == sta_mac
+                hs.ap_mac == ap_mac && hs.sta_mac == sta_mac
                 && hs.quality == HandshakeQuality::None
             ) {
                 db.handshakes[idx] = Handshake::new(ap_mac, sta_mac, ssid.to_string());
