@@ -330,7 +330,22 @@ fn pipeline_thread(
         inner.stats.pending.fetch_sub(1, Ordering::Relaxed);
         inner.stats.frames_received.fetch_add(1, Ordering::Relaxed);
 
-        // ── 0. 802.11 frame control sanity check ──
+        // ── 0. Write raw bytes to pcap FIRST ──
+        // Pcap is raw forensic evidence — every byte from the chip driver goes to
+        // disk before any parsing or filtering. This ensures we never lose frames
+        // due to parser bugs, sanity checks, or edge cases.
+        if let Some(ref mut cap) = pcap {
+            let elapsed = inner.start_time.elapsed();
+            let ts_us = elapsed.as_micros() as u64;
+            if write_pcap_packet(&mut cap.writer, &rx_frame.data, ts_us).is_ok() {
+                cap.packets_written += 1;
+                cap.bytes_written += (16 + rx_frame.data.len()) as u64;
+                inner.stats.pcap_frames_written.store(cap.packets_written, Ordering::Relaxed);
+                inner.stats.pcap_bytes_written.store(cap.bytes_written, Ordering::Relaxed);
+            }
+        }
+
+        // ── 1. 802.11 frame control sanity check ──
         // Valid frames: protocol version = 0 (bits 0-1), type = 0-2 (bits 2-3).
         // Type 3 is reserved. Non-zero protocol version is invalid.
         if rx_frame.data.len() >= 2 {
@@ -343,7 +358,7 @@ fn pipeline_thread(
             }
         }
 
-        // ── 1. Parse ──
+        // ── 2. Parse ──
         let parsed = parsed_frame::parse_frame(
             &rx_frame.data,
             rx_frame.rssi,
@@ -352,7 +367,7 @@ fn pipeline_thread(
             rx_frame.timestamp,
         );
 
-        // ── 2. Update per-type counters ──
+        // ── 3. Update per-type counters ──
         match parsed.frame_type {
             0 => {
                 inner.stats.mgmt_count.fetch_add(1, Ordering::Relaxed);
@@ -378,18 +393,6 @@ fn pipeline_thread(
             inner.stats.frames_unparseable.fetch_add(1, Ordering::Relaxed);
         } else {
             inner.stats.frames_parsed.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // ── 3. Write to pcap ──
-        if let Some(ref mut cap) = pcap {
-            let elapsed = inner.start_time.elapsed();
-            let ts_us = elapsed.as_micros() as u64;
-            if write_pcap_packet(&mut cap.writer, &rx_frame.data, ts_us).is_ok() {
-                cap.packets_written += 1;
-                cap.bytes_written += (16 + rx_frame.data.len()) as u64;
-                inner.stats.pcap_frames_written.store(cap.packets_written, Ordering::Relaxed);
-                inner.stats.pcap_bytes_written.store(cap.bytes_written, Ordering::Relaxed);
-            }
         }
 
         // ── 4. Extract deltas + apply to the FrameStore ──

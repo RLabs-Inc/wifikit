@@ -313,7 +313,7 @@ impl HandshakeMessage {
 /// Identify the handshake message type from a parsed `KeyInfo`.
 ///
 /// Returns `None` for unrecognized key info patterns.
-pub fn identify_message(ki: &KeyInfo) -> Option<HandshakeMessage> {
+pub fn identify_message(ki: &KeyInfo, key_data_len: usize) -> Option<HandshakeMessage> {
     if ki.pairwise {
         // 4-way handshake (pairwise key)
         if ki.ack && !ki.mic {
@@ -324,15 +324,17 @@ pub fn identify_message(ki: &KeyInfo) -> Option<HandshakeMessage> {
             // are typically set but some APs omit Secure on reconnection.
             // Only ACK + MIC + Install are mandatory for M3 identification.
             Some(HandshakeMessage::M3)
-        } else if !ki.ack && ki.mic && !ki.install && !ki.secure {
-            // M2: STA→AP, MIC set, no ACK/Install/Secure
-            Some(HandshakeMessage::M2)
-        } else if !ki.ack && ki.mic && ki.secure && !ki.install {
-            // M4: STA→AP, MIC + Secure, no ACK/Install
-            Some(HandshakeMessage::M4)
         } else if !ki.ack && ki.mic && !ki.install {
-            // Edge case: some implementations set Secure in M2 (post-reassoc)
-            Some(HandshakeMessage::M2)
+            // M2 or M4 — both from STA, both have MIC, neither has ACK/Install.
+            // Normal M2: !secure. Normal M4: secure.
+            // But post-reassociation M2 can also have Secure set (same bits as M4).
+            // Reliable differentiator: M2 carries RSN IE in key_data (non-empty),
+            // M4 has empty key_data.
+            if key_data_len > 0 {
+                Some(HandshakeMessage::M2)
+            } else {
+                Some(HandshakeMessage::M4)
+            }
         } else {
             None
         }
@@ -728,7 +730,7 @@ pub fn parse_from_data_frame(payload: &[u8]) -> Option<ParsedEapol> {
     match header.packet_type {
         EapolType::Key => {
             let key = parse_eapol_key(body)?;
-            let message = identify_message(&key.key_info)?;
+            let message = identify_message(&key.key_info, key.key_data.len())?;
             // Store complete EAPOL frame (header + body) for capture engine
             let raw_eapol = eapol_data[..HEADER_LEN + body_len].to_vec();
             Some(ParsedEapol::Key { header, key, message, raw_eapol })
@@ -753,7 +755,7 @@ pub fn parse_raw_eapol(eapol_data: &[u8]) -> Option<ParsedEapol> {
     match header.packet_type {
         EapolType::Key => {
             let key = parse_eapol_key(body)?;
-            let message = identify_message(&key.key_info)?;
+            let message = identify_message(&key.key_info, key.key_data.len())?;
             let raw_eapol = eapol_data[..HEADER_LEN + body_len].to_vec();
             Some(ParsedEapol::Key { header, key, message, raw_eapol })
         }
@@ -919,13 +921,16 @@ mod tests {
     #[test]
     fn test_identify_m1() {
         let ki = parse_key_info(KI_PAIRWISE | KI_ACK | 2);
-        assert_eq!(identify_message(&ki), Some(HandshakeMessage::M1));
+        // M1: ACK, no MIC — key_data_len doesn't matter
+        assert_eq!(identify_message(&ki, 0), Some(HandshakeMessage::M1));
+        assert_eq!(identify_message(&ki, 50), Some(HandshakeMessage::M1));
     }
 
     #[test]
     fn test_identify_m2() {
         let ki = parse_key_info(KI_PAIRWISE | KI_MIC | 2);
-        assert_eq!(identify_message(&ki), Some(HandshakeMessage::M2));
+        // M2: MIC, no ACK/Install — has key_data (RSN IE)
+        assert_eq!(identify_message(&ki, 22), Some(HandshakeMessage::M2));
     }
 
     #[test]
@@ -933,42 +938,42 @@ mod tests {
         let ki = parse_key_info(
             KI_PAIRWISE | KI_ACK | KI_MIC | KI_INSTALL | KI_SECURE | KI_ENCRYPTED | 2,
         );
-        assert_eq!(identify_message(&ki), Some(HandshakeMessage::M3));
+        assert_eq!(identify_message(&ki, 100), Some(HandshakeMessage::M3));
     }
 
     #[test]
     fn test_identify_m4() {
         let ki = parse_key_info(KI_PAIRWISE | KI_MIC | KI_SECURE | 2);
-        assert_eq!(identify_message(&ki), Some(HandshakeMessage::M4));
+        // M4: MIC + Secure, no ACK/Install — empty key_data
+        assert_eq!(identify_message(&ki, 0), Some(HandshakeMessage::M4));
     }
 
     #[test]
     fn test_identify_m2_variant_with_secure() {
-        // Some APs set Secure in M2 (post-reassociation)
+        // Post-reassociation M2 with Secure bit set — same KeyInfo as M4.
+        // Disambiguated by key_data: M2 has RSN IE (non-empty), M4 is empty.
         let ki = parse_key_info(KI_PAIRWISE | KI_MIC | KI_SECURE | 2);
-        // This matches M4 first (more specific), which is correct — M4 has Secure + MIC
-        // The M2 variant catch-all only fires when Secure is NOT set (normal M2)
-        let msg = identify_message(&ki).unwrap();
-        assert_eq!(msg, HandshakeMessage::M4);
+        assert_eq!(identify_message(&ki, 22), Some(HandshakeMessage::M2));
+        assert_eq!(identify_message(&ki, 0), Some(HandshakeMessage::M4));
     }
 
     #[test]
     fn test_identify_group_m1() {
         let ki = parse_key_info(KI_ACK | KI_MIC | KI_SECURE | KI_ENCRYPTED | 2);
-        assert_eq!(identify_message(&ki), Some(HandshakeMessage::GroupM1));
+        assert_eq!(identify_message(&ki, 0), Some(HandshakeMessage::GroupM1));
     }
 
     #[test]
     fn test_identify_group_m2() {
         let ki = parse_key_info(KI_MIC | KI_SECURE | 2);
-        assert_eq!(identify_message(&ki), Some(HandshakeMessage::GroupM2));
+        assert_eq!(identify_message(&ki, 0), Some(HandshakeMessage::GroupM2));
     }
 
     #[test]
     fn test_identify_unknown() {
         // No meaningful bits set
         let ki = parse_key_info(2);
-        assert_eq!(identify_message(&ki), None);
+        assert_eq!(identify_message(&ki, 0), None);
     }
 
     #[test]

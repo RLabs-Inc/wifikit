@@ -995,7 +995,11 @@ mod tests {
 
     fn build_m2(replay: u64, snonce: &[u8; 32]) -> Vec<u8> {
         let ki = KI_PAIRWISE | KI_MIC | 2;
-        build_eapol_frame(ki, replay, snonce, &[0xCC; 16], &[])
+        // M2 always carries RSN IE in key_data (non-empty distinguishes from M4)
+        let dummy_rsn_ie = [0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,
+                            0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+                            0x00, 0x0F, 0xAC, 0x02, 0x00, 0x00];
+        build_eapol_frame(ki, replay, snonce, &[0xCC; 16], &dummy_rsn_ie)
     }
 
     fn build_m3(replay: u64, anonce: &[u8; 32]) -> Vec<u8> {

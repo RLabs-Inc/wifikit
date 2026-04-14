@@ -453,7 +453,7 @@ pub fn parse_frame(raw: &[u8], rssi: i8, channel: u8, band: u8, timestamp: Durat
             parse_management(raw, fsubtype, protected)
         }
         t if t == frame_type::DATA as u8 => {
-            parse_data(raw, fsubtype, to_ds, from_ds, protected, is_qos)
+            parse_data(raw, fsubtype, to_ds, from_ds, protected, is_qos, order)
         }
         t if t == frame_type::CONTROL as u8 => {
             parse_control(raw, fsubtype)
@@ -792,6 +792,7 @@ fn parse_data(
     from_ds: bool,
     protected: bool,
     is_qos: bool,
+    order: bool,
 ) -> FrameBody {
     if raw.len() < 24 {
         return FrameBody::Unparseable { reason: "data frame too short" };
@@ -838,8 +839,11 @@ fn parse_data(
         };
     }
 
-    // LLC/SNAP offset depends on QoS
-    let llc_off: usize = if is_qos { 26 } else { 24 };
+    // LLC/SNAP offset depends on QoS and HT Control field (Order bit)
+    // QoS data: 24 (base) + 2 (QoS Control) = 26
+    // QoS data + HTC: 24 + 2 + 4 (HT Control) = 30
+    let htc_len: usize = if is_qos && order { 4 } else { 0 };
+    let llc_off: usize = if is_qos { 26 + htc_len } else { 24 };
 
     if llc_off + 8 > raw.len() {
         return FrameBody::Data {
@@ -1228,15 +1232,21 @@ mod tests {
     /// Build a complete EAPOL-Key frame payload (LLC/SNAP + EAPOL header + key body).
     /// key_info determines which handshake message it represents.
     fn make_eapol_key(key_info: u16) -> Vec<u8> {
+        make_eapol_key_with_data(key_info, &[])
+    }
+
+    fn make_eapol_key_with_data(key_info: u16, key_data: &[u8]) -> Vec<u8> {
         let mut payload = Vec::new();
         // LLC/SNAP header
         payload.extend_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E]);
-        // EAPOL header: version=2, type=3(Key), body_len=95
-        payload.extend_from_slice(&[0x02, 0x03, 0x00, 0x5F]);
+        let body_len = 95 + key_data.len();
+        // EAPOL header: version=2, type=3(Key), body_len
+        payload.extend_from_slice(&[0x02, 0x03]);
+        payload.extend_from_slice(&(body_len as u16).to_be_bytes());
         // EAPOL-Key body (95 bytes minimum):
         //   descriptor(1) + key_info(2) + key_length(2) + replay_counter(8)
         //   + nonce(32) + iv(16) + rsc(8) + reserved(8) + mic(16) + key_data_len(2)
-        let mut body = vec![0u8; 95];
+        let mut body = vec![0u8; 95 + key_data.len()];
         body[0] = 0x02; // descriptor type = IEEE 802.11
         body[1] = (key_info >> 8) as u8; // key info high byte
         body[2] = (key_info & 0xFF) as u8; // key info low byte
@@ -1246,6 +1256,11 @@ mod tests {
         // Fill nonce with non-zero (offset 13..45)
         for i in 13..45 {
             body[i] = (i & 0xFF) as u8;
+        }
+        // key_data_len at offset 93-94
+        body[93..95].copy_from_slice(&(key_data.len() as u16).to_be_bytes());
+        if !key_data.is_empty() {
+            body[95..].copy_from_slice(key_data);
         }
         payload.extend_from_slice(&body);
         payload
@@ -1441,7 +1456,11 @@ mod tests {
     #[test]
     fn route_eapol_m2() {
         // M2: pairwise=1, mic=1, no ack/install/secure → ki = 0x010A
-        let eapol = make_eapol_key(0x010A);
+        // M2 carries RSN IE in key_data (non-empty distinguishes from M4)
+        let rsn_ie = [0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,
+                      0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+                      0x00, 0x0F, 0xAC, 0x02, 0x00, 0x00];
+        let eapol = make_eapol_key_with_data(0x010A, &rsn_ie);
         let frame = make_data_frame(true, false, true, false, &eapol);
         let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
         if let FrameBody::Data { payload: DataPayload::Eapol(parsed), .. } = &pf.body {
@@ -1607,16 +1626,20 @@ mod tests {
     fn route_all_eapol_messages() {
         use crate::protocol::eapol::HandshakeMessage;
 
-        let cases: Vec<(&str, u16, HandshakeMessage, bool, bool)> = vec![
-            // (name, key_info, expected_msg, to_ds, from_ds)
-            ("M1", 0x008A, HandshakeMessage::M1, false, true),
-            ("M2", 0x010A, HandshakeMessage::M2, true, false),
-            ("M3", 0x13CA, HandshakeMessage::M3, false, true),
-            ("M4", 0x030A, HandshakeMessage::M4, true, false),
+        let rsn_ie = [0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,
+                      0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+                      0x00, 0x0F, 0xAC, 0x02, 0x00, 0x00];
+        let cases: Vec<(&str, u16, HandshakeMessage, bool, bool, &[u8])> = vec![
+            // (name, key_info, expected_msg, to_ds, from_ds, key_data)
+            // M2 has RSN IE in key_data; M4 has empty key_data
+            ("M1", 0x008A, HandshakeMessage::M1, false, true, &[]),
+            ("M2", 0x010A, HandshakeMessage::M2, true, false, &rsn_ie),
+            ("M3", 0x13CA, HandshakeMessage::M3, false, true, &[0xEE; 32]),
+            ("M4", 0x030A, HandshakeMessage::M4, true, false, &[]),
         ];
 
-        for (name, ki, expected_msg, to_ds, from_ds) in &cases {
-            let eapol = make_eapol_key(*ki);
+        for (name, ki, expected_msg, to_ds, from_ds, key_data) in &cases {
+            let eapol = make_eapol_key_with_data(*ki, key_data);
             let frame = make_data_frame(*to_ds, *from_ds, true, false, &eapol);
             let pf = parse_frame(&frame, -50, 6, 0, Duration::ZERO);
 

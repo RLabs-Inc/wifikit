@@ -652,7 +652,8 @@ fn extract_data(pf: &ParsedFrame, channel: u8, store: &FrameStore, deltas: &mut 
     );
 
     if is_eapol {
-        let llc_off: usize = if pf.is_qos { 26 } else { 24 };
+        let htc_len: usize = if pf.is_qos && pf.order { 4 } else { 0 };
+        let llc_off: usize = if pf.is_qos { 26 + htc_len } else { 24 };
         if llc_off + 8 <= pf.raw.len() {
             let raw_payload = &pf.raw[llc_off..];
             let ssid = store.get_ap(&bssid_mac).map(|ap| ap.ssid.clone()).unwrap_or_default();
